@@ -37,7 +37,9 @@
         "SC-52F",
         "SCG32"
       ],
-      "kernelVersions": ["6.6.98"],
+      "kernelVersions": [
+        "6.6.98"
+      ],
       "exploit": {
         "url": "https://raw.githubusercontent.com/BuSung-dev/Root-My-Galaxy-Payloads/main/artifacts/pa3q-S938NKSUACZF1/cve-2026-43499-app.so",
         "size": 104128
@@ -53,7 +55,9 @@
       "models": [
         "SM-S9370"
       ],
-      "kernelVersions": ["6.6.98"],
+      "kernelVersions": [
+        "6.6.98"
+      ],
       "exploit": {
         "url": "https://raw.githubusercontent.com/BuSung-dev/Root-My-Galaxy-Payloads/main/artifacts/psq-S9370ZCS9CZG1/cve-2026-43499-app.so",
         "size": 125264
@@ -66,8 +70,13 @@
     {
       "payloadId": "q7q-F966USQU9BZDN",
       "displayName": "Galaxy Z Fold 7 | Kernel 6.6.98",
-      "models": ["SM-F966U", "SM-F966U1"],
-      "kernelVersions": ["6.6.98"],
+      "models": [
+        "SM-F966U",
+        "SM-F966U1"
+      ],
+      "kernelVersions": [
+        "6.6.98"
+      ],
       "exploit": {
         "url": "https://raw.githubusercontent.com/BuSung-dev/Root-My-Galaxy-Payloads/main/artifacts/q7q-F966USQU9BZDN/cve-2026-43499-app.so",
         "size": 111216
@@ -80,8 +89,12 @@
     {
       "payloadId": "e3q-S928USQS6DZF2",
       "displayName": "Galaxy S24 Ultra | Kernel 6.1.145",
-      "models": ["SM-S928U"],
-      "kernelVersions": ["6.1.145"],
+      "models": [
+        "SM-S928U"
+      ],
+      "kernelVersions": [
+        "6.1.145"
+      ],
       "exploit": {
         "url": "https://raw.githubusercontent.com/BuSung-dev/Root-My-Galaxy-Payloads/main/artifacts/e3q-S928USQS6DZF2/cve-2026-43499-app.so",
         "size": 104128
@@ -94,8 +107,12 @@
     {
       "payloadId": "e2s-S926BXXUEDZDR",
       "displayName": "Galaxy S24+ | Kernel 6.1.157",
-      "models": ["SM-S926B"],
-      "kernelVersions": ["6.1.157"],
+      "models": [
+        "SM-S926B"
+      ],
+      "kernelVersions": [
+        "6.1.157"
+      ],
       "requiresFreshP0Session": true,
       "exploit": {
         "url": "https://raw.githubusercontent.com/BuSung-dev/Root-My-Galaxy-Payloads/main/artifacts/e2s-S926BXXUEDZDR/cve-2026-43499-app.so",
@@ -109,8 +126,12 @@
     {
       "payloadId": "e1s-S921BXXSFDZE1",
       "displayName": "Galaxy S24 | Kernel 6.1.157",
-      "models": ["SM-S921B"],
-      "kernelVersions": ["6.1.157"],
+      "models": [
+        "SM-S921B"
+      ],
+      "kernelVersions": [
+        "6.1.157"
+      ],
       "requiresFreshP0Session": true,
       "exploit": {
         "url": "https://raw.githubusercontent.com/BuSung-dev/Root-My-Galaxy-Payloads/main/artifacts/e1s-S921BXXSFDZE1/cve-2026-43499-app.so",
@@ -124,8 +145,17 @@
     {
       "payloadId": "essi-A566EXXSCCZG6",
       "displayName": "Galaxy A56 5G | Kernel 6.6.102",
-      "models": ["SM-A5660", "SM-A566B", "SM-A566E", "SM-A566S", "SM-A566U1", "SM-A566W"],
-      "kernelVersions": ["6.6.102"],
+      "models": [
+        "SM-A5660",
+        "SM-A566B",
+        "SM-A566E",
+        "SM-A566S",
+        "SM-A566U1",
+        "SM-A566W"
+      ],
+      "kernelVersions": [
+        "6.6.102"
+      ],
       "exploit": {
         "url": "https://raw.githubusercontent.com/BuSung-dev/Root-My-Galaxy-Payloads/main/artifacts/essi-A566EXXSCCZG6/cve-2026-43499-app.so",
         "size": 104128
@@ -138,8 +168,12 @@
     {
       "payloadId": "a36xq-A366WVLS3AYG1",
       "displayName": "Galaxy A36 5G | Kernel 6.6.46",
-      "models": ["SM-A366W"],
-      "kernelVersions": ["6.6.46"],
+      "models": [
+        "SM-A366W"
+      ],
+      "kernelVersions": [
+        "6.6.46"
+      ],
       "exploit": {
         "url": "https://raw.githubusercontent.com/BuSung-dev/Root-My-Galaxy-Payloads/main/artifacts/a36xq-A366WVLS3AYG1/cve-2026-43499-app.so",
         "size": 128688
@@ -152,8 +186,18 @@
     {
       "payloadId": "dm3q-S9180ZHS8FZF5",
       "displayName": "Galaxy S23 Ultra | Kernel 5.15.189",
-      "models": ["SM-S9180", "SM-S918B", "SM-S918N", "SM-S918Q", "SM-S918U", "SM-S918W", "SM-S918U1"],
-      "kernelVersions": ["5.15.189"],
+      "models": [
+        "SM-S9180",
+        "SM-S918B",
+        "SM-S918N",
+        "SM-S918Q",
+        "SM-S918U",
+        "SM-S918W",
+        "SM-S918U1"
+      ],
+      "kernelVersions": [
+        "5.15.189"
+      ],
       "exploit": {
         "url": "https://raw.githubusercontent.com/BuSung-dev/Root-My-Galaxy-Payloads/main/artifacts/dm3q-S9180ZHS8FZF5/cve-2026-43499-app.so",
         "size": 137728
@@ -166,8 +210,12 @@
     {
       "payloadId": "e1s-S921NKSSFDZF3",
       "displayName": "Galaxy S24 | Kernel 6.1.157",
-      "models": ["SM-S921N"],
-      "kernelVersions": ["6.1.157"],
+      "models": [
+        "SM-S921N"
+      ],
+      "kernelVersions": [
+        "6.1.157"
+      ],
       "requiresFreshP0Session": true,
       "exploit": {
         "url": "https://raw.githubusercontent.com/BuSung-dev/Root-My-Galaxy-Payloads/main/artifacts/e1s-S921NKSSFDZF3/cve-2026-43499-app.so",
@@ -177,6 +225,29 @@
         "url": "https://raw.githubusercontent.com/BuSung-dev/Root-My-Galaxy-Payloads/main/kernelsu/ksud-e1s-S921NKSSFDZF3-kdp",
         "size": 4758872
       }
+    },
+    {
+      "payloadId": "f946b-F946BXXS7GZE5",
+      "displayName": "Galaxy Z Fold 5 | Kernel 5.15.189",
+      "models": [
+        "SM-F946B"
+      ],
+      "kernelVersions": [
+        "5.15.189"
+      ],
+      "exploit": {
+        "url": "https://raw.githubusercontent.com/BuSung-dev/Root-My-Galaxy-Payloads/main/artifacts/f946b-F946BXXS7GZE5/cve-2026-43499-app.so",
+        "size": 126256
+      },
+      "rootHelper": {
+        "url": "https://raw.githubusercontent.com/BuSung-dev/Root-My-Galaxy-Payloads/main/artifacts/f946b-F946BXXS7GZE5/cve-2026-43499-root",
+        "size": 26456
+      },
+      "kernelsu": {
+        "url": "https://raw.githubusercontent.com/BuSung-dev/Root-My-Galaxy-Payloads/main/kernelsu/ksud-f946b-F946BXXS7GZE5-kdp",
+        "size": 4887272
+      },
+      "notes": "Offsets BTF-verified (0 mismatches) vs recovered vmlinux.btf (6.0 MB SHA-256 8d95924649ae54017b0b2cb62c47faeb26bbd4b61c0f325c1d27e0b120cb02e9). P0 fingerprint 32x8 verified from raw Image. Worker caller 0x10db44 & TRACEFS_EVENT_ID 108 live-verified on device RFCWC0G1Z1J 5.15.189-abF946BXXS7GZE5 id=108 slabinfo mm_struct 1024. KSU 371136B ko (vermagic 5.15.189-android13-8-33404244-abF946BXXS7GZE5 211 undef 0 missing 0 CRC manual-reloc) ksud 4887272B android13-5.15_kernelsu.ko Docker built."
     }
   ]
 }
