@@ -2,6 +2,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <sys/file.h>
 #include <dlfcn.h>
 #include <limits.h>
 #include <poll.h>
@@ -28,6 +29,7 @@
 #define HOLD_READY_SOCKET "cve43499_roothold"
 #define SH_PATH "/system/bin/sh"
 #define KSU_LOADER_PATH "/data/local/tmp/ksud-s25u-kdp"
+#define KSU_LATE_LOAD_LOCK_PATH "/data/local/tmp/.cve43499-lateload.lock"
 #define LOGCAT_PATH "/system/bin/logcat"
 
 static uid_t allowed_client_uid = 2000;
@@ -619,8 +621,51 @@ static int verify_kernelsu_control(void) {
  * Core KernelSU late-load work. Runs in the calling (already-forked)
  * process so it can be shared between the socket-request path and the
  * daemon-side activation watcher. Returns the loader/verify exit status.
+ *
+ * Callers must hold the late-load lock (see kernelsu_late_load_core).
  */
-static int kernelsu_late_load_core(void) {
+static int kernelsu_late_load_locked(void) {
+  /* Pre-stage the ksud binary so the loader's self-staging rename step
+   * (/data/local/tmp/.ksud-stage -> /data/adb/ksud) always has a valid
+   * source. On a clean boot the loader's own copy can fail, leaving the
+   * rename source missing and the whole late-load aborted. */
+  mkdir("/data/adb", 0755);
+  {
+    int src = open(KSU_LOADER_PATH, O_RDONLY | O_CLOEXEC);
+    if (src >= 0) {
+      const char *staging_paths[] = {
+          "/data/local/tmp/.ksud-stage",
+          "/data/adb/ksud",
+          NULL,
+      };
+      for (int i = 0; staging_paths[i]; i++) {
+        int dst = open(staging_paths[i],
+                       O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0755);
+        if (dst < 0) {
+          continue;
+        }
+        char buf[65536];
+        for (;;) {
+          ssize_t got = read(src, buf, sizeof(buf));
+          if (got <= 0) {
+            break;
+          }
+          ssize_t off = 0;
+          while (off < got) {
+            ssize_t put = write(dst, buf + off, (size_t)(got - off));
+            if (put <= 0) {
+              break;
+            }
+            off += put;
+          }
+        }
+        close(dst);
+        lseek(src, 0, SEEK_SET);
+      }
+      close(src);
+    }
+  }
+
   if (unshare(CLONE_NEWNS) != 0 ||
       mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) != 0) {
     dprintf(STDERR_FILENO, "late-load: private mount namespace: %s\n",
@@ -652,6 +697,46 @@ static int kernelsu_late_load_core(void) {
     return loader_status;
   }
   return verify_kernelsu_control();
+}
+
+/*
+ * Serialized entry point shared by the socket-request path and the
+ * daemon-side activation watcher. Both fire after a successful exploit
+ * (the marker wakes the watcher while the app-side supervisor also sends
+ * a --late-load request), and ksud's stage step renames away the shared
+ * /data/local/tmp/.ksud-stage source, so concurrent invocations race:
+ * one consumes the staging file and the other aborts with
+ * "Failed to stage ksud". Hold an exclusive flock across the whole
+ * sequence and re-probe under the lock so the losing caller exits 0
+ * once KernelSU is already active.
+ */
+static int kernelsu_late_load_core(void) {
+  int status;
+  int lock_fd = open(KSU_LATE_LOAD_LOCK_PATH, O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+  if (lock_fd >= 0) {
+    for (;;) {
+      if (flock(lock_fd, LOCK_EX) == 0) {
+        break;
+      }
+      if (errno != EINTR) {
+        dprintf(STDERR_FILENO, "late-load: lock: %s\n", strerror(errno));
+        close(lock_fd);
+        lock_fd = -1;
+        break;
+      }
+    }
+  }
+  if (ksu_already_active()) {
+    dprintf(STDOUT_FILENO, "late-load: KernelSU already active, skip loader\n");
+    status = 0;
+  } else {
+    status = kernelsu_late_load_locked();
+  }
+  if (lock_fd >= 0) {
+    flock(lock_fd, LOCK_UN);
+    close(lock_fd);
+  }
+  return status;
 }
 
 /*
@@ -817,6 +902,76 @@ static int run_kernelsu_late_load(struct su_request *request, int conn) {
  */
 #define ACTIVATE_LOG_PATH "/data/local/tmp/ksu-activate.log"
 
+/*
+ * Boot-scoped module-activation completion marker. apply-modules runs ksud
+ * lifecycle stages through /system/bin/su and restarts zygote; it must run
+ * once per boot even though several daemons/watchers may observe the same
+ * activation marker. The marker stores the boot_id of the boot that
+ * completed activation (same pattern as KSU_ACTIVE_MARKER_PATH).
+ */
+#define KSU_MODULES_DONE_PATH "/data/local/tmp/.cve43499-modules-done"
+
+static int modules_done_this_boot(void) {
+  char live_boot_id[64];
+  char saved_boot_id[64];
+  if (!read_boot_id(live_boot_id, sizeof(live_boot_id))) {
+    return 0;
+  }
+  int fd = open(KSU_MODULES_DONE_PATH, O_RDONLY | O_CLOEXEC);
+  if (fd < 0) {
+    return 0;
+  }
+  ssize_t got = read(fd, saved_boot_id, sizeof(saved_boot_id) - 1);
+  close(fd);
+  if (got <= 0) {
+    return 0;
+  }
+  saved_boot_id[got] = '\0';
+  if (got > 0 && (saved_boot_id[got - 1] == '\n' ||
+                  saved_boot_id[got - 1] == '\r')) {
+    saved_boot_id[--got] = '\0';
+  }
+  return strcmp(live_boot_id, saved_boot_id) == 0;
+}
+
+static void mark_modules_done(void) {
+  char live_boot_id[64];
+  if (!read_boot_id(live_boot_id, sizeof(live_boot_id))) {
+    return;
+  }
+  int fd = open(KSU_MODULES_DONE_PATH,
+                O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+  if (fd >= 0) {
+    write_full(fd, live_boot_id, strlen(live_boot_id));
+    close(fd);
+  }
+}
+
+/* Exclusive cross-process lock reused for both late-load and the
+ * module-activation sequence so concurrent daemons/watchers serialize. */
+static int activation_lock_acquire(void) {
+  int fd = open(KSU_LATE_LOAD_LOCK_PATH, O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+  if (fd < 0) {
+    return -1;
+  }
+  for (;;) {
+    if (flock(fd, LOCK_EX) == 0) {
+      return fd;
+    }
+    if (errno != EINTR) {
+      close(fd);
+      return -1;
+    }
+  }
+}
+
+static void activation_lock_release(int fd) {
+  if (fd >= 0) {
+    flock(fd, LOCK_UN);
+    close(fd);
+  }
+}
+
 static void run_activation_sequence(void) {
   int log_fd = open(ACTIVATE_LOG_PATH,
                     O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600);
@@ -826,11 +981,33 @@ static void run_activation_sequence(void) {
     if (log_fd > STDERR_FILENO) {
       close(log_fd);
     }
+  } else {
+    /* SELinux may deny creating the log in shell_data_file depending on
+     * policy version; never let that abort activation. */
+    int nul = open("/dev/null", O_WRONLY | O_CLOEXEC);
+    if (nul >= 0) {
+      dup2(nul, STDOUT_FILENO);
+      dup2(nul, STDERR_FILENO);
+      if (nul > STDERR_FILENO) {
+        close(nul);
+      }
+    }
   }
 
   dprintf(STDOUT_FILENO,
-          "[activate] start uid=%d pid=%d ksu_active=%d\n",
-          getuid(), getpid(), ksu_already_active());
+          "[activate] start uid=%d pid=%d ksu_active=%d done=%d\n",
+          getuid(), getpid(), ksu_already_active(), modules_done_this_boot());
+
+  /* Idempotent: several watchers/daemons can observe the same marker.
+   * Everything below is serialized by the shared lock and keyed to this
+   * boot via modules_done_this_boot(). */
+  int lock_fd = activation_lock_acquire();
+  if (ksu_already_active() && modules_done_this_boot()) {
+    dprintf(STDOUT_FILENO, "[activate] already completed this boot\n");
+    dprintf(STDOUT_FILENO, "[activate] done\n");
+    activation_lock_release(lock_fd);
+    return;
+  }
 
   int ll_status = 1;
   if (!ksu_already_active()) {
@@ -845,7 +1022,15 @@ static void run_activation_sequence(void) {
     ll_status = 0;
   }
 
-  if (ll_status == 0) {
+  /* The ksud loader's self-staging rename step can fail with a non-zero
+   * exit even though the kernel module loaded successfully (the rename
+   * target /data/adb/ksud may already exist or the staging source may be
+   * missing). Do not trust the exit code alone — re-probe the module. If
+   * it is now responding, proceed with module activation regardless. */
+  int ksu_up = ksu_already_active();
+  dprintf(STDOUT_FILENO, "[activate] post-late-load ksu_active=%d\n", ksu_up);
+
+  if ((ll_status == 0 || ksu_up) && !modules_done_this_boot()) {
     /* Record that KernelSU is active for this boot so future pre-exploit
      * checks can detect it without needing a shell root grant. */
     ksu_mark_active_this_boot();
@@ -856,22 +1041,33 @@ static void run_activation_sequence(void) {
     }
     int am_status = (am > 0) ? wait_status(am) : 1;
     dprintf(STDOUT_FILENO, "[activate] apply-modules exit=%d\n", am_status);
+    if (am_status == 0 && ksu_already_active()) {
+      mark_modules_done();
+    }
+  } else if (modules_done_this_boot()) {
+    dprintf(STDOUT_FILENO, "[activate] modules already active this boot\n");
   } else {
     dprintf(STDERR_FILENO,
-            "[activate] late-load failed (%d); skipping module activation\n",
+            "[activate] late-load failed (%d) and module not active; "
+            "skipping module activation\n",
             ll_status);
   }
   dprintf(STDOUT_FILENO, "[activate] done\n");
+  activation_lock_release(lock_fd);
 }
 
 static void activation_watcher(void) {
   prctl(PR_SET_NAME, "cve43499-activate", 0, 0, 0);
   for (;;) {
-    /* Claim the marker atomically: rename succeeds for exactly one watcher
-     * even if a stale daemon from a previous run is still polling. */
-    static const char claimed_path[] = KSU_ACTIVATE_SIGNAL_PATH ".claimed";
-    if (rename(KSU_ACTIVATE_SIGNAL_PATH, claimed_path) == 0) {
-      unlink(claimed_path);
+    /* Poll for marker existence instead of claiming it via rename: the
+     * daemon's u:r:kernel:s0 domain may lack remove_name/rename rights on
+     * shell_data_file after SELinux re-enforces, which previously left the
+     * marker unclaimed forever. Completion is tracked by the boot-scoped
+     * done flag and the whole sequence is flock-serialized, so duplicate
+     * wake-ups are harmless. The unlink is best-effort only. */
+    struct stat st;
+    if (stat(KSU_ACTIVATE_SIGNAL_PATH, &st) == 0 &&
+        !modules_done_this_boot()) {
       pid_t ap = fork();
       if (ap == 0) {
         run_activation_sequence();
@@ -879,6 +1075,13 @@ static void activation_watcher(void) {
       }
       if (ap > 0) {
         wait_status(ap);
+      }
+      if (modules_done_this_boot()) {
+        unlink(KSU_ACTIVATE_SIGNAL_PATH);
+      } else {
+        /* Activation incomplete (e.g. sucompat not ready yet); retry after
+         * a short backoff instead of hot-spinning. */
+        sleep(5);
       }
     }
     sleep(1);
@@ -1139,6 +1342,16 @@ static int client_send_request(int conn, int argc, char **argv,
 static int client_main(int argc, char **argv) {
   int conn = connect_daemon();
   if (conn < 0) {
+    /* Once SELinux re-enforces, shell-domain clients can no longer reach
+     * the daemon socket. If KernelSU is in fact already active this boot,
+     * a --late-load request is moot: report success instead of an error so
+     * callers (the auto-root app flow) do not surface a failure. */
+    if (su_probe_active() || ksu_active_this_boot()) {
+      dprintf(STDERR_FILENO,
+              "late-load: daemon unreachable but KernelSU is already "
+              "active this boot; nothing to do\n");
+      return 0;
+    }
     return 127;
   }
 
@@ -1257,8 +1470,22 @@ static int daemon_main(void) {
   struct sockaddr_un sun;
   memset(&sun, 0, sizeof(sun));
   sun.sun_family = AF_UNIX;
-  unlink(BOOTSTRAP_SOCK_PATH);
   snprintf(sun.sun_path, sizeof(sun.sun_path), "%s", BOOTSTRAP_SOCK_PATH);
+
+  /* The UMH path can queue the daemon more than once. A second bind would
+   * unlink and steal the first daemon's socket, orphaning its clients.
+   * If another daemon already listens, exit quietly — activation is
+   * idempotent and that instance's watcher handles everything. */
+  int probe = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  if (probe >= 0) {
+    if (connect(probe, (struct sockaddr *)&sun, sizeof(sun)) == 0) {
+      close(probe);
+      close(fd);
+      return 0;
+    }
+    close(probe);
+  }
+  unlink(BOOTSTRAP_SOCK_PATH);
 
   if (bind(fd, (struct sockaddr *)&sun, sizeof(sun)) != 0 ||
       listen(fd, 16) != 0) {
@@ -1435,6 +1662,286 @@ static pid_t follow_payload_log(const char *path, int transport_fd,
   }
 }
 
+/*
+ * Feed-driven artifact freshness check (auto-root self-update).
+ *
+ * The app caches payloads in its private storage and re-pushes the cached
+ * bytes on every auto-root boot, so stale artifacts survive forever. Before
+ * exploiting, fetch support/targets-v3.json from the payload repository,
+ * locate the entry matching this device model, and compare each artifact's
+ * recorded size against the local file. Download and atomically replace any
+ * file whose size differs (raw.githubusercontent URLs do not expose a
+ * usable Last-Modified, so the manifest size is the freshness signal).
+ *
+ * Best-effort and fail-open: any network or parse error keeps the local
+ * files untouched. Set RMG_SELF_UPDATE=0 to disable.
+ */
+#define RMG_FEED_URL "https://raw.githubusercontent.com/HyperRamzey/" \
+    "Root-My-Galaxy-Payloads/main/support/targets-v3.json"
+#define RMG_CURL_PATH "/system/bin/curl"
+#define RMG_TMP_BASE "/data/local/tmp/.rmg-dl"
+#define RMG_ARTIFACT_COUNT 3
+
+struct rmg_artifact_info {
+  char url[512];
+  long size;
+};
+
+static int rmg_fetch_url(const char *url, const char *out_path,
+                         int timeout_sec) {
+  pid_t pid = fork();
+  if (pid < 0) {
+    return -1;
+  }
+  if (pid == 0) {
+    int devnull = open("/dev/null", O_WRONLY | O_CLOEXEC);
+    if (devnull >= 0) {
+      dup2(devnull, STDOUT_FILENO);
+      dup2(devnull, STDERR_FILENO);
+      if (devnull > STDERR_FILENO) {
+        close(devnull);
+      }
+    }
+    char timeout_arg[16];
+    snprintf(timeout_arg, sizeof(timeout_arg), "%d", timeout_sec);
+    execl(RMG_CURL_PATH, "curl", "-fsSL", "--max-time", timeout_arg, "-o",
+          out_path, url, (char *)NULL);
+    _exit(127);
+  }
+  int status = 0;
+  if (waitpid(pid, &status, 0) < 0) {
+    return -1;
+  }
+  if (WIFEXITED(status)) {
+    return WEXITSTATUS(status);
+  }
+  return -1;
+}
+
+static long rmg_file_size(const char *path) {
+  struct stat st;
+  if (stat(path, &st) != 0) {
+    return -1;
+  }
+  return (long)st.st_size;
+}
+
+/* Find the JSON object for this device's model and pull url/size for the
+ * three artifact keys. Tolerates arbitrary whitespace around separators. */
+static int rmg_parse_feed(const char *json, const char *model,
+                          struct rmg_artifact_info out[RMG_ARTIFACT_COUNT]) {
+  static const char *keys[RMG_ARTIFACT_COUNT] = {"exploit", "rootHelper",
+                                                 "kernelsu"};
+  const char *model_pos = strstr(json, model);
+  if (!model_pos) {
+    return -1;
+  }
+  /* Back up to the start of this payload object. */
+  const char *seg_start = json;
+  for (const char *p = json; p < model_pos; p++) {
+    if (p[0] == '{' && strncmp(p + 1, "\"payloadId\"", 11) == 0) {
+      seg_start = p;
+    }
+  }
+  /* Segment ends at the next payload object or EOF. */
+  const char *seg_end = json + strlen(json);
+  for (const char *p = model_pos + 1; *p; p++) {
+    if (p[0] == '{' && strncmp(p + 1, "\"payloadId\"", 11) == 0) {
+      seg_end = p;
+      break;
+    }
+  }
+
+  memset(out, 0, sizeof(*out) * RMG_ARTIFACT_COUNT);
+  for (int i = 0; i < RMG_ARTIFACT_COUNT; i++) {
+    char key[64];
+    snprintf(key, sizeof(key), "\"%s\"", keys[i]);
+    const char *kpos = NULL;
+    for (const char *p = seg_start; p + strlen(key) <= seg_end; p++) {
+      if (strncmp(p, key, strlen(key)) == 0) {
+        kpos = p;
+        break;
+      }
+    }
+    if (!kpos) {
+      continue;
+    }
+    const char *cursor = kpos + strlen(key);
+    const char *limit = seg_end;
+
+    const char *ukey = "\"url\"";
+    const char *upos = NULL;
+    for (const char *p = cursor; p + strlen(ukey) <= limit; p++) {
+      if (strncmp(p, ukey, strlen(ukey)) == 0) {
+        upos = p;
+        break;
+      }
+    }
+    if (upos) {
+      upos = strchr(upos + strlen(ukey), ':');
+      while (upos && *upos && *upos != '"') {
+        upos++;
+      }
+      if (upos && *upos == '"' && (size_t)(limit - upos) > 1) {
+        upos++;
+        size_t n = 0;
+        while (upos[n] && upos[n] != '"' &&
+               n < sizeof(out[i].url) - 1 &&
+               upos + n < limit) {
+          n++;
+        }
+        memcpy(out[i].url, upos, n);
+        out[i].url[n] = '\0';
+      }
+    }
+
+    const char *skey = "\"size\"";
+    const char *spos = NULL;
+    for (const char *p = cursor; p + strlen(skey) <= limit; p++) {
+      if (strncmp(p, skey, strlen(skey)) == 0) {
+        spos = p;
+        break;
+      }
+    }
+    if (spos) {
+      spos = strchr(spos + strlen(skey), ':');
+      if (spos && spos < limit) {
+        out[i].size = strtol(spos + 1, NULL, 10);
+      }
+    }
+  }
+  return 0;
+}
+
+/* Atomically replace target with tmp (same filesystem by construction). */
+static int rmg_install(const char *tmp, const char *target) {
+  chmod(tmp, 0755);
+  if (rename(tmp, target) != 0) {
+    unlink(tmp);
+    return -1;
+  }
+  return 0;
+}
+
+static void self_update_artifacts(int report_fd, const char *payload_path,
+                                  const char *helper_arg) {
+  const char *disabled = getenv("RMG_SELF_UPDATE");
+  if (disabled && strcmp(disabled, "0") == 0) {
+    return;
+  }
+
+  char model[PROP_VALUE_MAX];
+  if (__system_property_get("ro.product.model", model) <= 0) {
+    return;
+  }
+
+  const char *feed_tmp = RMG_TMP_BASE "-feed.json";
+  unlink(feed_tmp);
+  if (rmg_fetch_url(RMG_FEED_URL, feed_tmp, 20) != 0 ||
+      rmg_file_size(feed_tmp) <= 0) {
+    dprintf(report_fd, "[self-update] feed unreachable; keeping local "
+                       "artifacts\n");
+    unlink(feed_tmp);
+    return;
+  }
+
+  FILE *f = fopen(feed_tmp, "rb");
+  if (!f) {
+    unlink(feed_tmp);
+    return;
+  }
+  fseek(f, 0, SEEK_END);
+  long len = ftell(f);
+  fseek(f, 0, SEEK_SET);
+  if (len <= 0 || len > 4 * 1024 * 1024) {
+    fclose(f);
+    unlink(feed_tmp);
+    return;
+  }
+  char *json = malloc((size_t)len + 1);
+  if (!json || fread(json, 1, (size_t)len, f) != (size_t)len) {
+    free(json);
+    fclose(f);
+    unlink(feed_tmp);
+    return;
+  }
+  json[len] = '\0';
+  fclose(f);
+  unlink(feed_tmp);
+
+  struct rmg_artifact_info info[RMG_ARTIFACT_COUNT];
+  if (rmg_parse_feed(json, model, info) != 0) {
+    dprintf(report_fd, "[self-update] no feed entry for model %s\n", model);
+    free(json);
+    return;
+  }
+  free(json);
+
+  const char *targets[RMG_ARTIFACT_COUNT];
+  targets[0] = payload_path;   /* exploit */
+  targets[1] = helper_arg;     /* rootHelper (this binary) */
+  targets[2] = KSU_LOADER_PATH /* kernelsu */;
+  static const char *names[RMG_ARTIFACT_COUNT] = {"exploit", "root-helper",
+                                                  "ksud"};
+
+  int updated = 0;
+  for (int i = 0; i < RMG_ARTIFACT_COUNT; i++) {
+    if (info[i].url[0] == '\0' || !targets[i]) {
+      continue;
+    }
+    long local = rmg_file_size(targets[i]);
+    if (info[i].size > 0 && local == info[i].size) {
+      dprintf(report_fd, "[self-update] %s up-to-date (%ld bytes)\n",
+              names[i], local);
+      continue;
+    }
+    char tmp[128];
+    snprintf(tmp, sizeof(tmp), "%s-%d", RMG_TMP_BASE, i);
+    unlink(tmp);
+    dprintf(report_fd,
+            "[self-update] %s local=%ld remote=%ld -> downloading\n",
+            names[i], local, info[i].size);
+    if (rmg_fetch_url(info[i].url, tmp, 120) != 0) {
+      dprintf(report_fd, "[self-update] %s download failed\n", names[i]);
+      unlink(tmp);
+      continue;
+    }
+    long got = rmg_file_size(tmp);
+    if (info[i].size > 0 && got != info[i].size) {
+      dprintf(report_fd, "[self-update] %s size mismatch got=%ld\n", names[i],
+              got);
+      unlink(tmp);
+      continue;
+    }
+    if (rmg_install(tmp, targets[i]) != 0) {
+      dprintf(report_fd, "[self-update] %s install failed errno=%d\n",
+              names[i], errno);
+      continue;
+    }
+    updated++;
+    dprintf(report_fd, "[self-update] %s updated (%ld bytes)\n", names[i],
+            got);
+    if (i == 2) {
+      /* Keep the pre-staged loader copy in sync with ksud. */
+      long src = open(KSU_LOADER_PATH, O_RDONLY | O_CLOEXEC);
+      if (src >= 0) {
+        int dst = open("/data/local/tmp/.ksud-stage",
+                       O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0755);
+        if (dst >= 0) {
+          char buf[65536];
+          ssize_t gotb;
+          while ((gotb = read(src, buf, sizeof(buf))) > 0) {
+            write_full(dst, buf, (size_t)gotb);
+          }
+          close(dst);
+        }
+        close(src);
+      }
+    }
+  }
+  dprintf(report_fd, "[self-update] finished updated=%d\n", updated);
+}
+
 static int payload_runner_main(int argc, char **argv) {
   if (argc != 5) {
     return 2;
@@ -1444,6 +1951,11 @@ static int payload_runner_main(int argc, char **argv) {
   if (transport_fd < 0) {
     return errno;
   }
+
+  /* Refresh stale artifacts from the payload repository before doing
+   * anything else; the app keeps re-pushing its cached (possibly outdated)
+   * copies on every auto-root boot. */
+  self_update_artifacts(transport_fd, argv[2], argv[3]);
 
   /* Pre-exploit KernelSU liveness check. If KernelSU is already active this
    * boot (a previous run already rooted and late-loaded), skip the exploit
