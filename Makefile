@@ -48,9 +48,11 @@ APP_PRELOAD_SRCS := \
   src/preload.c
 
 COMMON_CFLAGS := \
-  -O2 -g0 -Wall -Wextra \
+  -O3 -g0 -Wall -Wextra -march=armv8-a+crc+crypto -mtune=cortex-x3 -flto=thin -ffunction-sections -fdata-sections -fomit-frame-pointer -fno-unwind-tables -fno-asynchronous-unwind-tables -fvisibility=hidden \
   -Wno-unused-parameter -Wno-sign-compare \
   -Isrc -DTARGET_HEADER='"$(TARGET_INCLUDE)"'
+
+COMMON_LDFLAGS := -flto=thin -Wl,--gc-sections -Wl,-O3 -Wl,--icf=all
 
 .DEFAULT_GOAL := all
 
@@ -65,14 +67,14 @@ $(OUTDIR):
 
 $(PRELOAD): $(PRELOAD_SRCS) $(TARGET_HEADER) src/offset.h src/common.h src/kernelsnitch/*.h | $(OUTDIR)
 	$(TARGET_CC) -fPIC $(COMMON_CFLAGS) $(PRELOAD_SRCS) \
-	  -shared -pthread -o $@
+	  -shared -pthread $(COMMON_LDFLAGS) -o $@
 
 $(ROOT_HELPER): src/su_daemon.c | $(OUTDIR)
-	$(TARGET_CC) -fPIE -pie -O2 -g0 -Wall -Wextra $< -ldl -o $@
+	$(TARGET_CC) -fPIE -pie -O3 -g0 -Wall -Wextra -march=armv8-a+crc+crypto -mtune=cortex-x3 -flto=thin -ffunction-sections -fdata-sections -fomit-frame-pointer -fno-unwind-tables -fno-asynchronous-unwind-tables -fvisibility=hidden $< -ldl $(COMMON_LDFLAGS) -o $@
 
 $(APP_PRELOAD): $(APP_PRELOAD_SRCS) $(TARGET_HEADER) src/offset.h src/common.h src/kernelsnitch/*.h | $(OUTDIR)
 	$(TARGET_CC) -DAPP_PAYLOAD=1 $(APP_TARGET_CFLAGS) -fPIC $(COMMON_CFLAGS) $(APP_PRELOAD_SRCS) \
-	  -shared -pthread -o $@
+	  -shared -pthread $(COMMON_LDFLAGS) -o $@
 
 $(APP_RELEASE): $(APP_PRELOAD_SRCS) $(TARGET_HEADER) src/offset.h src/common.h src/kernelsnitch/*.h | $(OUTDIR)
 	$(TARGET_CC) -DAPP_PAYLOAD=1 $(APP_TARGET_CFLAGS) -fPIC -Oz -g0 \
