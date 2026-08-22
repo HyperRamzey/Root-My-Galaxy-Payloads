@@ -622,7 +622,9 @@ static int verify_kernelsu_control(void) {
  * process so it can be shared between the socket-request path and the
  * daemon-side activation watcher. Returns the loader/verify exit status.
  *
- * Callers must hold the late-load lock (see kernelsu_late_load_core).
+ * Callers are responsible for serialization via activation_lock_acquire()
+ * before reaching this function (see run_kernelsu_late_load and
+ * run_activation_sequence).
  */
 static int kernelsu_late_load_locked(void) {
   /* Pre-stage the ksud binary so the loader's self-staging rename step
@@ -700,43 +702,18 @@ static int kernelsu_late_load_locked(void) {
 }
 
 /*
- * Serialized entry point shared by the socket-request path and the
- * daemon-side activation watcher. Both fire after a successful exploit
- * (the marker wakes the watcher while the app-side supervisor also sends
- * a --late-load request), and ksud's stage step renames away the shared
- * /data/local/tmp/.ksud-stage source, so concurrent invocations race:
- * one consumes the staging file and the other aborts with
- * "Failed to stage ksud". Hold an exclusive flock across the whole
- * sequence and re-probe under the lock so the losing caller exits 0
- * once KernelSU is already active.
+ * Unlocked late-load work. Callers are responsible for serialization via
+ * activation_lock_acquire() — the daemon-side activation sequence holds
+ * it across this call, and run_kernelsu_late_load() takes it for socket
+ * requests. Nesting another acquisition here would deadlock a forked
+ * child against its own parent (flock is per open-file-description).
  */
 static int kernelsu_late_load_core(void) {
-  int status;
-  int lock_fd = open(KSU_LATE_LOAD_LOCK_PATH, O_RDWR | O_CREAT | O_CLOEXEC, 0644);
-  if (lock_fd >= 0) {
-    for (;;) {
-      if (flock(lock_fd, LOCK_EX) == 0) {
-        break;
-      }
-      if (errno != EINTR) {
-        dprintf(STDERR_FILENO, "late-load: lock: %s\n", strerror(errno));
-        close(lock_fd);
-        lock_fd = -1;
-        break;
-      }
-    }
-  }
   if (ksu_already_active()) {
     dprintf(STDOUT_FILENO, "late-load: KernelSU already active, skip loader\n");
-    status = 0;
-  } else {
-    status = kernelsu_late_load_locked();
+    return 0;
   }
-  if (lock_fd >= 0) {
-    flock(lock_fd, LOCK_UN);
-    close(lock_fd);
-  }
-  return status;
+  return kernelsu_late_load_locked();
 }
 
 /*
@@ -867,9 +844,44 @@ static int run_apply_modules(struct su_request *request, int conn) {
   return wait_status(pid);
 }
 
+/*
+ * Exclusive cross-process lock shared by the daemon-side activation
+ * sequence and socket-request late-loads so concurrent triggers
+ * serialize. Never held across a fork that re-acquires it: flock is per
+ * open-file-description and a child taking LOCK_EX on the same file would
+ * deadlock against its own parent.
+ */
+static int activation_lock_acquire(void) {
+  int fd = open(KSU_LATE_LOAD_LOCK_PATH, O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+  if (fd < 0) {
+    return -1;
+  }
+  for (;;) {
+    if (flock(fd, LOCK_EX) == 0) {
+      return fd;
+    }
+    if (errno != EINTR) {
+      close(fd);
+      return -1;
+    }
+  }
+}
+
+static void activation_lock_release(int fd) {
+  if (fd >= 0) {
+    flock(fd, LOCK_UN);
+    close(fd);
+  }
+}
+
 static int run_kernelsu_late_load(struct su_request *request, int conn) {
+  /* Serialize against the daemon-side activation sequence; the child
+   * inherits the lock fd so the lock is held until it exits. */
+  int lock_fd = activation_lock_acquire();
+  int status = 1;
   pid_t pid = fork();
   if (pid < 0) {
+    activation_lock_release(lock_fd);
     return 1;
   }
   if (pid == 0) {
@@ -884,7 +896,9 @@ static int run_kernelsu_late_load(struct su_request *request, int conn) {
     _exit(kernelsu_late_load_core());
   }
   close_request_fds(request);
-  return wait_status(pid);
+  status = wait_status(pid);
+  activation_lock_release(lock_fd);
+  return status;
 }
 
 /*
@@ -899,8 +913,9 @@ static int run_kernelsu_late_load(struct su_request *request, int conn) {
  * it and performs late-load + module activation from the daemon's own
  * context, which is always reachable. Output goes to a dedicated log so the
  * sequence is inspectable.
- */
+  */
 #define ACTIVATE_LOG_PATH "/data/local/tmp/ksu-activate.log"
+
 
 /*
  * Boot-scoped module-activation completion marker. apply-modules runs ksud
@@ -943,31 +958,6 @@ static void mark_modules_done(void) {
                 O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
   if (fd >= 0) {
     write_full(fd, live_boot_id, strlen(live_boot_id));
-    close(fd);
-  }
-}
-
-/* Exclusive cross-process lock reused for both late-load and the
- * module-activation sequence so concurrent daemons/watchers serialize. */
-static int activation_lock_acquire(void) {
-  int fd = open(KSU_LATE_LOAD_LOCK_PATH, O_RDWR | O_CREAT | O_CLOEXEC, 0644);
-  if (fd < 0) {
-    return -1;
-  }
-  for (;;) {
-    if (flock(fd, LOCK_EX) == 0) {
-      return fd;
-    }
-    if (errno != EINTR) {
-      close(fd);
-      return -1;
-    }
-  }
-}
-
-static void activation_lock_release(int fd) {
-  if (fd >= 0) {
-    flock(fd, LOCK_UN);
     close(fd);
   }
 }
