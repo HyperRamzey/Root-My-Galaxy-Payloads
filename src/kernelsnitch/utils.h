@@ -134,19 +134,76 @@
 #define PAGE_SIZE 4096
 #endif
 
+static inline int pin_to_core_try(size_t core)
+{
+    cpu_set_t requested;
+    CPU_ZERO(&requested);
+    if (core >= CPU_SETSIZE) return -1;
+    CPU_SET(core, &requested);
+    return sched_setaffinity(0, sizeof(requested), &requested);
+}
+
 static inline void pin_to_core(size_t core)
 {
-    cpu_set_t cpuset;
-    CPU_ZERO(&cpuset);
-    CPU_SET(core, &cpuset);
-    SYSCHK(sched_setaffinity(0, sizeof(cpu_set_t), &cpuset));
+    cpu_set_t allowed;
+    if (sched_getaffinity(0, sizeof(allowed), &allowed) == 0) {
+        if (core < CPU_SETSIZE && CPU_ISSET(core, &allowed)) {
+            cpu_set_t req;
+            CPU_ZERO(&req);
+            CPU_SET(core, &req);
+            if (sched_setaffinity(0, sizeof(req), &req) == 0) return;
+            pr_warning("pin_to_core %zu: sched_setaffinity errno=%d (allowed but failed)\n",
+                       core, errno);
+        } else {
+            char mask_str[128] = {0};
+            size_t pos = 0;
+            for (int i = 0; i < CPU_SETSIZE && pos + 8 < sizeof(mask_str); i++) {
+                if (CPU_ISSET(i, &allowed)) {
+                    int n = snprintf(mask_str + pos, sizeof(mask_str) - pos,
+                                     "%s%d", pos ? "," : "", i);
+                    if (n > 0) pos += (size_t)n;
+                }
+            }
+            pr_warning("pin_to_core %zu not in allowed mask [%s], fallback to highest allowed\n",
+                       core, mask_str[0] ? mask_str : "?");
+        }
+        /* Fallback: pick highest allowed CPU (perf cluster) */
+        for (int c = CPU_SETSIZE - 1; c >= 0; --c) {
+            if (CPU_ISSET(c, &allowed)) {
+                cpu_set_t req;
+                CPU_ZERO(&req);
+                CPU_SET((size_t)c, &req);
+                if (sched_setaffinity(0, sizeof(req), &req) == 0) {
+                    if ((size_t)c != core)
+                        pr_warning("pin_to_core %zu -> fallback core %d ok\n", core, c);
+                    return;
+                }
+            }
+        }
+        pr_warning("pin_to_core %zu: no fallback succeeded errno=%d, continuing unpinned\n",
+                   core, errno);
+        return;
+    }
+    /* sched_getaffinity failed: try direct and tolerate failure */
+    pr_warning("pin_to_core %zu: sched_getaffinity errno=%d, trying direct\n", core, errno);
+    if (pin_to_core_try(core) == 0) return;
+    pr_warning("pin_to_core %zu direct failed errno=%d, continuing unpinned\n", core, errno);
 }
 
 static inline void reset_cpu_pin(void)
 {
+    cpu_set_t allowed;
+    if (sched_getaffinity(0, sizeof(allowed), &allowed) == 0) {
+        /* Restore to full allowed mask instead of 0xff over 1024 bits */
+        if (sched_setaffinity(0, sizeof(allowed), &allowed) == 0) return;
+        pr_warning("reset_cpu_pin: sched_setaffinity allowed mask errno=%d\n", errno);
+        return;
+    }
     cpu_set_t cpuset;
     memset(&cpuset, 0xff, sizeof(cpu_set_t));
-    SYSCHK(sched_setaffinity(0, sizeof(cpu_set_t), &cpuset));
+    if (sched_setaffinity(0, sizeof(cpuset), &cpuset) != 0) {
+        pr_warning("reset_cpu_pin fallback errno=%d\n", errno);
+    }
 }
 
 static inline void set_limit(void)
