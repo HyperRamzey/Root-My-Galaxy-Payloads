@@ -223,8 +223,57 @@ static pid_t spawn_allocation_keeper(void) {
     .tv_sec = 86400,
     .tv_nsec = 0,
   };
+  /*
+   * Shell-context activation actor. The root daemon cannot run the module
+   * lifecycle itself (its kernel domain cannot exec /system/bin/su), so
+   * this long-lived keeper — running as the invoking shell uid with full
+   * lifetime across boot — performs it once KernelSU appears, exactly once
+   * per boot, serialized against the daemon's watcher via the shared
+   * late-load lock.
+   */
+  struct timespec tick = {
+    .tv_sec = 5,
+    .tv_nsec = 0,
+  };
+  int backoff = 0;
+
   for (;;) {
-    syscall(SYS_nanosleep, &hold, NULL);
+    syscall(SYS_nanosleep, &tick, NULL);
+    if (backoff > 0) {
+      backoff--;
+      continue;
+    }
+    if (!ksu_module_loaded()) {
+      continue;
+    }
+    if (modules_done_this_boot()) {
+      syscall(SYS_nanosleep, &hold, NULL);
+    }
+    int lock_fd = activation_lock_acquire();
+    if (lock_fd < 0) {
+      backoff = 6;
+      continue;
+    }
+    if (!modules_done_this_boot()) {
+      pid_t ap = fork();
+      if (ap == 0) {
+        execl("/system/bin/su", "su", "-c", KSU_APPLY_SCRIPT, (char *)NULL);
+        _exit(127);
+      }
+      if (ap > 0) {
+        int status = 0;
+        while (waitpid(ap, &status, 0) < 0 && errno == EINTR) {
+        }
+        if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+          mark_modules_done();
+        } else {
+          backoff = 12;
+        }
+      } else {
+        backoff = 6;
+      }
+    }
+    activation_lock_release(lock_fd);
   }
 }
 

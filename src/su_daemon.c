@@ -19,10 +19,12 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/system_properties.h>
+#include <sys/sysinfo.h>
 #include <sys/types.h>
 #include <sys/un.h>
 #include <sys/wait.h>
 #include <termios.h>
+#include <time.h>
 #include <unistd.h>
 
 #define BOOTSTRAP_SOCK_PATH "/data/local/tmp/temp_su.sock"
@@ -30,6 +32,33 @@
 #define SH_PATH "/system/bin/sh"
 #define KSU_LOADER_PATH "/data/local/tmp/ksud-s25u-kdp"
 #define KSU_LATE_LOAD_LOCK_PATH "/data/local/tmp/.cve43499-lateload.lock"
+
+/*
+ * KernelSU module lifecycle driver, executed via `su -c` from a
+ * shell/app context (see apply_modules_core). Exits non-zero unless all
+ * lifecycle stages succeeded and a zygote was actually restarted.
+ */
+#define KSU_APPLY_SCRIPT \
+  "ksud=''; " \
+  "for p in /data/adb/ksud /data/adb/ksu/bin/ksud " \
+  "/data/local/tmp/ksud-s25u-kdp; do " \
+  "[ -x \"$p\" ] && ksud=\"$p\" && break; " \
+  "done; " \
+  "if [ -z \"$ksud\" ]; then " \
+  "echo 'apply-modules: no ksud binary found' >&2; exit 1; " \
+  "fi; " \
+  "rc=0; " \
+  "for s in post-fs-data services boot-completed; do " \
+  "\"$ksud\" \"$s\" >/dev/null 2>&1 || rc=1; " \
+  "echo \"apply-modules: ksud $s exit=$? ($ksud)\"; " \
+  "done; " \
+  "killed=0; " \
+  "for p in $(pidof zygote64) $(pidof zygote); do " \
+  "kill -9 $p 2>/dev/null && killed=1; " \
+  "done; " \
+  "if [ \"$killed\" = 0 ]; then echo 'apply-modules: no zygote killed' >&2; " \
+  "rc=1; fi; " \
+  "exit $rc"
 #define LOGCAT_PATH "/system/bin/logcat"
 
 static uid_t allowed_client_uid = 2000;
@@ -437,6 +466,35 @@ static int ksu_already_active(void) {
   return ret == 0 && info.version != 0;
 }
 
+/* Universal liveness probe: /proc/modules is readable from every SELinux
+ * context, unlike the reboot probe above which needs CAP_SYS_BOOT. */
+static int ksu_module_loaded(void) {
+  int fd = open("/proc/modules", O_RDONLY | O_CLOEXEC);
+  if (fd < 0) {
+    return 0;
+  }
+  char buf[4096];
+  size_t carry = 0;
+  int found = 0;
+  ssize_t n;
+  while (!found && (n = read(fd, buf + carry, sizeof(buf) - carry)) > 0) {
+    size_t len = carry + (size_t)n;
+    for (size_t i = 0; i + 8 <= len; i++) {
+      if (buf[i] == 'k' && memcmp(buf + i, "kernelsu", 8) == 0 &&
+          (i + 8 == len || buf[i + 8] == ' ' || buf[i + 8] == '\n')) {
+        found = 1;
+        break;
+      }
+    }
+    if (!found) {
+      carry = len < 8 ? len : 7;
+      memmove(buf, buf + len - carry, carry);
+    }
+  }
+  close(fd);
+  return found;
+}
+
 /*
  * Activation handoff marker. The exploit side (runner or preload
  * supervisor) drops this file once root is installed; the daemon's
@@ -480,26 +538,7 @@ static int read_boot_id(char *out, size_t out_len) {
 }
 
 static int ksu_active_this_boot(void) {
-  char live_boot_id[64];
-  char marker_boot_id[64];
-  if (!read_boot_id(live_boot_id, sizeof(live_boot_id))) {
-    return 0;
-  }
-  int fd = open(KSU_ACTIVE_MARKER_PATH, O_RDONLY | O_CLOEXEC);
-  if (fd < 0) {
-    return 0;
-  }
-  ssize_t got = read(fd, marker_boot_id, sizeof(marker_boot_id) - 1);
-  close(fd);
-  if (got <= 0) {
-    return 0;
-  }
-  marker_boot_id[got] = '\0';
-  while (got > 0 &&
-         (marker_boot_id[got - 1] == '\n' || marker_boot_id[got - 1] == '\r')) {
-    marker_boot_id[--got] = '\0';
-  }
-  return strcmp(live_boot_id, marker_boot_id) == 0;
+  return ksu_module_loaded();
 }
 
 static void ksu_mark_active_this_boot(void) {
@@ -729,99 +768,29 @@ static int kernelsu_late_load_core(void) {
  * sepolicy patching and zygote signals are all permitted (uid 0 is always
  * allowed by KernelSU sucompat, no manager grant needed).
  */
-static const char APPLY_MODULES_SU_SCRIPT[] =
-    "ksud=''; "
-    "for p in /data/adb/ksud /data/adb/ksu/bin/ksud "
-    "/data/local/tmp/ksud-s25u-kdp; do "
-    "[ -x \"$p\" ] && ksud=\"$p\" && break; "
-    "done; "
-    "if [ -z \"$ksud\" ]; then "
-    "echo 'apply-modules: no ksud binary found' >&2; exit 1; "
-    "fi; "
-    "for s in post-fs-data services boot-completed; do "
-    "\"$ksud\" \"$s\" >/dev/null 2>&1; "
-    "echo \"apply-modules: ksud $s exit=$? ($ksud)\"; "
-    "done; "
-    "for p in $(pidof zygote64) $(pidof zygote); do "
-    "kill -9 $p 2>/dev/null; "
-    "done; "
-    "echo 'apply-modules: zygote restart triggered'";
-
+/*
+ * Module activation must run from a shell/app context: sucompat intercepts
+ * exec("/system/bin/su") and redirects it into /data/adb, which the
+ * daemon's u:r:kernel:s0 domain cannot access, so the exec fails (exit
+ * 127) here. Shell-context actors — the payload's stability keeper and any
+ * su client — run KSU_APPLY_SCRIPT successfully instead; this daemon-side
+ * attempt stays as a best-effort probe that honestly reports failure so a
+ * no-op is never mistaken for completion.
+ */
 static int apply_modules_core(void) {
   set_root_env();
 
-  /* Preferred path: run the whole lifecycle through su (ksu domain). */
   pid_t mp = fork();
   if (mp == 0) {
-    execl("/system/bin/su", "su", "-c", APPLY_MODULES_SU_SCRIPT,
-          (char *)NULL);
+    execl("/system/bin/su", "su", "-c", KSU_APPLY_SCRIPT, (char *)NULL);
+    int saved_errno = errno;
+    dprintf(STDERR_FILENO, "apply-modules: exec su failed errno=%d\n",
+            saved_errno);
     _exit(127);
   }
   int su_status = (mp > 0) ? wait_status(mp) : 1;
   dprintf(STDOUT_FILENO, "apply-modules: su script exit=%d\n", su_status);
-  if (su_status == 0) {
-    return 0;
-  }
-
-  /* Fallback: direct exec from this domain. Only works when SELinux is
-   * still permissive or the ksud sepolicy patch was already applied this
-   * boot (e.g. re-activation after a soft reboot). */
-  dprintf(STDERR_FILENO,
-          "apply-modules: su path failed (%d); trying direct exec\n",
-          su_status);
-  const char *ksud_paths[] = {
-      "/data/adb/ksud",
-      "/data/local/tmp/ksud-s25u-kdp",
-      "/data/adb/ksu/bin/ksud",
-      NULL,
-  };
-  const char *ksud = NULL;
-  for (int i = 0; ksud_paths[i]; i++) {
-    if (access(ksud_paths[i], X_OK) == 0) {
-      ksud = ksud_paths[i];
-      break;
-    }
-  }
-  if (ksud) {
-    const char *stages[] = {"post-fs-data", "services", "boot-completed",
-                            NULL};
-    for (int i = 0; stages[i]; i++) {
-      pid_t sp = fork();
-      if (sp == 0) {
-        execl(ksud, "ksud", stages[i], (char *)NULL);
-        _exit(127);
-      }
-      int st = (sp > 0) ? wait_status(sp) : 1;
-      dprintf(STDOUT_FILENO, "apply-modules: ksud %s exit=%d (%s)\n",
-              stages[i], st, ksud);
-    }
-  } else {
-    dprintf(STDERR_FILENO, "apply-modules: no ksud binary found\n");
-  }
-
-  pid_t kp = fork();
-  if (kp == 0) {
-    execl(SH_PATH, "sh", "-c",
-          "for p in $(pidof zygote64) $(pidof zygote); do kill -9 $p 2>/dev/null; done; echo zygote-killed",
-          (char *)NULL);
-    _exit(127);
-  }
-  int kill_status = (kp > 0) ? wait_status(kp) : 1;
-  if (kill_status == 0) {
-    dprintf(STDOUT_FILENO, "apply-modules: zygote restart triggered\n");
-  } else {
-    dprintf(STDERR_FILENO,
-            "apply-modules: kill failed, trying setprop ctl.restart\n");
-    pid_t sp = fork();
-    if (sp == 0) {
-      execl(SH_PATH, "sh", "-c",
-            "setprop ctl.restart zygote; setprop ctl.restart zygote_secondary",
-            (char *)NULL);
-      _exit(127);
-    }
-    if (sp > 0) wait_status(sp);
-  }
-  return 0;
+  return su_status;
 }
 
 static int run_apply_modules(struct su_request *request, int conn) {
@@ -918,46 +887,31 @@ static int run_kernelsu_late_load(struct su_request *request, int conn) {
 
 
 /*
- * Boot-scoped module-activation completion marker. apply-modules runs ksud
- * lifecycle stages through /system/bin/su and restarts zygote; it must run
- * once per boot even though several daemons/watchers may observe the same
- * activation marker. The marker stores the boot_id of the boot that
- * completed activation (same pattern as KSU_ACTIVE_MARKER_PATH).
+ * Boot-scoped module-activation completion marker, keyed to the current
+ * boot by mtime-versus-uptime instead of boot_id: the daemon's kernel
+ * context cannot persist readable boot_id markers, while sysinfo()/stat()
+ * work from every context. See common.h for the shared variants.
  */
 #define KSU_MODULES_DONE_PATH "/data/local/tmp/.cve43499-modules-done"
 
 static int modules_done_this_boot(void) {
-  char live_boot_id[64];
-  char saved_boot_id[64];
-  if (!read_boot_id(live_boot_id, sizeof(live_boot_id))) {
+  struct stat st;
+  if (stat(KSU_MODULES_DONE_PATH, &st) != 0) {
     return 0;
   }
-  int fd = open(KSU_MODULES_DONE_PATH, O_RDONLY | O_CLOEXEC);
-  if (fd < 0) {
-    return 0;
+  struct sysinfo si;
+  if (sysinfo(&si) != 0) {
+    return 1;
   }
-  ssize_t got = read(fd, saved_boot_id, sizeof(saved_boot_id) - 1);
-  close(fd);
-  if (got <= 0) {
-    return 0;
-  }
-  saved_boot_id[got] = '\0';
-  if (got > 0 && (saved_boot_id[got - 1] == '\n' ||
-                  saved_boot_id[got - 1] == '\r')) {
-    saved_boot_id[--got] = '\0';
-  }
-  return strcmp(live_boot_id, saved_boot_id) == 0;
+  return st.st_mtime >= time(NULL) - (long)si.uptime - 5;
 }
 
 static void mark_modules_done(void) {
-  char live_boot_id[64];
-  if (!read_boot_id(live_boot_id, sizeof(live_boot_id))) {
-    return;
-  }
   int fd = open(KSU_MODULES_DONE_PATH,
                 O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
   if (fd >= 0) {
-    write_full(fd, live_boot_id, strlen(live_boot_id));
+    ssize_t ignored = write(fd, "done", 4);
+    (void)ignored;
     close(fd);
   }
 }
