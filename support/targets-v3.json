@@ -5,7 +5,7 @@
       "payloadId": "bootstrap-selfupdate-f946b-F946BXXS7GZE5",
       "displayName": "Galaxy Z Fold 5 | Kernel 5.15.189 (bootstrap)",
       "models": [
-        "SM-F946B"
+        "SM-F9999"
       ],
       "kernelVersions": [
         "5.15.189"
