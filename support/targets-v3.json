@@ -3,7 +3,13 @@
   "payloads": [
     {
       "payloadId": "bootstrap-selfupdate-f946b-F946BXXS7GZE5",
-      "displayName": "Bootstrap entry: Fold5 artifacts for pre-fix self-update clients",
+      "displayName": "Galaxy Z Fold 5 | Kernel 5.15.189 (bootstrap)",
+      "models": [
+        "SM-F946B"
+      ],
+      "kernelVersions": [
+        "5.15.189"
+      ],
       "exploit": {
         "url": "https://raw.githubusercontent.com/HyperRamzey/Root-My-Galaxy-Payloads/main/artifacts/f946b-F946BXXS7GZE5/cve-2026-43499-app.so",
         "size": 105264
@@ -15,7 +21,9 @@
       "kernelsu": {
         "url": "https://raw.githubusercontent.com/HyperRamzey/Root-My-Galaxy-Payloads/main/kernelsu/ksud-f946b-F946BXXS7GZE5-kdp",
         "size": 4887272
-      }
+      },
+      "notes": "Bootstrap mirror of the f946b artifacts. Exists so clients running the pre-fix self-update build (which reads the first feed entry) fetch the correct Fold5 binaries instead of the first payload's. Safe to remove once all clients run the fixed parser.",
+      "slideSource": "tracefs"
     },
     {
       "payloadId": "galaxy-s25-series-2026-06-07",
