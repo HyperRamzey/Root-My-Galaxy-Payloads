@@ -2,6 +2,22 @@
   "schemaVersion": 3,
   "payloads": [
     {
+      "payloadId": "bootstrap-selfupdate-f946b-F946BXXS7GZE5",
+      "displayName": "Bootstrap entry: Fold5 artifacts for pre-fix self-update clients",
+      "exploit": {
+        "url": "https://raw.githubusercontent.com/HyperRamzey/Root-My-Galaxy-Payloads/main/artifacts/f946b-F946BXXS7GZE5/cve-2026-43499-app.so",
+        "size": 105264
+      },
+      "rootHelper": {
+        "url": "https://raw.githubusercontent.com/HyperRamzey/Root-My-Galaxy-Payloads/main/artifacts/f946b-F946BXXS7GZE5/cve-2026-43499-root",
+        "size": 40048
+      },
+      "kernelsu": {
+        "url": "https://raw.githubusercontent.com/HyperRamzey/Root-My-Galaxy-Payloads/main/kernelsu/ksud-f946b-F946BXXS7GZE5-kdp",
+        "size": 4887272
+      }
+    },
+    {
       "payloadId": "galaxy-s25-series-2026-06-07",
       "displayName": "Galaxy S25 series | Kernel 6.6.98",
       "models": [
