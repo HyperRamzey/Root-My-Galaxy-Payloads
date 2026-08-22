@@ -124,6 +124,16 @@ __attribute__((constructor)) static void load(void) {
   }
   started = 1;
   set_unbuffer();
+
+  /* Skip the exploit when KernelSU is already active this boot. The
+   * reboot-syscall probe needs CAP_SYS_BOOT and returns EPERM from the
+   * app/shell domain even when the module is loaded, so also consult the
+   * boot-scoped active marker written by the daemon after activation. */
+  if (ksu_already_active() || ksu_active_this_boot()) {
+    pr_success("KernelSU already active this boot; skipping exploit\n");
+    return;
+  }
+
   wait_for_boot_quiet_window();
 
   int max_attempts = env_int(
@@ -230,6 +240,11 @@ __attribute__((constructor)) static void load(void) {
     }
     if (waited == child && WIFEXITED(status) && WEXITSTATUS(status) == 0) {
       pr_success("exploit completed attempt=%d/%d\n", attempt, max_attempts);
+      /* Root is installed and the UMH daemon is up. Ask its activation
+       * watcher to run KernelSU late-load + module activation from the
+       * daemon's root context (shell-domain clients lose daemon-socket
+       * access once SELinux re-enforces). */
+      ksu_signal_activation();
       return;
     }
 

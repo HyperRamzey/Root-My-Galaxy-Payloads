@@ -48,11 +48,11 @@ APP_PRELOAD_SRCS := \
   src/preload.c
 
 COMMON_CFLAGS := \
-  -O3 -g0 -Wall -Wextra -march=armv8-a+crc+crypto -mtune=cortex-x3 -flto=thin -ffunction-sections -fdata-sections -fomit-frame-pointer -fno-unwind-tables -fno-asynchronous-unwind-tables -fvisibility=hidden \
+  -O3 -g0 -Wall -Wextra -march=armv8-a+crc+crypto -mtune=cortex-x3 -ffunction-sections -fdata-sections -fomit-frame-pointer -fno-unwind-tables -fno-asynchronous-unwind-tables -fvisibility=hidden \
   -Wno-unused-parameter -Wno-sign-compare \
   -Isrc -DTARGET_HEADER='"$(TARGET_INCLUDE)"'
 
-COMMON_LDFLAGS := -flto=thin -Wl,--gc-sections -Wl,-O3 -Wl,--icf=all
+COMMON_LDFLAGS := -Wl,--gc-sections -Wl,-O3
 
 .DEFAULT_GOAL := all
 
@@ -70,7 +70,7 @@ $(PRELOAD): $(PRELOAD_SRCS) $(TARGET_HEADER) src/offset.h src/common.h src/kerne
 	  -shared -pthread $(COMMON_LDFLAGS) -o $@
 
 $(ROOT_HELPER): src/su_daemon.c | $(OUTDIR)
-	$(TARGET_CC) -fPIE -pie -O3 -g0 -Wall -Wextra -march=armv8-a+crc+crypto -mtune=cortex-x3 -flto=thin -ffunction-sections -fdata-sections -fomit-frame-pointer -fno-unwind-tables -fno-asynchronous-unwind-tables -fvisibility=hidden $< -ldl $(COMMON_LDFLAGS) -o $@
+	$(TARGET_CC) -fPIE -pie -O3 -g0 -Wall -Wextra -march=armv8-a+crc+crypto -mtune=cortex-x3 -ffunction-sections -fdata-sections -fomit-frame-pointer -fno-unwind-tables -fno-asynchronous-unwind-tables -fvisibility=hidden $< -ldl $(COMMON_LDFLAGS) -o $@
 
 $(APP_PRELOAD): $(APP_PRELOAD_SRCS) $(TARGET_HEADER) src/offset.h src/common.h src/kernelsnitch/*.h | $(OUTDIR)
 	$(TARGET_CC) -DAPP_PAYLOAD=1 $(APP_TARGET_CFLAGS) -fPIC $(COMMON_CFLAGS) $(APP_PRELOAD_SRCS) \
@@ -83,7 +83,7 @@ $(APP_RELEASE): $(APP_PRELOAD_SRCS) $(TARGET_HEADER) src/offset.h src/common.h s
 	  -Wall -Wextra -Wno-unused-parameter -Wno-sign-compare \
 	  -Isrc -DTARGET_HEADER='"$(TARGET_INCLUDE)"' \
 	  $(APP_PRELOAD_SRCS) -shared -pthread \
-	  -Wl,--gc-sections -Wl,--icf=all -s -o $@
+	  -Wl,--gc-sections -s -o $@
 	@test $$(stat -c %s $@) -le $(APP_RELEASE_SIZE)
 	truncate -s $(APP_RELEASE_SIZE) $@
 

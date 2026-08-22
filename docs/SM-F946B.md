@@ -183,20 +183,61 @@ build_f946b.bat
 
 Produces:
 
-- `build/f946b-F946BXXS7GZE5/cve-2026-43499` (96,608 bytes)
-- `build/f946b-F946BXXS7GZE5/cve-2026-43499-app.so` (126,016 bytes)
-- `build/f946b-F946BXXS7GZE5/cve-2026-43499-root` (26,456 bytes)
+- `build/f946b-F946BXXS7GZE5/cve-2026-43499` (82,216 bytes)
+- `build/f946b-F946BXXS7GZE5/cve-2026-43499-app.so` (105,264 bytes)
+- `build/f946b-F946BXXS7GZE5/cve-2026-43499-root` (32,192 bytes)
+
+Builds use `-O2`/`-O3` with `-ffunction-sections -fdata-sections
+-Wl,--gc-sections` but **no LTO and no ICF** (removed 2026-08-22).
+
+## Pre-exploit KernelSU check
+
+Before running the exploit, the runner and the preload constructor probe
+whether KernelSU is already active this boot and skip the exploit if so
+(re-running only risks a kernel panic for no gain). Detection uses two
+unprivileged signals:
+
+1. `su -c id` reports `uid=0` — works when shell (uid 2000) has a KernelSU
+   root grant in the manager;
+2. the boot-scoped marker `/data/local/tmp/.cve43499-ksu-active` matches the
+   live `/proc/sys/kernel/random/boot_id` — works even when shell has no
+   grant yet (the daemon writes it after a successful activation).
+
+The reboot-syscall probe (`0xDEADBEEF`/`0xCAFEBABE`) needs `CAP_SYS_BOOT`
+and returns `EPERM` from the shell/app domain even when the module is
+loaded, so it is not relied on before privilege escalation.
+
+**Note:** grant shell (uid 2000) root in the KernelSU manager after the
+first successful run so future runs can detect and reuse it via `su`.
+
+## Module activation (daemon-side)
+
+The exploit runner (shell domain, uid 2000) loses the ability to reach the
+daemon socket once SELinux re-enforces, so its `--late-load`/
+`--apply-modules` socket requests die with `Permission denied` and modules
+stay disabled. The fix: the payload constructor drops an activation marker
+(`/data/local/tmp/.cve43499-activate`) after a successful exploit; the root
+daemon's activation watcher polls for it and performs KernelSU late-load +
+module activation from its own context. Output is logged to
+`/data/local/tmp/ksu-activate.log`.
+
+Module activation runs the ksud lifecycle stages (`post-fs-data`,
+`services`, `boot-completed`) through `/system/bin/su -c` so they execute
+in the `u:r:ksu:s0` domain — the daemon's own `u:r:kernel:s0` domain is
+SELinux-denied access to `/data/adb` (magisk_file) and cannot signal the
+zygote. After the stages, zygote is killed so the fresh zygote picks up
+Zygisk/LSPosed (Vector) modules.
+
+Device-verified 2026-08-22: full exploit → late-load (`KernelSU control
+verified version=32525`) → module activation → zygote restart →
+`zygiskd status` shows `zygote_states:2`, `modules64:1,zygisk_vector`, and
+the "Vector loaded" notification appears.
+
+![Vector loaded notification](SM-F946B-vector-notification.png)
 
 ## Remaining Work
 
-1. **End-to-end exploit test** on the Fold5 (single-shot; offsets now BTF-verified)
-2. **KernelSU module for f946b** — the dm3q `.ko` is symbol-ABI-compatible
-   (0 CRC mismatches, all 205 symbols resolve) but **struct-incompatible**:
-   its KDP code accesses `target->cred`/`target->real_cred` at dm3q's
-   compiled-in offsets (0x5e0), while the Fold5 kernel has cred at 0x798.
-   A Fold5-specific module must be compiled against the Fold5 kernel tree.
-   Build is currently blocked (Docker/WSL unavailable on this host).
-3. **SKB_DATA_DELTA** runtime confirmation (-0x1000, matches Kalama 5.15 family)
+1. **SKB_DATA_DELTA** runtime confirmation (-0x1000, matches Kalama 5.15 family)
 
 ## Firmware Download Links
 
