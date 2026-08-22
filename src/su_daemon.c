@@ -1727,29 +1727,39 @@ static long rmg_file_size(const char *path) {
 }
 
 /* Find the JSON object for this device's model and pull url/size for the
- * three artifact keys. Tolerates arbitrary whitespace around separators. */
+ * three artifact keys. Tolerates arbitrary whitespace around separators.
+ * Entry boundaries are located via the "payloadId" token itself because
+ * pretty-printed feeds do not place "{" directly adjacent to the key. */
 static int rmg_parse_feed(const char *json, const char *model,
                           struct rmg_artifact_info out[RMG_ARTIFACT_COUNT]) {
   static const char *keys[RMG_ARTIFACT_COUNT] = {"exploit", "rootHelper",
                                                  "kernelsu"};
-  const char *model_pos = strstr(json, model);
+  static const char pid_token[] = "\"payloadId\"";
+  /* Quote-delimited model match so we never hit a substring inside prose
+   * such as the per-target notes fields. */
+  char model_key[64];
+  snprintf(model_key, sizeof(model_key), "\"%s\"", model);
+  const char *model_pos = strstr(json, model_key);
   if (!model_pos) {
     return -1;
   }
-  /* Back up to the start of this payload object. */
-  const char *seg_start = json;
-  for (const char *p = json; p < model_pos; p++) {
-    if (p[0] == '{' && strncmp(p + 1, "\"payloadId\"", 11) == 0) {
-      seg_start = p;
-    }
-  }
-  /* Segment ends at the next payload object or EOF. */
-  const char *seg_end = json + strlen(json);
-  for (const char *p = model_pos + 1; *p; p++) {
-    if (p[0] == '{' && strncmp(p + 1, "\"payloadId\"", 11) == 0) {
-      seg_end = p;
+  /* This entry starts at the nearest "payloadId" token at or before the
+   * model string; it ends at the following one (or EOF). */
+  const char *seg_start = NULL;
+  for (const char *p = json; p < model_pos;) {
+    const char *hit = strstr(p, pid_token);
+    if (!hit || hit >= model_pos) {
       break;
     }
+    seg_start = hit;
+    p = hit + strlen(pid_token);
+  }
+  if (!seg_start) {
+    return -1;
+  }
+  const char *seg_end = strstr(model_pos + 1, pid_token);
+  if (!seg_end) {
+    seg_end = json + strlen(json);
   }
 
   memset(out, 0, sizeof(*out) * RMG_ARTIFACT_COUNT);
