@@ -433,7 +433,7 @@ int run_exploit(int argc, char **argv) {
   log_startup_context();
   init_ashmem_path();
 
-  pin_to_core(MAIN_CORE);
+  pin_to_core(CORE);
 #if defined(SLIDE_STACK_WRITER) && \
     defined(SLIDE_STACK_WRITER_SIGRETURN) && \
     SLIDE_STACK_WRITER == SLIDE_STACK_WRITER_SIGRETURN
@@ -495,7 +495,7 @@ int run_exploit(int argc, char **argv) {
 #endif
 #endif
 
-  pin_to_core(MAIN_CORE);
+  pin_to_core(CORE);
 #if !defined(APP_FOPS_REUSE_VERIFIED_PAGE) || \
     !APP_FOPS_REUSE_VERIFIED_PAGE
   page_base = prepare_good_kernel_page(PAGE_PAYLOAD_FOPS);

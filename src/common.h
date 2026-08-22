@@ -72,19 +72,7 @@
 #define KERNELSNITCH_MTE_ENABLED 0
 #endif
 #define MM_PARTIALS 5
-/*
- * CPU pinning. CORE is the base core for worker/spray threads; MAIN_CORE is
- * the core for the exploit's main (timing-critical) thread. Both can be
- * overridden per-target in target.h (included via offset.h above). On the
- * Fold5 (Snapdragon 8 Gen 2) the little cores are cpu0-2 (A510 @ 2.0GHz),
- * performance cores cpu3-6 (A715/A710 @ 2.8GHz), prime cpu7 (X3 @ 3.36GHz).
- */
-#ifndef CORE
 #define CORE 0
-#endif
-#ifndef MAIN_CORE
-#define MAIN_CORE CORE
-#endif
 #ifndef KSNITCH_COLLISIONS
 #define KSNITCH_COLLISIONS 4
 #endif

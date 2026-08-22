@@ -134,45 +134,19 @@
 #define PAGE_SIZE 4096
 #endif
 
-static inline int pin_to_core_try(size_t core)
-{
-    cpu_set_t requested;
-    CPU_ZERO(&requested);
-    if (core >= CPU_SETSIZE) return -1;
-    CPU_SET(core, &requested);
-    return sched_setaffinity(0, sizeof(requested), &requested);
-}
-
 static inline void pin_to_core(size_t core)
 {
-    if (pin_to_core_try(core) == 0) return;
-    int saved = errno;
-    cpu_set_t cur;
-    char cur_str[128] = {0};
-    if (sched_getaffinity(0, sizeof(cur), &cur) == 0) {
-        size_t pos = 0;
-        for (int i = 0; i < CPU_SETSIZE && pos + 8 < sizeof(cur_str); i++) {
-            if (CPU_ISSET(i, &cur)) {
-                int n = snprintf(cur_str + pos, sizeof(cur_str) - pos,
-                                 "%s%d", pos ? "," : "", i);
-                if (n > 0) pos += (size_t)n;
-            }
-        }
-        pr_warning("pin_to_core %zu: sched_setaffinity errno=%d (%s), allowed [%s], keeping current\n",
-                   core, saved, strerror(saved), cur_str[0] ? cur_str : "?");
-    } else {
-        pr_warning("pin_to_core %zu: sched_setaffinity errno=%d (%s), keep current\n",
-                   core, saved, strerror(saved));
-    }
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(core, &cpuset);
+    SYSCHK(sched_setaffinity(0, sizeof(cpu_set_t), &cpuset));
 }
 
 static inline void reset_cpu_pin(void)
 {
     cpu_set_t cpuset;
     memset(&cpuset, 0xff, sizeof(cpu_set_t));
-    if (sched_setaffinity(0, sizeof(cpuset), &cpuset) != 0) {
-        pr_warning("reset_cpu_pin fallback errno=%d\n", errno);
-    }
+    SYSCHK(sched_setaffinity(0, sizeof(cpu_set_t), &cpuset));
 }
 
 static inline void set_limit(void)
