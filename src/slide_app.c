@@ -1678,6 +1678,9 @@ void *slide_waiter_thread(void *arg __attribute__((unused))) {
 }
 
 void *slide_owner_thread(void *arg __attribute__((unused))) {
+#ifdef SLIDE_OWNER_CORE
+  pin_to_core(SLIDE_OWNER_CORE);
+#endif
   if (futex_op(&slide_f_pi_target, FUTEX_LOCK_PI, 0, NULL, NULL, 0) != 0) {
     pr_error("slide owner lock target errno=%d\n", errno);
     return NULL;

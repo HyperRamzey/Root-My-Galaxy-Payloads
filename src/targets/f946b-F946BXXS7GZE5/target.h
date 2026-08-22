@@ -26,6 +26,28 @@
  * ===========================================================================
  */
 
+/*
+ * CPU pinning for Snapdragon 8 Gen 2 (SM8550-AC / Kalama):
+ *   cpu0-2 = Cortex-A510 @ 2.0 GHz (little)
+ *   cpu3-6 = Cortex-A715/A710 @ 2.8 GHz (performance)
+ *   cpu7   = Cortex-X3 @ 3.36 GHz (prime)
+ * Main (timing-critical) thread -> cpu7 (X3). Worker/spray threads ->
+ * cpu3-6 so nothing lands on the slow A510 little cores, while the
+ * multi-threaded slide phase keeps its parallelism.
+ */
+#ifndef CORE
+#define CORE 3
+#endif
+#ifndef MAIN_CORE
+#define MAIN_CORE 7
+#endif
+#ifndef SLIDE_WAITER_CORE
+#define SLIDE_WAITER_CORE 5
+#endif
+#ifndef SLIDE_OWNER_CORE
+#define SLIDE_OWNER_CORE 6
+#endif
+
 #ifndef MM_STRUCT_SZ
 #define MM_STRUCT_SZ 0x400
 #endif
