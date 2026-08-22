@@ -444,6 +444,87 @@ static int verify_kernelsu_control(void) {
   return 0;
 }
 
+static int run_apply_modules(struct su_request *request, int conn) {
+  pid_t pid = fork();
+  if (pid < 0) {
+    return 1;
+  }
+  if (pid == 0) {
+    if (dup2(request->stdin_fd, STDIN_FILENO) < 0 ||
+        dup2(request->stdout_fd, STDOUT_FILENO) < 0 ||
+        dup2(request->stderr_fd, STDERR_FILENO) < 0 ||
+        fchdir(request->cwd_fd) != 0) {
+      _exit(126);
+    }
+    close(conn);
+    close_request_fds(request);
+    set_root_env();
+
+    /* 1. Activate KernelSU modules. This ksud build has no `module mount`
+     * subcommand — the lifecycle command that performs the bind/overlay
+     * mounts is `post-fs-data`. Run it as root (we are the daemon). */
+    const char *ksud_paths[] = {
+        "/data/adb/ksud",
+        "/data/local/tmp/ksud-s25u-kdp",
+        "/data/adb/ksu/bin/ksud",
+        NULL,
+    };
+    const char *ksud = NULL;
+    for (int i = 0; ksud_paths[i]; i++) {
+      if (access(ksud_paths[i], X_OK) == 0) {
+        ksud = ksud_paths[i];
+        break;
+      }
+    }
+    if (ksud) {
+      const char *stages[] = {"post-fs-data", "services", "boot-completed",
+                              NULL};
+      for (int i = 0; stages[i]; i++) {
+        pid_t mp = fork();
+        if (mp == 0) {
+          execl(ksud, "ksud", stages[i], (char *)NULL);
+          _exit(127);
+        }
+        int st = (mp > 0) ? wait_status(mp) : 1;
+        dprintf(STDOUT_FILENO, "apply-modules: ksud %s exit=%d (%s)\n",
+                stages[i], st, ksud);
+      }
+    } else {
+      dprintf(STDERR_FILENO, "apply-modules: no ksud binary found\n");
+    }
+
+    /* 2. Kill zygote PIDs directly — init auto-restarts them, and the fresh
+     * zygote picks up Zygisk modules. More reliable than setprop ctl.*
+     * (SELinux-denied from most domains) or ksud soft-reboot. */
+    pid_t kp = fork();
+    if (kp == 0) {
+      execl(SH_PATH, "sh", "-c",
+            "for p in $(pidof zygote64) $(pidof zygote); do kill -9 $p 2>/dev/null; done; echo zygote-killed",
+            (char *)NULL);
+      _exit(127);
+    }
+    int kill_status = (kp > 0) ? wait_status(kp) : 1;
+    if (kill_status == 0) {
+      dprintf(STDOUT_FILENO, "apply-modules: zygote restart triggered\n");
+    } else {
+      /* Fallback: setprop ctl.restart (works from kernel domain on some builds) */
+      dprintf(STDERR_FILENO,
+              "apply-modules: kill failed, trying setprop ctl.restart\n");
+      pid_t sp = fork();
+      if (sp == 0) {
+        execl(SH_PATH, "sh", "-c",
+              "setprop ctl.restart zygote; setprop ctl.restart zygote_secondary",
+              (char *)NULL);
+        _exit(127);
+      }
+      if (sp > 0) wait_status(sp);
+    }
+    _exit(0);
+  }
+  close_request_fds(request);
+  return wait_status(pid);
+}
+
 static int run_kernelsu_late_load(struct su_request *request, int conn) {
   pid_t pid = fork();
   if (pid < 0) {
@@ -839,11 +920,18 @@ static void serve_one(int conn) {
 
   int is_kernelsu_late_load = request.header.argc == 2 &&
                               strcmp(request.argv[1], "--late-load") == 0;
-  int status = is_kernelsu_late_load
-                   ? run_kernelsu_late_load(&request, conn)
-                   : request.header.interactive
-                         ? run_interactive(&request, conn)
-                         : run_direct(&request, conn);
+  int is_apply_modules = request.header.argc == 2 &&
+                         strcmp(request.argv[1], "--apply-modules") == 0;
+  int status;
+  if (is_kernelsu_late_load) {
+    status = run_kernelsu_late_load(&request, conn);
+  } else if (is_apply_modules) {
+    status = run_apply_modules(&request, conn);
+  } else if (request.header.interactive) {
+    status = run_interactive(&request, conn);
+  } else {
+    status = run_direct(&request, conn);
+  }
   send_response(conn, status);
   free_request(&request);
 }
@@ -1075,6 +1163,38 @@ static int payload_runner_main(int argc, char **argv) {
       relay_payload_log_tail(argv[4], transport_fd);
       close(transport_fd);
       return saved_errno;
+    }
+    /* Exploit succeeded. SELinux is still permissive right now — trigger
+     * KernelSU late-load + module activation immediately, before the window
+     * closes. The supervisor is uid 2000 (allowed daemon client). */
+    if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+      char helper_path[PATH_MAX];
+      if (realpath(argv[3], helper_path)) {
+        dprintf(transport_fd, "[runner] exploit ok, triggering late-load\n");
+        pid_t ll = fork();
+        if (ll == 0) {
+          execl(helper_path, helper_path, "--late-load", (char *)NULL);
+          _exit(127);
+        }
+        int ll_status = 0;
+        while (waitpid(ll, &ll_status, 0) < 0 && errno == EINTR) {
+        }
+        dprintf(transport_fd, "[runner] late-load exit=%d\n",
+                WIFEXITED(ll_status) ? WEXITSTATUS(ll_status) : -1);
+        if (WIFEXITED(ll_status) && WEXITSTATUS(ll_status) == 0) {
+          dprintf(transport_fd, "[runner] triggering apply-modules\n");
+          pid_t am = fork();
+          if (am == 0) {
+            execl(helper_path, helper_path, "--apply-modules", (char *)NULL);
+            _exit(127);
+          }
+          int am_status = 0;
+          while (waitpid(am, &am_status, 0) < 0 && errno == EINTR) {
+          }
+          dprintf(transport_fd, "[runner] apply-modules exit=%d\n",
+                  WIFEXITED(am_status) ? WEXITSTATUS(am_status) : -1);
+        }
+      }
     }
     close(transport_fd);
     if (WIFEXITED(status)) {

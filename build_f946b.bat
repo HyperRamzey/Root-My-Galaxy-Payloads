@@ -4,7 +4,7 @@ set CC=%NDK%\toolchains\llvm\prebuilt\windows-x86_64\bin\aarch64-linux-android35
 set OUTDIR=build\f946b-F946BXXS7GZE5
 set TH=-DTARGET_HEADER=\"targets/f946b-F946BXXS7GZE5/target.h\"
 rem Max native optimizations (matches Makefile COMMON_CFLAGS/LDFLAGS)
-set OPT=-O3 -g0 -Wall -Wextra -march=armv8-a+crc+crypto -mtune=cortex-x3 -flto=thin -ffunction-sections -fdata-sections -fomit-frame-pointer -fno-unwind-tables -fno-asynchronous-unwind-tables -fvisibility=hidden -Wno-unused-parameter -Wno-sign-compare
+set OPT=-O2 -g0 -Wall -Wextra -march=armv8-a+crc+crypto -mtune=cortex-x3 -flto=thin -ffunction-sections -fdata-sections -fomit-frame-pointer -fno-unwind-tables -fno-asynchronous-unwind-tables -fvisibility=hidden -Wno-unused-parameter -Wno-sign-compare
 set LDOPT=-flto=thin -Wl,--gc-sections -Wl,-O3 -Wl,--icf=all
 if not exist %OUTDIR% mkdir %OUTDIR%
 
