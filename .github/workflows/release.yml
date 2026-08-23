@@ -29,9 +29,10 @@ jobs:
 
       - name: Install Android NDK r30
         run: |
-          wget -q https://dl.google.com/android/repository/android-ndk-r30-linux.zip
-          unzip -q android-ndk-r30-linux.zip -d "$RUNNER_TEMP"
-          echo "ANDROID_NDK_HOME=$RUNNER_TEMP/android-ndk-r30" >> "$GITHUB_ENV"
+          set -e
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            "ndk;30.0.15729638" > /dev/null || true
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/30.0.15729638" >> "$GITHUB_ENV"
 
       - name: Build
         run: |
