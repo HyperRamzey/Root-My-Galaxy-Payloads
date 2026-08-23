@@ -134,19 +134,32 @@
 #define PAGE_SIZE 4096
 #endif
 
-static inline void pin_to_core(size_t core)
+static inline void pin_to_core(ssize_t core)
 {
+    if (core < 0) {
+        /* Affinity layout could not resolve a usable core; leave the
+         * scheduler free rather than disturbing the run. */
+        return;
+    }
     cpu_set_t cpuset;
     CPU_ZERO(&cpuset);
     CPU_SET(core, &cpuset);
-    SYSCHK(sched_setaffinity(0, sizeof(cpu_set_t), &cpuset));
+    if (sched_setaffinity(0, sizeof(cpu_set_t), &cpuset) != 0) {
+        /* Non-fatal by design: a kernel that rejects the requested core
+         * (restricted prime, cpuset wall) must never abort the exploit
+         * over an optimization. */
+        pr_warning("pin to core %zd failed errno=%d; continuing unpinned\n",
+                   core, errno);
+    }
 }
 
 static inline void reset_cpu_pin(void)
 {
     cpu_set_t cpuset;
     memset(&cpuset, 0xff, sizeof(cpu_set_t));
-    SYSCHK(sched_setaffinity(0, sizeof(cpu_set_t), &cpuset));
+    if (sched_setaffinity(0, sizeof(cpu_set_t), &cpuset) != 0) {
+        pr_warning("reset_cpu_pin failed errno=%d\n", errno);
+    }
 }
 
 static inline void set_limit(void)
