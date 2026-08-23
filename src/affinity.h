@@ -190,6 +190,29 @@ static inline void affinity_detect(void) {
     CPU_SET(c, &affinity_layout.perf_mask);
     perf_list[perf_n++] = c;
   }
+  /* Per-profile choreography cores win over topology detection when
+   * defined by the target header: the futex-collision channel is
+   * calibrated per cluster pair, and moving it onto faster cores measur-
+   * ably breaks it (zero collisions observed on F946B perf pins; a
+   * mismatched-cluster waiter even panicked one attempt). Profiles that
+   * verified other placements may override via their target.h; values
+   * still pass through the usability probe with automatic fallback to
+   * the detected map. */
+#ifdef RMG_PROFILE_TIMING_CORE
+  if (affinity_cpu_usable(RMG_PROFILE_TIMING_CORE)) {
+    timing = RMG_PROFILE_TIMING_CORE;
+    CPU_ZERO(&affinity_layout.perf_mask);
+    perf_n = 0;
+    for (int c = max_cpu; c >= 0 && perf_n < AFFINITY_MAX_CPUS; c--) {
+      if (c == timing || !affinity_cpu_usable(c)) {
+        continue;
+      }
+      CPU_SET(c, &affinity_layout.perf_mask);
+      perf_list[perf_n++] = c;
+    }
+  }
+#endif
+
   affinity_layout.timing_core = timing;
   const char *env = getenv("RMG_NO_AFFINITY");
   if (env && env[0] == '1') {
@@ -202,15 +225,34 @@ static inline void affinity_detect(void) {
     if (env) {
       affinity_layout.consumer_core = atoi(env);
     } else {
+#ifdef RMG_PROFILE_CONSUMER_CORE
+      affinity_layout.consumer_core =
+          affinity_cpu_usable(RMG_PROFILE_CONSUMER_CORE)
+              ? RMG_PROFILE_CONSUMER_CORE
+              : (perf_n > 0 ? perf_list[0] : timing);
+#else
       affinity_layout.consumer_core =
           perf_n > 0 ? perf_list[0] : timing;
+#endif
     }
     env = getenv("RMG_TIMING_CORE");
     if (env) {
       affinity_layout.timing_core = atoi(env);
     }
-    affinity_layout.waiter_core =
-        perf_n > 1 ? perf_list[1] : affinity_layout.consumer_core;
+    env = getenv("RMG_WAITER_CORE");
+    if (env) {
+      affinity_layout.waiter_core = atoi(env);
+    } else {
+#ifdef RMG_PROFILE_WAITER_CORE
+      affinity_layout.waiter_core =
+          affinity_cpu_usable(RMG_PROFILE_WAITER_CORE)
+              ? RMG_PROFILE_WAITER_CORE
+              : affinity_layout.consumer_core;
+#else
+      affinity_layout.waiter_core =
+          perf_n > 1 ? perf_list[1] : affinity_layout.consumer_core;
+#endif
+    }
   }
   if (affinity_layout.waiter_core < 0) {
     affinity_layout.waiter_core = affinity_layout.consumer_core;
