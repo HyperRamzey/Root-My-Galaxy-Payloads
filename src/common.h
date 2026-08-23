@@ -670,11 +670,10 @@ static inline void ksu_signal_activation(void) {
 }
 
 /*
- * Module-activation completion marker, boot-scoped WITHOUT boot_id: the
- * daemon's kernel context could not persist boot_id markers reliably, so
- * done-state is derived from the marker's mtime versus current uptime —
- * a file touched after this boot started means this boot finished
- * activation. Uses only sysinfo()/stat(), valid from every context.
+ * Module-activation completion marker: content is
+ * "<boot_id> <write-time uptime>", so done-state is provably scoped to the
+ * current boot while staying immune to wall-clock corrections. Both fields
+ * come from world-readable procfs/sysinfo, valid from every context.
  */
 #define KSU_MODULES_DONE_PATH "/data/local/tmp/.cve43499-modules-done"
 
@@ -695,38 +694,51 @@ static inline int modules_done_this_boot(void) {
   if (up < 0) {
     return 1;
   }
-  /* Preferred format: the marker stores the sysinfo uptime captured at
-   * write time. Uptime is monotonic within a boot and resets on reboot,
-   * so a stored value <= live uptime proves same-boot completion without
-   * touching the wall clock — NTP corrections minutes into a boot used to
-   * make the pure-mtime check look stale and re-trigger zygote kills. */
+  /* Preferred format: "<boot_id> <write-time uptime>". The boot_id proves
+   * the marker belongs to the current boot (an uptime-only stamp looked
+   * done again on any later boot once live uptime passed the stored
+   * value); the uptime component is monotonic within that boot, immune to
+   * the NTP wall-clock jumps that made the pure-mtime check falsely stale
+   * and re-triggered zygote kills. */
+  char live_boot_id[64];
+  if (!read_boot_id(live_boot_id, sizeof(live_boot_id))) {
+    return 1;
+  }
   int fd = open(KSU_MODULES_DONE_PATH, O_RDONLY | O_CLOEXEC);
   if (fd >= 0) {
-    char buf[32];
+    char buf[128];
     ssize_t n = read(fd, buf, sizeof(buf) - 1);
     close(fd);
     if (n > 0) {
       buf[n] = '\0';
-      long stored = strtol(buf, NULL, 10);
-      if (stored > 0) {
-        return stored <= up + 2;
+      char *space = strchr(buf, ' ');
+      if (space != NULL) {
+        *space = '\0';
+        long stored = strtol(space + 1, NULL, 10);
+        if (stored > 0 && strcmp(buf, live_boot_id) == 0) {
+          return stored <= up + 2;
+        }
       }
     }
   }
-  /* Legacy "done" payload: fall back to the mtime heuristic. */
+  /* Legacy payloads ("done" text or bare uptime): fall back to the
+   * mtime-vs-boot-window heuristic rather than trusting them blindly. */
   return st.st_mtime >= time(NULL) - up - 5;
 }
 
 static inline void mark_modules_done(void) {
-  char payload[32];
-  long up = ksu_uptime_sec();
+  char payload[128];
+  char live_boot_id[64];
   size_t len;
-  if (up >= 0) {
-    len = (size_t)snprintf(payload, sizeof(payload), "%ld", up);
+  long up = ksu_uptime_sec();
+  if (up >= 0 && read_boot_id(live_boot_id, sizeof(live_boot_id))) {
+    len = (size_t)snprintf(payload, sizeof(payload), "%s %ld", live_boot_id,
+                           up);
   } else {
     memcpy(payload, "done", 5);
     len = 4;
   }
+
   int fd = open(KSU_MODULES_DONE_PATH,
                 O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
   if (fd >= 0) {

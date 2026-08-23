@@ -918,19 +918,27 @@ static int modules_done_this_boot(void) {
   if (sysinfo(&si) != 0) {
     return 1;
   }
-  /* Preferred format: stored write-time uptime (monotonic per boot, reset
-   * on reboot). Immune to NTP wall-clock jumps that made the mtime check
-   * falsely stale and re-triggered zygote kills mid-boot. */
+  /* Preferred format: "<boot_id> <write-time uptime>" (see common.h). The
+   * boot_id scopes the marker to this boot; the uptime component is
+   * immune to NTP wall-clock jumps. */
+  char live_boot_id[64];
+  if (!read_boot_id(live_boot_id, sizeof(live_boot_id))) {
+    return 1;
+  }
   int fd = open(KSU_MODULES_DONE_PATH, O_RDONLY | O_CLOEXEC);
   if (fd >= 0) {
-    char buf[32];
+    char buf[128];
     ssize_t n = read(fd, buf, sizeof(buf) - 1);
     close(fd);
     if (n > 0) {
       buf[n] = '\0';
-      long stored = strtol(buf, NULL, 10);
-      if (stored > 0) {
-        return stored <= (long)si.uptime + 2;
+      char *space = strchr(buf, ' ');
+      if (space != NULL) {
+        *space = '\0';
+        long stored = strtol(space + 1, NULL, 10);
+        if (stored > 0 && strcmp(buf, live_boot_id) == 0) {
+          return stored <= (long)si.uptime + 2;
+        }
       }
     }
   }
@@ -938,11 +946,14 @@ static int modules_done_this_boot(void) {
 }
 
 static void mark_modules_done(void) {
-  char payload[32];
+  char payload[128];
+  char live_boot_id[64];
   struct sysinfo si;
   size_t len;
-  if (sysinfo(&si) == 0) {
-    len = (size_t)snprintf(payload, sizeof(payload), "%ld", (long)si.uptime);
+  if (sysinfo(&si) == 0 &&
+      read_boot_id(live_boot_id, sizeof(live_boot_id))) {
+    len = (size_t)snprintf(payload, sizeof(payload), "%s %ld", live_boot_id,
+                           (long)si.uptime);
   } else {
     memcpy(payload, "done", 5);
     len = 4;
