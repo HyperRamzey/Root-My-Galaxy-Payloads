@@ -795,6 +795,8 @@ static inline void activation_lock_release(int fd) {
  * failures leave the zygote untouched so retries cannot soft-reboot-loop.
  */
 #define KSU_APPLY_SCRIPT \
+  "softdog disable 2>/dev/null; " \
+  "setprop persist.vendor.softdog off 2>/dev/null; " \
   "if [ \"$(getprop sys.boot_completed 2>/dev/null)\" != \"1\" ]; then " \
   "echo 'apply-modules: boot not completed; deferring' >&2; exit 42; fi; " \
   "ksud=''; " \
