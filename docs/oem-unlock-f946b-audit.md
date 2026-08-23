@@ -94,6 +94,20 @@ S24U-reported `+0xc88` — struct differs slightly between builds; the
    Samsung-signed Engineering Mode token containing mode 3. Persistence
    work continues on the software side (auto-root keeper) instead.
 
+## Follow-up: remaining surfaces exhausted (same session)
+
+| Surface | Finding |
+|---|---|
+| `sub_D9A50` fuse/flag state machine | States {0,1,3}, setters via `sub_C70D0(25/26/27)` ("set D/U", "force-U"), terminal `[EM]F: U`. Its result **overrides the TA bitmap only for bit 0** (`sub_D9DD0`) — and that getter's single consumer is `sub_595B0` at `0x5b8a8`, which formats it into the informational cmdline property `androidboot.em.status=0x%x`. No gate rides on it. Live value on device: `ro.boot.em.status=0x0`. |
+| ABL manual-unlock flow | `sub_71A50` calls `BLInitToken`, then the neutered OEM policy `sub_CC260` twice — the bootloader's own interactive path asks a function that unconditionally returns false. |
+| AVB persistent values | `ReadPersistentValue/WritePersistentValue` ops + `avb.persistent_digest.*` strings exist (rollback digest storage), unrelated to lock state. |
+| Android-side OemLock | `oem_lock` (`android.service.oemlock.IOemLockService`) binder service present, engmode HAL + `emservice` running (S24U topology confirmed live). Even a fully prepared Android-side allowance dies at the ABL policy stub above. |
+
+Every candidate route now terminates at one of: TA-signed token (no issuance
+authority), Samsung image signatures (Odin Auth / fused verification), or the
+policy stub. Manual `devinfo` writes additionally trigger the destructive sync
+(lock + userdata wipe + reboot-to-recovery) on the dominant boot path.
+
 ## Safety record
 
 Commands used against the device were limited to: `ls`, `dd if=<block>
