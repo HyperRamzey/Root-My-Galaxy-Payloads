@@ -842,6 +842,8 @@ static inline void activation_lock_release(int fd) {
   "if [ -n \"$PKG\" ]; then " \
   "cmd deviceidle whitelist +\"$PKG\" >/dev/null 2>&1; " \
   "am set-standby-bucket \"$PKG\" active >/dev/null 2>&1; " \
+  "appops set \"$PKG\" RUN_ANY_IN_BACKGROUND allow >/dev/null 2>&1; " \
+  "appops set \"$PKG\" START_FOREGROUND allow >/dev/null 2>&1; " \
   "settings put global adb_wifi_enabled 1 >/dev/null 2>&1; " \
   "echo \"apply-modules: manager $PKG exempted for next boot\"; fi; " \
   "BID=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null); " \
