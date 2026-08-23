@@ -43,9 +43,10 @@ jobs:
       - name: Stage artifacts
         run: |
           mkdir -p stage/${{ matrix.target }}
-          cp build/${{ matrix.target }}/cve-2026-43499-app.so stage/${{ matrix.target }}/
-          cp build/${{ matrix.target }}/cve-2026-43499-root stage/${{ matrix.target }}/
-          cp build/${{ matrix.target }}/cve-2026-43499 stage/${{ matrix.target }}/ || true
+          cd build/${{ matrix.target }}
+          for f in cve-2026-43499-app.so cve-2026-43499-root cve-2026-43499; do
+            [ -f "$f" ] && cp "$f" "../../stage/${{ matrix.target }}/${{ matrix.target }}-$f"
+          done
 
       - uses: actions/upload-artifact@v4
         with:
