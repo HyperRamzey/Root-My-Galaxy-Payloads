@@ -117,6 +117,33 @@ static void wait_for_boot_quiet_window(void) {
 #endif
 }
 
+/*
+ * Exploit-session mutex. The auto-root app, a manual adb run and any
+ * retry wrapper can all try to start a payload session in the same boot;
+ * two concurrent sessions churn shared kernel state and are the most
+ * reliable way to panic the device mid-choreography (observed on F946B).
+ * The first constructor to grab this lock owns the whole attempt window
+ * and holds the fd for its lifetime; every later one exits quietly.
+ */
+#define EXPLOIT_SESSION_LOCK_PATH "/data/local/tmp/.cve43499-exploit.lock"
+
+static int exploit_session_lock(void) {
+  int fd = open(EXPLOIT_SESSION_LOCK_PATH, O_RDWR | O_CREAT | O_CLOEXEC,
+                0644);
+  if (fd < 0) {
+    /* Cannot even create the lock file: run anyway, matching legacy
+     * behavior for restricted contexts. */
+    return 1;
+  }
+  if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
+    close(fd);
+    pr_warning("another exploit session is already running; exiting\n");
+    return 0;
+  }
+  /* fd intentionally left open (and locked) for the process lifetime. */
+  return 1;
+}
+
 __attribute__((constructor)) static void load(void) {
   static int started;
   if (started) {
@@ -131,6 +158,10 @@ __attribute__((constructor)) static void load(void) {
    * boot-scoped active marker written by the daemon after activation. */
   if (ksu_already_active() || ksu_active_this_boot()) {
     pr_success("KernelSU already active this boot; skipping exploit\n");
+    return;
+  }
+
+  if (!exploit_session_lock()) {
     return;
   }
 
