@@ -111,5 +111,10 @@ jobs:
 
       - uses: softprops/action-gh-release@v2
         with:
-          files: dist/*
+          files: |
+            dist/**/*.so
+            dist/**/cve-2026-43499
+            dist/kernelsu/*
+            dist/support/*
+            dist/SHA256SUMS
           generate_release_notes: true
