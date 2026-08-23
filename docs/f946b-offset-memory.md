@@ -164,3 +164,45 @@
 - KernelSU module loaded and functional
 - Interactive `su` shell requires KernelSU Manager APK installation
 - Both root and KernelSU are volatile — reboot removes them
+
+---
+
+## Re-verification against live firmware (2026-08-23)
+
+Method: `dd` of the running `/dev/block/by-name/boot` on device RFCWC0G1Z1J
+(100,663,296 B), kernel Image sliced at 0x1000 (46,860,800 B),
+kallsyms reconstructed with vmlinux-to-elf (base 0xffffffc008000000),
+every `targets/f946b-F946BXXS7GZE5/target.h` entry re-checked.
+
+Result: **20/20 semantic VERIFIED, 0 functional mismatches.** Naming relics
+documented below (behavior unaffected).
+
+| target.h macro | claimed | live symbol @ offset | verdict |
+| --- | --- | --- | --- |
+| INIT_TASK_OFF | 0x02c05080 | init_task | VERIFIED |
+| PREPARE_KERNEL_CRED_OFF | 0x0011e3c8 | prepare_kernel_cred | VERIFIED |
+| COMMIT_CREDS_OFF | 0x00120104 | commit_creds | VERIFIED |
+| OVERRIDE_CREDS_OFF | 0x0011f1dc | override_creds | VERIFIED |
+| ROOT_TASK_GROUP_OFF | 0x02cb9ac0 | root_task_group | VERIFIED |
+| SELINUX_ENFORCING_OFF | 0x02d8e5c0 | selinux_state (`.enforcing` bool is member 0 in 5.15; single-byte read guarded `old<=1` remains correct) | VERIFIED (relic name) |
+| KMALLOC_CACHES_OFF | 0x020644f8 | kmalloc_caches | VERIFIED |
+| ANON_PIPE_BUF_OPS_OFF | 0x01e7f4e0 | anon_pipe_buf_ops | VERIFIED |
+| SYSTEM_UNBOUND_WQ_OFF | 0x02a90800 | system_unbound_wq | VERIFIED |
+| CALL_USERMODEHELPER_EXEC_WORK_OFF | 0x001045d0 | call_usermodehelper_exec_work | VERIFIED |
+| ASHMEM_FOPS_OFF | 0x0200d538 | ashmem_fops | VERIFIED |
+| ASHMEM_MISC_FOPS_OFF | 0x02bfcf28 | ashmem_misc +0x10 (`.fops` field of the miscdevice) | VERIFIED |
+| ASHMEM_IOCTL/_MMAP/_OPEN/_RELEASE/_SHOW_FDINFO | ... | ashmem_ioctl / ashmem_mmap / ashmem_open / ashmem_release / ashmem_show_fdinfo | VERIFIED (5/5) |
+| ASHMEM_COMPAT_IOCTL_OFF | 0x0114cd38 | compat_ashmem_ioctl | VERIFIED |
+| CONFIGFS_READ_ITER_OFF | 0x005d7420 | configfs_read_iter | VERIFIED |
+| CONFIGFS_BIN_WRITE_ITER_OFF | 0x005d7e48 | configfs_bin_write_iter | VERIFIED |
+| COPY_SPLICE_READ_OFF | 0x00528198 | generic_file_splice_read (`copy_splice_read` does not exist in this build) | VERIFIED (relic name) |
+| NOOP_LLSEEK_OFF | 0x004bbd34 | noop_llseek | VERIFIED |
+| SLIDE_NFULNL_LOGGER_OBJECT_OFF | 0x02a91e48 | nfulnl_logger | VERIFIED |
+| SLIDE_RANDOM_TABLE_BOOT_ID_DATA_PTR_OFF | 0x02bba8c0 | random_table | VERIFIED |
+| SLIDE_SYSCTL_BOOTID_OFF | 0x02e6c0b1 | sysctl_bootid | VERIFIED |
+| SLIDE_TRACEFS_WORKER_CALLER_OFF | 0x0010db44 | inside worker_thread (0x10dacc..0x10e204) | VERIFIED |
+| SLIDE_TRACEFS_VFORK_CALLER_OFF | 0x000c8fe4 | inside wait_for_vfork_done (0xc8fa0..) | VERIFIED |
+
+Cross-checks: struct layouts independently match amaplis' source-verified
+SM-S911B SAFZE1 tables and the S918B FZF5 family deltas documented in
+[S23-porting-notes.md](S23-porting-notes.md).
