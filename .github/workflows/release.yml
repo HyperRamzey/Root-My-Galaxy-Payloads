@@ -1,0 +1,114 @@
+name: Release payloads
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+  schedule:
+    # Weekly, Monday 03:20 UTC - keeps releases fresh against the latest
+    # KernelSU upstream source snapshot.
+    - cron: "20 3 * * 1"
+
+permissions:
+  contents: write
+
+jobs:
+  build-native:
+    name: Build ${{ matrix.target }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - f946b-F946BXXS7GZE5
+          - e2s-S926BXXUEDZDR
+          - essi-A566EXXSCCZG6
+          - a36xq-A366WVLS3AYG1
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Android NDK r30
+        run: |
+          wget -q https://dl.google.com/android/repository/android-ndk-r30-linux.zip
+          unzip -q android-ndk-r30-linux.zip -d "$RUNNER_TEMP"
+          echo "ANDROID_NDK_HOME=$RUNNER_TEMP/android-ndk-r30" >> "$GITHUB_ENV"
+
+      - name: Build
+        run: |
+          make TARGET=${{ matrix.target }} \
+            ANDROID_NDK_HOME="$ANDROID_NDK_HOME" \
+            NDK_HOST=linux-x86_64 API=35 all
+
+      - name: Stage artifacts
+        run: |
+          mkdir -p stage/${{ matrix.target }}
+          cp build/${{ matrix.target }}/cve-2026-43499-app.so stage/${{ matrix.target }}/
+          cp build/${{ matrix.target }}/cve-2026-43499-root stage/${{ matrix.target }}/
+          cp build/${{ matrix.target }}/cve-2026-43499 stage/${{ matrix.target }}/ || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-${{ matrix.target }}
+          path: stage/
+
+  ksu-upstream-sync:
+    name: Pull latest KernelSU source
+    runs-on: ubuntu-24.04
+    outputs:
+      ksu_ref: ${{ steps.ksu.outputs.ref }}
+    steps:
+      - id: ksu
+        run: |
+          ref=$(git ls-remote --tags --refs --sort=-v:refname \
+            https://github.com/tiann/KernelSU.git |
+            grep -E 'refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$' | head -1 |
+            sed 's#.*refs/tags/##')
+          [ -n "$ref" ] || ref=main
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+          echo "Latest KernelSU release tag: $ref"
+
+      - name: Fetch and archive KernelSU source at ${{ steps.ksu.outputs.ref }}
+        run: |
+          git clone --depth 1 --branch "${{ steps.ksu.outputs.ref }}" \
+            https://github.com/tiann/KernelSU.git ksu-src
+          tar -czf kernelsu-${{ steps.ksu.outputs.ref }}-src.tar.gz ksu-src
+
+      - name: Verify Samsung KDP patch applies cleanly
+        run: |
+          cd ksu-src
+          git apply --check ../kernelsu/patches/KernelSU-v3.2.5-samsung-kdp-rkp-defex.patch ||
+          echo "::warning::Samsung patch needs rebasing onto ${{ steps.ksu.outputs.ref }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kernelsu-source-${{ steps.ksu.outputs.ref }}
+          path: kernelsu-*.tar.gz
+
+  release:
+    name: Publish release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    needs: [build-native]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Attach vendored KernelSU binaries + feed
+        run: |
+          mkdir -p dist/kernelsu dist/support
+          cp kernelsu/*.ko kernelsu/ksud-* dist/kernelsu/ 2>/dev/null || true
+          cp support/targets-v3.json support/targets-v2.json dist/support/
+
+      - name: Generate checksums
+        run: |
+          cd dist
+          find . -type f ! -name SHA256SUMS -exec sha256sum {} \; > SHA256SUMS
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

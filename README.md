@@ -1,119 +1,117 @@
 # Root My Galaxy Payloads
 
-This repository contains the device-specific native side of
-[Root My Galaxy](https://github.com/BuSung-dev/Root-My-Galaxy):
+Device-specific **native side** of
+[Root-My-Galaxy](https://github.com/HyperRamzey/Root-My-Galaxy) (the Android
+app lives in that repository): exact firmware profiles and offsets, the
+app-domain CVE-2026-43499 exploit source and compiled payloads, the root
+helper / KernelSU activation driver, the verified Samsung KernelSU late-load
+binaries, and the support feed consumed by the app.
 
-- exact firmware profiles and offsets;
-- the app-domain CVE-2026-43499 exploit source and compiled payload;
-- the app bootstrap helper source;
-- the verified KernelSU late-load build artifacts;
-- the support feed consumed by the application.
+Use only on devices you own or are explicitly authorized to test.
 
-It intentionally does not contain Android application source code.
+## Galaxy Z Fold 5 — `f946b-F946BXXS7GZE5` (device-tested)
 
-## Supported payloads
+| | |
+|---|---|
+| Kernel | `5.15.189-android13-8-33404244-abF946BXXS7GZE5` |
+| Engine | MCAST / tracefs / shaped-reclaim (PR #223) |
+| Result | `uid=0(root) context=u:r:kernel:s0`, KernelSU v3.2.5 LKM, Zygisk + Vector live |
+| Offsets | 66/66 BTF-verified (`docs/f946b-offset-memory.md`) |
 
-| Payload | Compatible models | Kernel version | Status |
-| --- | --- | --- | --- |
-| `galaxy-s25-series-2026-06-07` | Galaxy S25, S25+, S25 Edge, and S25 Ultra regional models | `6.6.98` | Device-tested |
-| `e3q-S928USQS6DZF2` | Galaxy S24 Ultra `SM-S928U` | `6.1.145` | Hardware debugging in progress |
-| `e2s-S926BXXUEDZDR` | Galaxy S24+ `SM-S926B` | `6.1.157` | Device-tested |
-| `essi-A566EXXSCCZG6` | Galaxy A56 5G `SM-A566E` | `6.6.102` | Device-tested |
-| `a36xq-A366WVLS3AYG1` | Galaxy A36 5G `SM-A366W` | `6.6.46` | Device-tested |
-| `dm3q-S9180ZHS8FZF5` | Galaxy S23 Ultra `SM-S9180` | `5.15.189` | Test in progress |
-| `dm2q-S916BXXSAFZG1` | Galaxy S23+ `SM-S916B` | `5.15.189` | Experimental: hardware root from ADB shell; not in app feed |
-| `dm2q-S916NKSS8FZG1` | Galaxy S23+ `SM-S916N` | `5.15.189` | Experimental: hardware root from ADB shell; not in app feed |
-| `f946b-F946BXXS7GZE5` | Galaxy Z Fold 5 `SM-F946B` | `5.15.189` | **Device-tested: full root + KernelSU from ADB shell** |
+### Manual quick start (one attempt per boot)
 
-The S916B FZG1 and F946B F946BXXS7GZE5 profiles are shell-only. Their exact tracefs route works from `adb shell` (`u:r:shell:s0`), but direct app-domain execution is not supported. Root My Galaxy would need to delegate the native runner through an authorized shell bridge such as Shizuku. See [`artifacts/dm2q-S916BXXSAFZG1/README.md`](artifacts/dm2q-S916BXXSAFZG1/README.md).
-
-### Galaxy Z Fold5 (SM-F946B, F946BXXS7GZE5) — Confirmed Working
-
-This fork contains the **device-tested** Fold5 exploit chain:
-
-- **Kernel**: `5.15.189-android13-8-33404244-abF946BXXS7GZE5`
-- **Engine**: MCAST/tracefs/shaped-reclaim (PR #223)
-- **Result**: `uid=0(root) gid=0(root) context=u:r:kernel:s0`, KernelSU v3.2.5 loaded, no panic
-- **All 66 offsets verified** against recovered `vmlinux.elf` + `vmlinux.btf` (see [`docs/f946b-offset-memory.md`](docs/f946b-offset-memory.md))
-
-Quick start (ADB shell, one attempt per boot):
-
-```cmd
+```sh
 adb push artifacts/f946b-F946BXXS7GZE5/cve-2026-43499-app.so /data/local/tmp/f946b.so
-adb push artifacts/f946b-F946BXXS7GZE5/cve-2026-43499-root /data/local/tmp/cve-2026-43499-root
-adb push kernelsu/ksud-f946b-F946BXXS7GZE5-kdp /data/local/tmp/ksud-f946b-kdp
-adb shell "chmod 755 /data/local/tmp/cve-2026-43499-root /data/local/tmp/ksud-f946b-kdp"
-adb shell "SLIDE_SOURCE=tracefs EXPLOIT_ATTEMPTS=1 P0_ATTEMPT_TIMEOUT_SEC=115 EXPLOIT_ATTEMPT_TIMEOUT_SEC=600 /data/local/tmp/cve-2026-43499-root --run-payload /data/local/tmp/f946b.so /data/local/tmp/cve-2026-43499-root /data/local/tmp/f946b.log"
-adb shell "/data/local/tmp/cve-2026-43499-root -c 'id; getenforce'"
-adb shell "/data/local/tmp/cve-2026-43499-root -c 'cp /data/local/tmp/ksud-f946b-kdp /data/local/tmp/ksud-s25u-kdp; chmod 755 /data/local/tmp/ksud-s25u-kdp'"
+adb push artifacts/f946b-F946BXXS7GZE5/cve-2026-43499-root   /data/local/tmp/cve-2026-43499-root
+adb push kernelsu/ksud-f946b-F946BXXS7GZE5-kdp              /data/local/tmp/ksud-f946b-kdp
+adb shell "chmod 755 /data/local/tmp/cve-2026-43499-root /data/local/tmp/ksud-*"
+adb shell "SLIDE_SOURCE=tracefs EXPLOIT_ATTEMPTS=1 P0_ATTEMPT_TIMEOUT_SEC=115 \
+  EXPLOIT_ATTEMPT_TIMEOUT_SEC=600 \
+  /data/local/tmp/cve-2026-43499-root --run-payload /data/local/tmp/f946b.so \
+  /data/local/tmp/cve-2026-43499-root /data/local/tmp/f946b.log"
 adb shell "/data/local/tmp/cve-2026-43499-root --late-load"
 ```
 
-Both root and KernelSU are volatile — a reboot removes them.
+Root and KernelSU are volatile; a reboot clears them.
 
-Schema version 3 keeps each exploit and KernelSU artifact once. Its flat
-`models` and `kernelVersions` arrays define runtime compatibility. See
-[`support/README.md`](support/README.md) for the matching rules.
+### Automatic root restore on reboot (the e2e path)
 
-The port is based on the exploit source published at
-<https://github.com/NebuSec/CyberMeowfia/tree/main/IonStack/CVE-2026-43499/exploit>.
+Enable **Auto-root on boot** in the app (wireless-debugging pairing is set up
+once from its Settings screen). Per boot the pipeline is:
+
+1. `BootReceiver` → `RootOnBootService` (single-instance, alarm-retried).
+2. App stages its cached payloads over wireless ADB to `/data/local/tmp`.
+3. Root helper self-updates artifacts from this repo's feed (3 retries per
+   download) so a stale app cache can never execute old code.
+4. Exploit runs once (an flock mutex makes concurrent triggers no-ops).
+5. Root daemon late-loads KernelSU; the shell-context stability keeper then
+   owns module activation:
+   - disables Samsung's `softdog` (its 100 s expiry was panicking the device
+     mid-churn — see commit history),
+   - repairs a poisoned `/data/adb/ksud` from the feed-managed copy,
+   - runs ksud `post-fs-data` / `services` / `boot-completed`,
+   - re-runs `services` if `vectord` lost the race,
+   - restarts zygote **only if every stage succeeded**, then writes the
+     boot-scoped done marker,
+   - exempts the manager app from Samsung background management for next
+     boot (`deviceidle whitelist`, standby bucket, `adb_wifi_enabled`).
+6. The app waits for that marker instead of touching ksud/zygote itself.
+
+Every keeper decision is traced to `/data/local/tmp/ksu-keeper.log`.
+
+### Reliability rules encoded the hard way
+
+- Choreography cores are compile-time literals (`CORE 0`,
+  `CONSUMER_CORE CORE+1`, waiter unpinned). Any runtime affinity probing in
+  the payload path destabilizes it even with identical placement; the X3
+  prime rejects affinity on this firmware outright (restricted-core EINVAL),
+  so `src/affinity.h` pinning applies **only to post-root background actors**
+  (perf-cluster mask, never LITTLE).
+- The exploit session lock (`flock`) makes overlapping manual/app runs safe.
+- A pre-exploit liveness check (`su` probe + `/proc/modules` +
+  `/sys/module/kernelsu` + boot-scoped public-storage marker) prevents
+  re-exploitation after zygote restarts.
+- Module application never kills zygote unless all ksud stages succeeded —
+  retries can defer (exit 42) but cannot soft-reboot-loop.
+
+## Supported payloads
+
+| Payload | Models | Kernel | Status |
+| --- | --- | --- | --- |
+| `galaxy-s25-series-2026-06-07` | S25 family | 6.6.98 | Device-tested |
+| `e3q-S928USQS6DZF2` | S24 Ultra | 6.1.145 | HW debugging |
+| `e2s-S926BXXUEDZDR` | S24+ | 6.1.157 | Device-tested |
+| `essi-A566EXXSCCZG6` | A56 5G | 6.6.102 | Device-tested |
+| `a36xq-A366WVLS3AYG1` | A36 5G | 6.6.46 | Device-tested |
+| `dm3q-S9180ZHS8ZF5` | S23 Ultra | 5.15.189 | Testing |
+| `dm2q-S916BXXSAFZG1` / `-S916NKSS8FZG1` | S23+ | 5.15.189 | Shell-only |
+| `f946b-F946BXXS7GZE5` | Z Fold5 | 5.15.189 | **Device-tested: full auto-root e2e** |
 
 ## Feed delivery
 
-Root My Galaxy resolves the payload repository's current commit first and
-fetches `support/targets-v3.json` and every artifact from that immutable
-commit. Per-artifact SHA-256 fields and manifest signatures are not part of
-schema version 3. `targets-v2.json` is retained for released 0.2.3 clients.
+The app resolves this repo's current `main` commit and fetches
+`support/targets-v3.json` plus every artifact from that immutable commit.
+Per-artifact SHA-256 fields and manifest signatures are not part of schema
+v3; sizes are enforced by both the feed parser and the helper's self-update.
 
 ## Build
 
 ```sh
-make TARGET=pa3q-S938NKSUACZF1 ANDROID_NDK_HOME=/path/to/android-ndk
-make TARGET=e3q-S928USQS6DZF2 ANDROID_NDK_HOME=/path/to/android-ndk
-make TARGET=e2s-S926BXXUEDZDR ANDROID_NDK_HOME=/path/to/android-ndk
-make TARGET=essi-S721NKSSCDZF3 ANDROID_NDK_HOME=/path/to/android-ndk
-make TARGET=e1s-S921BXXSFDZF2 ANDROID_NDK_HOME=/path/to/android-ndk
-make TARGET=a15-A155NKSS6BYH1 ANDROID_NDK_HOME=/path/to/android-ndk
-make TARGET=essi-A566EXXSCCZG6 ANDROID_NDK_HOME=/path/to/android-ndk
-make TARGET=a36xq-A366WVLS3AYG1 ANDROID_NDK_HOME=/path/to/android-ndk
-make TARGET=dm3q-S9180ZHS8FZF5 ANDROID_NDK_HOME=/path/to/android-ndk
-make TARGET=dm2q-S916BXXSAFZG1 ANDROID_NDK_HOME=/path/to/android-ndk
-make TARGET=f946b-F946BXXS7GZE5 ANDROID_NDK_HOME=/path/to/android-ndk
+make TARGET=f946b-F946BXXS7GZE5 ANDROID_NDK_HOME=/path/to/android-ndk API=35
 ```
 
-Outputs:
+Outputs under `build/<profile>/`: `cve-2026-43499` (shell preload),
+`cve-2026-43499-app.so` (app payload), `cve-2026-43499-root` (root helper /
+activation driver). `make … release` additionally builds the size-capped
+release `.so`. On Windows, `build_f946b.bat` mirrors this with NDK r30.
 
-```text
-build/<profile>/cve-2026-43499
-build/<profile>/cve-2026-43499-app.so
-build/<profile>/cve-2026-43499-root
-```
+Porting procedure: [`docs/PORTING.md`](docs/PORTING.md). KernelSU patch and
+artifact provenance: [`kernelsu/README.md`](kernelsu/README.md).
 
-The release app payload is built with:
+## CI
 
-```sh
-make TARGET=essi-S721NKSSCDZF3 ANDROID_NDK_HOME=/path/to/android-ndk release
-```
-
-The complete firmware-to-profile procedure is recorded in
-[`docs/PORTING.md`](docs/PORTING.md). Samsung-specific KernelSU changes and
-versioned artifacts are documented in [`kernelsu/README.md`](kernelsu/README.md).
-The exact S921B DZF2 analysis is recorded separately in
-[`docs/SM-S921B-S921BXXSFDZF2.md`](docs/SM-S921B-S921BXXSFDZF2.md), and the
-S928U/S928U1 DZF2 analysis is in
-[`docs/SM-S928U1-S928U1UES6DZF2.md`](docs/SM-S928U1-S928U1UES6DZF2.md). S921B
-is an Exynos 2400 target and is not a Qualcomm/Snapdragon reference for E3Q.
-The 5.10 A15 analysis is in
-[`docs/SM-A155N-A155NKSS6BYH1.md`](docs/SM-A155N-A155NKSS6BYH1.md).
-The SM-A566E CCZG6 analysis and validation record is in
-[`docs/SM-A566E-A566EXXSCCZG6.md`](docs/SM-A566E-A566EXXSCCZG6.md).
-The SM-S926B DZDR analysis and device-validation record is in
-[`docs/SM-S926B-S926BXXUEDZDR.md`](docs/SM-S926B-S926BXXUEDZDR.md).
-The Fold5 porting analysis and validation record is in
-[`docs/SM-F946B.md`](docs/SM-F946B.md).
-
-The SM-A366W AYG1 device validation is in
-[`docs/SM-A366W-A366WVLS3AYG1.md`](docs/SM-A366W-A366WVLS3AYG1.md).
-The experimental SM-S916B FZG1 shell port and its exact hardware evidence are in [`docs/SM-S916B-S916BXXSAFZG1.md`](docs/SM-S916B-S916BXXSAFZG1.md).
-
-Use only on devices you own or are explicitly authorized to test.
+`.github/workflows/release.yml` builds the native matrix on tag pushes,
+archives the vendored KernelSU binaries + feed into a release with SHA256SUMS,
+and — scheduled weekly or via workflow_dispatch — pulls the latest upstream
+KernelSU source, verifies the Samsung KDP/RKP/DEFEX patch still applies, and
+uploads the source snapshot.
