@@ -268,14 +268,25 @@ static pid_t spawn_allocation_keeper(void) {
    * Combined with the apply script's no-zygote-kill-on-failure contract,
    * this is what prevents soft-reboot loops from ever starting. */
   int fail_streak = 0;
+  /* Verbose per-tick trace: every decision lands in ksu-keeper.log so a
+   * silent stall between actors is diagnosable after the fact. */
+  int last_state_logged = -1;
+  long applied_at_uptime = -1;
 
   for (;;) {
     syscall(SYS_nanosleep, &tick, NULL);
+    long now_up = ksu_uptime_sec();
     if (backoff > 0) {
       backoff--;
       continue;
     }
-    if (!ksu_active_this_boot()) {
+    int active = ksu_active_this_boot();
+    if (!active) {
+      if (last_state_logged != 0) {
+        dprintf(STDOUT_FILENO, "keeper tick uptime=%ld state=waiting-ksu\n",
+                now_up);
+        last_state_logged = 0;
+      }
       continue;
     }
     /* Publish a boot-scoped active marker on public storage so later
@@ -284,11 +295,26 @@ static pid_t spawn_allocation_keeper(void) {
      * exploit instead of re-running it after a zygote restart. */
     ksu_sd_marker_write();
     if (modules_done_this_boot()) {
+      if (last_state_logged != 1) {
+        dprintf(STDOUT_FILENO,
+                "keeper tick uptime=%ld state=done-this-boot\n", now_up);
+        last_state_logged = 1;
+      }
       syscall(SYS_nanosleep, &hold, NULL);
       continue;
     }
+    if (applied_at_uptime > 0 && now_up - applied_at_uptime < 20) {
+      /* Grace window right after a fresh apply: give the framework restart
+       * time to settle before judging the done marker again. */
+      continue;
+    }
+    dprintf(STDOUT_FILENO,
+            "keeper tick uptime=%ld state=attempting-apply streak=%d\n",
+            now_up, fail_streak);
     int lock_fd = activation_lock_acquire();
     if (lock_fd < 0) {
+      dprintf(STDOUT_FILENO, "keeper uptime=%ld lock acquire failed\n",
+              now_up);
       backoff = 6;
       continue;
     }
@@ -300,13 +326,30 @@ static pid_t spawn_allocation_keeper(void) {
         _exit(127);
       }
       if (ap > 0) {
+        /* Bounded wait: a wedged su/ksud must not freeze this actor. */
         int status = 0;
-        while (waitpid(ap, &status, 0) < 0 && errno == EINTR) {
+        int waited = 0;
+        pid_t w;
+        while ((w = waitpid(ap, &status, WNOHANG)) == 0 && waited < 120) {
+          syscall(SYS_nanosleep, &tick, NULL);
+          waited += 5;
+        }
+        if (w == 0) {
+          dprintf(STDOUT_FILENO,
+                  "keeper uptime=%ld apply child=%d timed out after 120s; "
+                  "killing\n",
+                  now_up, (int)ap);
+          syscall(SYS_kill, ap, SIGKILL);
+          while (waitpid(ap, &status, 0) < 0 && errno == EINTR) {
+          }
+          status = 1 << 8;
+        } else if (w < 0) {
+          status = 1 << 8;
         }
         int rc = WIFEXITED(status) ? WEXITSTATUS(status) : 1;
         dprintf(STDOUT_FILENO,
-                "keeper apply rc=%d streak=%d uptime=%ld\n", rc,
-                fail_streak, ksu_uptime_sec());
+                "keeper apply rc=%d streak=%d uptime=%ld waited=%ds\n", rc,
+                fail_streak, ksu_uptime_sec(), waited);
         if (rc == 0) {
           mark_modules_done();
           /* Housekeeping: drop this app's stale boot-scoped markers from
