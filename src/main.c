@@ -505,11 +505,6 @@ int run_exploit(int argc, char **argv) {
   init_ashmem_path();
 
   pin_to_core(CORE);
-  {
-    char affinity_desc[160];
-    affinity_describe(affinity_desc, sizeof(affinity_desc));
-    pr_success("cpu map %s\n", affinity_desc);
-  }
 #if defined(SLIDE_STACK_WRITER) && \
     defined(SLIDE_STACK_WRITER_SIGRETURN) && \
     SLIDE_STACK_WRITER == SLIDE_STACK_WRITER_SIGRETURN

