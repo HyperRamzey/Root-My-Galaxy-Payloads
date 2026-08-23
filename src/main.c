@@ -309,6 +309,30 @@ static pid_t spawn_allocation_keeper(void) {
                 fail_streak, ksu_uptime_sec());
         if (rc == 0) {
           mark_modules_done();
+          /* Housekeeping: drop this app's stale boot-scoped markers from
+           * previous boots so public storage does not accumulate them. */
+          {
+            char live_boot_id[64];
+            char path[160];
+            DIR *dir = opendir("/storage/emulated/0");
+            if (dir != NULL &&
+                read_boot_id(live_boot_id, sizeof(live_boot_id))) {
+              struct dirent *ent;
+              size_t prefix_len = strlen(".cve43499-ksu-");
+              while ((ent = readdir(dir)) != NULL) {
+                if (strncmp(ent->d_name, ".cve43499-ksu-", prefix_len) != 0) {
+                  continue;
+                }
+                if (strcmp(ent->d_name + prefix_len, live_boot_id) == 0) {
+                  continue;
+                }
+                snprintf(path, sizeof(path), "/storage/emulated/0/%s",
+                         ent->d_name);
+                unlink(path);
+              }
+              closedir(dir);
+            }
+          }
           fail_streak = 0;
         } else if (rc == 42) {
           /* Boot not completed yet; retry sooner but do not count it as a

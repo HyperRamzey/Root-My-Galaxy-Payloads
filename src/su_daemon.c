@@ -73,6 +73,12 @@
   "done; " \
   "if [ \"$killed\" = 0 ]; then echo 'apply-modules: no zygote killed' >&2; " \
   "exit 1; fi; " \
+  "PKG=\"${RMG_MANAGER_PACKAGE:-}\"; " \
+  "if [ -n \"$PKG\" ]; then " \
+  "cmd deviceidle whitelist +\"$PKG\" >/dev/null 2>&1; " \
+  "am set-standby-bucket \"$PKG\" active >/dev/null 2>&1; " \
+  "settings put global adb_wifi_enabled 1 >/dev/null 2>&1; " \
+  "echo \"apply-modules: manager $PKG exempted for next boot\"; fi; " \
   "echo 'apply-modules: zygote restarted for module pickup'; exit 0"
 #define LOGCAT_PATH "/system/bin/logcat"
 
