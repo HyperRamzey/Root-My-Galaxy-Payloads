@@ -37,28 +37,43 @@
  * KernelSU module lifecycle driver, executed via `su -c` from a
  * shell/app context (see apply_modules_core). Exits non-zero unless all
  * lifecycle stages succeeded and a zygote was actually restarted.
+ *
+ * Boot-safety contract: this script is retried by long-lived actors, so it
+ * must never disturb a running framework unless module activation actually
+ * succeeded. Exit 42 defers while the system is still booting; stage
+ * failures leave the zygote untouched so retries cannot soft-reboot-loop.
  */
 #define KSU_APPLY_SCRIPT \
+  "if [ \"$(getprop sys.boot_completed 2>/dev/null)\" != \"1\" ]; then " \
+  "echo 'apply-modules: boot not completed; deferring' >&2; exit 42; fi; " \
   "ksud=''; " \
-  "for p in /data/adb/ksud /data/adb/ksu/bin/ksud " \
-  "/data/local/tmp/ksud-s25u-kdp; do " \
+  "for p in /data/local/tmp/ksud-s25u-kdp /data/adb/ksud " \
+  "/data/adb/ksu/bin/ksud; do " \
   "[ -x \"$p\" ] && ksud=\"$p\" && break; " \
   "done; " \
   "if [ -z \"$ksud\" ]; then " \
   "echo 'apply-modules: no ksud binary found' >&2; exit 1; " \
   "fi; " \
+  "if [ \"$ksud\" != \"/data/adb/ksud\" ]; then " \
+  "cp \"$ksud\" /data/adb/ksud 2>/dev/null && chmod 755 /data/adb/ksud; fi; " \
   "rc=0; " \
   "for s in post-fs-data services boot-completed; do " \
   "\"$ksud\" \"$s\" >/dev/null 2>&1 || rc=1; " \
   "echo \"apply-modules: ksud $s exit=$? ($ksud)\"; " \
   "done; " \
+  "if [ \"$rc\" != \"0\" ]; then " \
+  "echo 'apply-modules: ksud stages failed; leaving zygote alone' >&2; " \
+  "exit $rc; fi; " \
+  "if [ -d /data/adb/modules/zygisk_vector ] && [ -z \"$(pidof vectord)\" ]; " \
+  "then \"$ksud\" services >/dev/null 2>&1; sleep 2; fi; " \
+  "echo \"apply-modules: vectord pid=$(pidof vectord)\"; " \
   "killed=0; " \
   "for p in $(pidof zygote64) $(pidof zygote); do " \
   "kill -9 $p 2>/dev/null && killed=1; " \
   "done; " \
   "if [ \"$killed\" = 0 ]; then echo 'apply-modules: no zygote killed' >&2; " \
-  "rc=1; fi; " \
-  "exit $rc"
+  "exit 1; fi; " \
+  "echo 'apply-modules: zygote restarted for module pickup'; exit 0"
 #define LOGCAT_PATH "/system/bin/logcat"
 
 static uid_t allowed_client_uid = 2000;
@@ -903,14 +918,39 @@ static int modules_done_this_boot(void) {
   if (sysinfo(&si) != 0) {
     return 1;
   }
+  /* Preferred format: stored write-time uptime (monotonic per boot, reset
+   * on reboot). Immune to NTP wall-clock jumps that made the mtime check
+   * falsely stale and re-triggered zygote kills mid-boot. */
+  int fd = open(KSU_MODULES_DONE_PATH, O_RDONLY | O_CLOEXEC);
+  if (fd >= 0) {
+    char buf[32];
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n > 0) {
+      buf[n] = '\0';
+      long stored = strtol(buf, NULL, 10);
+      if (stored > 0) {
+        return stored <= (long)si.uptime + 2;
+      }
+    }
+  }
   return st.st_mtime >= time(NULL) - (long)si.uptime - 5;
 }
 
 static void mark_modules_done(void) {
+  char payload[32];
+  struct sysinfo si;
+  size_t len;
+  if (sysinfo(&si) == 0) {
+    len = (size_t)snprintf(payload, sizeof(payload), "%ld", (long)si.uptime);
+  } else {
+    memcpy(payload, "done", 5);
+    len = 4;
+  }
   int fd = open(KSU_MODULES_DONE_PATH,
                 O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
   if (fd >= 0) {
-    ssize_t ignored = write(fd, "done", 4);
+    ssize_t ignored = write(fd, payload, len);
     (void)ignored;
     close(fd);
   }
@@ -1002,6 +1042,10 @@ static void run_activation_sequence(void) {
 
 static void activation_watcher(void) {
   prctl(PR_SET_NAME, "cve43499-activate", 0, 0, 0);
+  /* Bounded retry pressure: the first attempts come quickly, but a
+   * persistently failing sequence degrades to a long cooldown instead of
+   * hot-looping for the lifetime of the daemon. */
+  int attempts = 0;
   for (;;) {
     /* Poll for marker existence instead of claiming it via rename: the
      * daemon's u:r:kernel:s0 domain may lack remove_name/rename rights on
@@ -1023,9 +1067,11 @@ static void activation_watcher(void) {
       if (modules_done_this_boot()) {
         unlink(KSU_ACTIVATE_SIGNAL_PATH);
       } else {
-        /* Activation incomplete (e.g. sucompat not ready yet); retry after
-         * a short backoff instead of hot-spinning. */
-        sleep(5);
+        attempts++;
+        /* Activation incomplete; back off hard after the early window.
+         * The shell-context keeper keeps its own independent schedule, so
+         * a deferred apply still happens once the environment is ready. */
+        sleep(attempts >= 10 ? 1800 : 5);
       }
     }
     sleep(1);

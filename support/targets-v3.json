@@ -12,11 +12,11 @@
       ],
       "exploit": {
         "url": "https://raw.githubusercontent.com/HyperRamzey/Root-My-Galaxy-Payloads/main/artifacts/f946b-F946BXXS7GZE5/cve-2026-43499-app.so",
-        "size": 107328
+        "size": 114816
       },
       "rootHelper": {
         "url": "https://raw.githubusercontent.com/HyperRamzey/Root-My-Galaxy-Payloads/main/artifacts/f946b-F946BXXS7GZE5/cve-2026-43499-root",
-        "size": 39016
+        "size": 39672
       },
       "kernelsu": {
         "url": "https://raw.githubusercontent.com/HyperRamzey/Root-My-Galaxy-Payloads/main/kernelsu/ksud-f946b-F946BXXS7GZE5-kdp",
@@ -259,14 +259,14 @@
       "kernelVersions": [
         "5.15.189"
       ],
-  "exploit": {
-    "url": "https://raw.githubusercontent.com/HyperRamzey/Root-My-Galaxy-Payloads/main/artifacts/f946b-F946BXXS7GZE5/cve-2026-43499-app.so",
-    "size": 107328
-  },
-  "rootHelper": {
-    "url": "https://raw.githubusercontent.com/HyperRamzey/Root-My-Galaxy-Payloads/main/artifacts/f946b-F946BXXS7GZE5/cve-2026-43499-root",
-    "size": 39016
-  },
+      "exploit": {
+        "url": "https://raw.githubusercontent.com/HyperRamzey/Root-My-Galaxy-Payloads/main/artifacts/f946b-F946BXXS7GZE5/cve-2026-43499-app.so",
+        "size": 114816
+      },
+      "rootHelper": {
+        "url": "https://raw.githubusercontent.com/HyperRamzey/Root-My-Galaxy-Payloads/main/artifacts/f946b-F946BXXS7GZE5/cve-2026-43499-root",
+        "size": 39672
+      },
       "kernelsu": {
         "url": "https://raw.githubusercontent.com/HyperRamzey/Root-My-Galaxy-Payloads/main/kernelsu/ksud-f946b-F946BXXS7GZE5-kdp",
         "size": 4887272
