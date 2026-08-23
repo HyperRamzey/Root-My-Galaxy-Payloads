@@ -1853,9 +1853,24 @@ static void self_update_artifacts(int report_fd, const char *payload_path,
   }
 
   const char *feed_tmp = RMG_TMP_BASE "-feed.json";
-  unlink(feed_tmp);
-  if (rmg_fetch_url(RMG_FEED_URL, feed_tmp, 20) != 0 ||
-      rmg_file_size(feed_tmp) <= 0) {
+  /* Boot-time networks (and raw.githubusercontent.com) are flaky right
+   * when this runs; a failed fetch silently condemned the run to the
+   * app's stale cache. Retry the feed before giving up. */
+  int feed_ok = 0;
+  for (int attempt = 1; attempt <= 3 && !feed_ok; attempt++) {
+    unlink(feed_tmp);
+    if (attempt > 1) {
+      sleep(2 * attempt);
+    }
+    if (rmg_fetch_url(RMG_FEED_URL, feed_tmp, 20) == 0 &&
+        rmg_file_size(feed_tmp) > 0) {
+      feed_ok = 1;
+    } else {
+      dprintf(report_fd, "[self-update] feed fetch attempt %d/3 failed\n",
+              attempt);
+    }
+  }
+  if (!feed_ok) {
     dprintf(report_fd, "[self-update] feed unreachable; keeping local "
                        "artifacts\n");
     unlink(feed_tmp);
@@ -1914,20 +1929,29 @@ static void self_update_artifacts(int report_fd, const char *payload_path,
     }
     char tmp[128];
     snprintf(tmp, sizeof(tmp), "%s-%d", RMG_TMP_BASE, i);
-    unlink(tmp);
-    dprintf(report_fd,
-            "[self-update] %s local=%ld remote=%ld -> downloading\n",
-            names[i], local, info[i].size);
-    if (rmg_fetch_url(info[i].url, tmp, 120) != 0) {
-      dprintf(report_fd, "[self-update] %s download failed\n", names[i]);
+    int fetched = 0;
+    for (int attempt = 1; attempt <= 3 && !fetched; attempt++) {
       unlink(tmp);
-      continue;
+      if (attempt > 1) {
+        sleep(2 * attempt);
+        dprintf(report_fd,
+                "[self-update] %s download retry %d/3\n", names[i], attempt);
+      }
+      if (rmg_fetch_url(info[i].url, tmp, 120) == 0) {
+        long got = rmg_file_size(tmp);
+        if (info[i].size <= 0 || got == info[i].size) {
+          fetched = 1;
+          break;
+        }
+        dprintf(report_fd, "[self-update] %s size mismatch got=%ld\n",
+                names[i], got);
+      } else {
+        dprintf(report_fd, "[self-update] %s download failed (attempt %d)\n",
+                names[i], attempt);
+      }
     }
-    long got = rmg_file_size(tmp);
-    if (info[i].size > 0 && got != info[i].size) {
-      dprintf(report_fd, "[self-update] %s size mismatch got=%ld\n", names[i],
-              got);
-      unlink(tmp);
+    unlink(tmp);
+    if (!fetched) {
       continue;
     }
     if (rmg_install(tmp, targets[i]) != 0) {
@@ -1937,7 +1961,7 @@ static void self_update_artifacts(int report_fd, const char *payload_path,
     }
     updated++;
     dprintf(report_fd, "[self-update] %s updated (%ld bytes)\n", names[i],
-            got);
+            rmg_file_size(targets[i]));
     if (i == 2) {
       /* Keep the pre-staged loader copy in sync with ksud. */
       long src = open(KSU_LOADER_PATH, O_RDONLY | O_CLOEXEC);
