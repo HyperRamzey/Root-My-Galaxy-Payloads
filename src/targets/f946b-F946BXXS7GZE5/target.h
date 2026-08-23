@@ -33,15 +33,19 @@
 /*
  * Choreography core placement (device-verified). The futex-collision side
  * channel is calibrated to a same-cluster LITTLE pair: pinning the timing
- * threads onto the perf cluster yielded zero collisions, and a waiter on a
- * foreign cluster panicked one attempt. The X3 prime (cpu7) is not an
- * option on this firmware — the kernel rejects affinity to it with EINVAL
- * (restricted-CPU reservation). Background actors still run on the probe-
- * permitted perf mask via pin_perf_mask().
+ * threads onto the perf cluster yielded zero collisions. The waiter stage
+ * must stay UNPINNED (-1): every tested explicit waiter placement (perf
+ * cluster, or sharing cpu1 with the consumer) ended in a kernel panic,
+ * while the historical unpinned waiter is the configuration every
+ * verified successful root used. pin_to_core() treats negative ids as
+ * "leave to the scheduler". The X3 prime (cpu7) is not an option on this
+ * firmware regardless — the kernel rejects affinity to it with EINVAL
+ * (restricted-CPU reservation). Background actors still run on the
+ * probe-permitted perf mask via pin_perf_mask().
  */
 #define RMG_PROFILE_TIMING_CORE 0
 #define RMG_PROFILE_CONSUMER_CORE 1
-#define RMG_PROFILE_WAITER_CORE 1
+#define RMG_PROFILE_WAITER_CORE (-1)
 
 #define KMALLOC_CGROUP_TYPE 1
 #define KMALLOC_CACHE_TYPES 3
