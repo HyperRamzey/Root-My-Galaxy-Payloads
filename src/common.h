@@ -760,7 +760,13 @@ static inline void mark_modules_done(void) {
 #define KSU_LATE_LOAD_LOCK_PATH "/data/local/tmp/.cve43499-lateload.lock"
 
 static inline int activation_lock_acquire(void) {
+  /* The daemon creates this file as root:root 0644; a shell-context actor
+   * cannot reopen it O_RDWR (EACCES forever). flock(LOCK_EX) is valid on a
+   * read-only descriptor, so degrade to O_RDONLY instead of failing. */
   int fd = open(KSU_LATE_LOAD_LOCK_PATH, O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+  if (fd < 0 && errno == EACCES) {
+    fd = open(KSU_LATE_LOAD_LOCK_PATH, O_RDONLY | O_CLOEXEC);
+  }
   if (fd < 0) {
     return -1;
   }

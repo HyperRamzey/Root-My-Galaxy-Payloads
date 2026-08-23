@@ -844,7 +844,11 @@ static int run_apply_modules(struct su_request *request, int conn) {
  * deadlock against its own parent.
  */
 static int activation_lock_acquire(void) {
+  /* See common.h: the root-owned lock file forces a read-only fallback. */
   int fd = open(KSU_LATE_LOAD_LOCK_PATH, O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+  if (fd < 0 && errno == EACCES) {
+    fd = open(KSU_LATE_LOAD_LOCK_PATH, O_RDONLY | O_CLOEXEC);
+  }
   if (fd < 0) {
     return -1;
   }
