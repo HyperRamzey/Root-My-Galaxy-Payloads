@@ -844,6 +844,10 @@ static inline void activation_lock_release(int fd) {
   "am set-standby-bucket \"$PKG\" active >/dev/null 2>&1; " \
   "settings put global adb_wifi_enabled 1 >/dev/null 2>&1; " \
   "echo \"apply-modules: manager $PKG exempted for next boot\"; fi; " \
+  "BID=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null); " \
+  "UP=$(cut -d' ' -f1 /proc/uptime 2>/dev/null | cut -d. -f1); " \
+  "if [ -n \"$BID\" ] && [ -n \"$UP\" ]; then " \
+  "echo \"$BID $UP\" > /data/local/tmp/.cve43499-modules-done 2>/dev/null; fi; " \
   "echo 'apply-modules: zygote restarted for module pickup'; exit 0"
 
 #endif
