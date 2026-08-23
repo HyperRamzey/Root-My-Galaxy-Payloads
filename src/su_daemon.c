@@ -66,9 +66,15 @@
   "if [ \"$rc\" != \"0\" ]; then " \
   "echo 'apply-modules: ksud stages failed; leaving zygote alone' >&2; " \
   "exit $rc; fi; " \
-  "if [ -d /data/adb/modules/zygisk_vector ] && [ -z \"$(pidof vectord)\" ]; " \
-  "then \"$ksud\" services >/dev/null 2>&1; sleep 2; fi; " \
-  "echo \"apply-modules: vectord pid=$(pidof vectord)\"; " \
+  "if [ -d /data/adb/modules/zygisk_vector ] && " \
+  "[ -x /data/adb/modules/zygisk_vector/daemon ] && " \
+  "[ -z \"$(pidof vectord)\" ]; then " \
+  "\"$ksud\" services >/dev/null 2>&1; sleep 2; fi; " \
+  "VD=$(pidof vectord); " \
+  "if [ -n \"$VD\" ]; then " \
+  "echo \"apply-modules: vectord pid=$VD\"; else " \
+  "echo 'apply-modules: no vectord (vector not installed or not running); " \
+  "non-blocking'; fi; " \
   "killed=0; " \
   "for p in $(pidof zygote64) $(pidof zygote); do " \
   "kill -9 $p 2>/dev/null && killed=1; " \
