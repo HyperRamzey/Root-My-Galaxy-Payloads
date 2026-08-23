@@ -5,12 +5,16 @@ on:
     tags: ["v*"]
   workflow_dispatch:
   schedule:
-    # Weekly, Monday 03:20 UTC - keeps releases fresh against the latest
-    # KernelSU upstream source snapshot.
+    # Weekly, Monday 03:20 UTC - refresh payloads against latest NDK builds,
+    # and keep the KernelSU upstream source snapshot current.
     - cron: "20 3 * * 1"
 
 permissions:
   contents: write
+
+concurrency:
+  group: payloads-release
+  cancel-in-progress: false
 
 jobs:
   build-native:
@@ -86,6 +90,86 @@ jobs:
           name: kernelsu-source-${{ steps.ksu.outputs.ref }}
           path: kernelsu-*.tar.gz
 
+  weekly-refresh:
+    name: Sync fresh payloads into repo + feed
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    needs: [build-native]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Copy fresh builds over committed artifacts
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          for d in dist/*/; do
+            t=$(basename "$d")
+            mkdir -p "artifacts/$t"
+            for f in "$d""$t"-cve-2026-43499-app.so \
+                     "$d""$t"-cve-2026-43499-root \
+                     "$d""$t"-cve-2026-43499; do
+              base=$(basename "$f")
+              dest="artifacts/$t/${base#"$t"-}"
+              if ! cmp -s "$f" "$dest" 2>/dev/null; then
+                cp "$f" "$dest"
+                echo "refreshed: $dest"
+              fi
+            done
+          done
+
+      - name: Update feed sizes to match fresh builds
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, glob
+          feed_path = 'support/targets-v3.json'
+          with open(feed_path) as fh:
+              feed = json.load(fh)
+          sizes = {}
+          for p in glob.glob('artifacts/*/*'):
+              t = p.split('/')[1]
+              sizes[(t, os.path.basename(p))] = os.path.getsize(p)
+          touched = 0
+          def fix(node):
+              global touched
+              url = node.get('url', '')
+              if '/artifacts/' not in url or '/kernelsu/' in url:
+                  return
+              rest = url.split('/artifacts/')[1]
+              parts = rest.split('/')
+              key = (parts[0], parts[-1])
+              if key in sizes and node.get('size') != sizes[key]:
+                  node['size'] = sizes[key]
+                  globals()['touched'] += 1
+          for payload in feed['payloads']:
+              for k in ('exploit', 'rootHelper'):
+                  node = payload.get(k)
+                  if isinstance(node, dict):
+                      fix(node)
+          with open(feed_path, 'w') as fh:
+              json.dump(feed, fh, indent=2)
+              fh.write('\n')
+          print(f'feed entries updated: {touched}')
+          PY
+
+      - name: Commit refreshed artifacts (if changed)
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet && git diff --cached --quiet; then
+            echo "No changes since last sync."
+            exit 0
+          fi
+          git add -A
+          git commit -m "ci(weekly): refresh payloads + feed from latest NDK builds"
+          git push origin main
+
   release:
     name: Publish release
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
@@ -114,7 +198,7 @@ jobs:
         with:
           files: |
             dist/**/*.so
-            dist/**/cve-2026-43499
+            dist/**/cve-2026-43499-root
             dist/kernelsu/*
             dist/support/*
             dist/SHA256SUMS
