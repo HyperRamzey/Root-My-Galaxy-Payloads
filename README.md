@@ -59,6 +59,18 @@ once from its Settings screen). Per boot the pipeline is:
 
 Every keeper decision is traced to `/data/local/tmp/ksu-keeper.log`.
 
+### Measured boot-to-root timing (F946BXXS7GZE5, RFCWC0G1Z1J)
+
+| Stage | Observed |
+|---|---|
+| Exploit (`attempt=1`) | seconds — KASLR slide + physrw + UMH root in one pass |
+| Keeper waits for KernelSU | `state=waiting-ksu` until late-load lands |
+| Module apply window | `waited=10s–70s` per boot |
+| Done marker | uptime 231–451 s across three consecutive boots |
+
+Worst case (retried boots) stays under ~8 minutes from boot to rooted,
+module-applied framework.
+
 ### Reliability rules encoded the hard way
 
 - Choreography cores are compile-time literals (`CORE 0`,

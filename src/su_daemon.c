@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <sys/file.h>
@@ -34,6 +35,49 @@
 #define KSU_LATE_LOAD_LOCK_PATH "/data/local/tmp/.cve43499-lateload.lock"
 
 /*
+ * The app stages ksud under its feed artifact name
+ * (/data/local/tmp/ksud-<profile>-kdp); older builds only ever had the fixed
+ * legacy alias above. Resolve the live loader binary on every call: prefer a
+ * profile-named candidate so a stale legacy copy can never shadow it.
+ */
+static const char *ksu_loader_path(void) {
+  static char resolved[160];
+  resolved[0] = '\0';
+  DIR *dir = opendir("/data/local/tmp");
+  if (dir != NULL) {
+    struct dirent *ent;
+    while ((ent = readdir(dir)) != NULL) {
+      size_t len = strlen(ent->d_name);
+      if (len > 8 && len < sizeof(resolved) - 16 &&
+          strncmp(ent->d_name, "ksud-", 5) == 0 &&
+          strcmp(ent->d_name + len - 4, "-kdp") == 0 &&
+          strcmp(ent->d_name, "ksud-s25u-kdp") != 0) {
+        snprintf(resolved, sizeof(resolved), "/data/local/tmp/%s",
+                 ent->d_name);
+        break;
+      }
+    }
+    closedir(dir);
+  }
+  if (resolved[0] == '\0') {
+    snprintf(resolved, sizeof(resolved), "%s", KSU_LOADER_PATH);
+  }
+  return resolved;
+}
+
+/* Self-update install target for the ksud feed artifact: keep the feed's
+ * file name so the staged path identifies the profile it belongs to. */
+static int ksu_selfupdate_target(const char *url, char *out, size_t out_sz) {
+  const char *base = strrchr(url, '/');
+  if (base == NULL || strncmp(base, "/ksud-", 6) != 0 || base[6] == '\0' ||
+      strlen(base) >= out_sz - 16) {
+    return -1;
+  }
+  snprintf(out, out_sz, "/data/local/tmp/%s", base + 1);
+  return 0;
+}
+
+/*
  * KernelSU module lifecycle driver, executed via `su -c` from a
  * shell/app context (see apply_modules_core). Exits non-zero unless all
  * lifecycle stages succeeded and a zygote was actually restarted.
@@ -49,8 +93,8 @@
   "if [ \"$(getprop sys.boot_completed 2>/dev/null)\" != \"1\" ]; then " \
   "echo 'apply-modules: boot not completed; deferring' >&2; exit 42; fi; " \
   "ksud=''; " \
-  "for p in /data/local/tmp/ksud-s25u-kdp /data/adb/ksud " \
-  "/data/adb/ksu/bin/ksud; do " \
+  "for p in /data/local/tmp/ksud-*-kdp /data/local/tmp/ksud-s25u-kdp " \
+  "/data/adb/ksud /data/adb/ksu/bin/ksud; do " \
   "[ -x \"$p\" ] && ksud=\"$p\" && break; " \
   "done; " \
   "if [ -z \"$ksud\" ]; then " \
@@ -701,7 +745,7 @@ static int kernelsu_late_load_locked(void) {
    * rename source missing and the whole late-load aborted. */
   mkdir("/data/adb", 0755);
   {
-    int src = open(KSU_LOADER_PATH, O_RDONLY | O_CLOEXEC);
+    int src = open(ksu_loader_path(), O_RDONLY | O_CLOEXEC);
     if (src >= 0) {
       const char *staging_paths[] = {
           "/data/local/tmp/.ksud-stage",
@@ -742,7 +786,7 @@ static int kernelsu_late_load_locked(void) {
             strerror(errno));
     return 10;
   }
-  if (mount(KSU_LOADER_PATH, LOGCAT_PATH, NULL, MS_BIND, NULL) != 0) {
+  if (mount(ksu_loader_path(), LOGCAT_PATH, NULL, MS_BIND, NULL) != 0) {
     dprintf(STDERR_FILENO, "late-load: bind mount: %s\n", strerror(errno));
     return 11;
   }
@@ -1924,7 +1968,11 @@ static void self_update_artifacts(int report_fd, const char *payload_path,
   const char *targets[RMG_ARTIFACT_COUNT];
   targets[0] = payload_path;   /* exploit */
   targets[1] = helper_arg;     /* rootHelper (this binary) */
-  targets[2] = KSU_LOADER_PATH /* kernelsu */;
+  char ksu_target[160];
+  if (ksu_selfupdate_target(info[2].url, ksu_target, sizeof(ksu_target)) != 0) {
+    snprintf(ksu_target, sizeof(ksu_target), "%s", KSU_LOADER_PATH);
+  }
+  targets[2] = ksu_target      /* kernelsu */;
   static const char *names[RMG_ARTIFACT_COUNT] = {"exploit", "root-helper",
                                                   "ksud"};
 
@@ -1976,7 +2024,7 @@ static void self_update_artifacts(int report_fd, const char *payload_path,
             rmg_file_size(targets[i]));
     if (i == 2) {
       /* Keep the pre-staged loader copy in sync with ksud. */
-      long src = open(KSU_LOADER_PATH, O_RDONLY | O_CLOEXEC);
+      long src = open(targets[2], O_RDONLY | O_CLOEXEC);
       if (src >= 0) {
         int dst = open("/data/local/tmp/.ksud-stage",
                        O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0755);
