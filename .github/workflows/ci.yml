@@ -1,0 +1,90 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-native:
+    name: Build ${{ matrix.target }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - f946b-F946BXXS7GZE5
+          - e2s-S926BXXUEDZDR
+          - essi-A566EXXSCCZG6
+          - a36xq-A366WVLS3AYG1
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Android NDK r30
+        run: |
+          set -e
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            "ndk;30.0.15729638" > /dev/null || true
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/30.0.15729638" >> "$GITHUB_ENV"
+
+      - name: Build (warnings as visible)
+        run: |
+          make TARGET=${{ matrix.target }} \
+            ANDROID_NDK_HOME="$ANDROID_NDK_HOME" \
+            NDK_HOST=linux-x86_64 API=35 all
+
+      - name: Work-dir hygiene probe compiles for arm64
+        run: |
+          set -e
+          CC="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android35-clang"
+          $CC -O1 -g0 -Wall -Wextra -Isrc \
+            -DTARGET_HEADER='"targets/f946b-F946BXXS7GZE5/target.h"' \
+            tests/workdir_probe_main.c src/main.c src/util.c src/slide.c \
+            src/fops.c src/pipe.c src/root.c -pthread -o /tmp/workdir_probe
+          test -x /tmp/workdir_probe
+
+  tools:
+    name: Porting tool self-check
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: generate_target.py parses
+        run: python3 -m py_compile tools/generate_target.py
+      - name: Feed stays schema-v3 valid JSON
+        run: |
+          python3 - <<'PY'
+          import json
+          feed = json.load(open('support/targets-v3.json'))
+          assert feed.get('schemaVersion') == 3, 'schemaVersion drift'
+          assert isinstance(feed['payloads'], list) and feed['payloads']
+          for p in feed['payloads']:
+              pid = p.get('payloadId')
+              assert pid, 'payload entry without payloadId'
+              for key in ('exploit', 'kernelsu'):
+                  node = p.get(key)
+                  assert isinstance(node, dict) and 'url' in node and 'size' in \
+                      node, f'{pid}: {key} missing url/size'
+          print(f'feed ok: {len(feed["payloads"])} payloads')
+          PY
+
+  ksu-patches:
+    name: KernelSU patches apply cleanly
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch v3.2.5
+        run: git clone --depth 1 --branch v3.2.5 https://github.com/tiann/KernelSU.git ksu-src
+      - name: Apply Samsung patches
+        run: |
+          cd ksu-src
+          for p in ../kernelsu/patches/*.patch; do
+            echo "checking $p"
+            git apply --check "$p"
+          done

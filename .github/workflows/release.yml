@@ -82,8 +82,11 @@ jobs:
       - name: Verify Samsung KDP patch applies cleanly
         run: |
           cd ksu-src
-          git apply --check ../kernelsu/patches/KernelSU-v3.2.5-samsung-kdp-rkp-defex.patch ||
-          echo "::warning::Samsung patch needs rebasing onto ${{ steps.ksu.outputs.ref }}"
+          for p in ../kernelsu/patches/*.patch; do
+            echo "checking $p"
+            git apply --check "$p" ||
+              echo "::warning::$p needs rebasing onto ${{ steps.ksu.outputs.ref }}"
+          done
 
       - uses: actions/upload-artifact@v4
         with:
