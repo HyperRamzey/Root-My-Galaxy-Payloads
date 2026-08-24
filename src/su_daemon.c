@@ -139,6 +139,8 @@ static int ksu_selfupdate_target(const char *url, char *out, size_t out_sz) {
   "appops set \"$PKG\" RUN_ANY_IN_BACKGROUND allow >/dev/null 2>&1; " \
   "appops set \"$PKG\" START_FOREGROUND allow >/dev/null 2>&1; " \
   "settings put global adb_wifi_enabled 1 >/dev/null 2>&1; " \
+  "pm grant \"$PKG\" android.permission.WRITE_SECURE_SETTINGS >/dev/null 2>&1; " \
+  "pm grant \"$PKG\" android.permission.POST_NOTIFICATIONS >/dev/null 2>&1; " \
   "echo \"apply-modules: manager $PKG exempted for next boot\"; fi; " \
   "BID=$(cat /proc/sys/kernel/random/boot_id 2>/dev/null); " \
   "UP=$(cut -d' ' -f1 /proc/uptime 2>/dev/null | cut -d. -f1); " \
