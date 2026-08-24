@@ -268,6 +268,13 @@ static pid_t spawn_allocation_keeper(void) {
    * Combined with the apply script's no-zygote-kill-on-failure contract,
    * this is what prevents soft-reboot loops from ever starting. */
   int fail_streak = 0;
+  /* One-shot work-dir heal via su once KernelSU is live. Anti-log addons
+   * (KillLogger-class) wipe /data/local/tmp every boot and whatever root
+   * process recreates it labels system_data_file, permanently denying
+   * shell staging for the NEXT boot's payload push. Healing here — the
+   * first privileged moment of this boot — restores the directory,
+   * ownership and shell_data_file label before the boot ends. */
+  int healed_work_dir = 0;
   /* Verbose per-tick trace: every decision lands in ksu-keeper.log so a
    * silent stall between actors is diagnosable after the fact. */
   int last_state_logged = -1;
@@ -288,6 +295,44 @@ static pid_t spawn_allocation_keeper(void) {
         last_state_logged = 0;
       }
       continue;
+    }
+    if (!healed_work_dir) {
+      healed_work_dir = 1;
+      pid_t hp = fork();
+      if (hp == 0) {
+        execl("/system/bin/su", "su", "-c", RMG_WORK_DIR_HEAL_SH,
+              (char *)NULL);
+        _exit(127);
+      }
+      if (hp > 0) {
+        /* Bounded wait: a wedged su must not freeze this actor or delay
+         * the module-activation schedule (same contract as apply). */
+        int hstatus = 0;
+        int hwaited = 0;
+        pid_t hw;
+        while ((hw = waitpid(hp, &hstatus, WNOHANG)) == 0 && hwaited < 30) {
+          struct timespec hs = {.tv_sec = 1, .tv_nsec = 0};
+          syscall(SYS_nanosleep, &hs, NULL);
+          hwaited++;
+        }
+        if (hw == 0) {
+          syscall(SYS_kill, hp, SIGKILL);
+          while (waitpid(hp, &hstatus, 0) < 0 && errno == EINTR) {
+          }
+          dprintf(STDOUT_FILENO,
+                  "keeper uptime=%ld work-dir heal timed out\n", now_up);
+        } else if (hw > 0 && WIFEXITED(hstatus)) {
+          dprintf(STDOUT_FILENO,
+                  "keeper uptime=%ld work-dir heal rc=%d\n", now_up,
+                  WEXITSTATUS(hstatus));
+        }
+      } else {
+        /* fork failed: retry on a later tick instead of losing the
+         * heal for this boot. */
+        healed_work_dir = 0;
+        backoff = 6;
+        continue;
+      }
     }
     /* Publish a boot-scoped active marker on public storage so later
      * app-domain payload invocations (whose policy may deny reading

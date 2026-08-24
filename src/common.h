@@ -752,6 +752,14 @@ static inline void mark_modules_done(void) {
 }
 
 /*
+ * Work-directory hygiene lives in workdir_hygiene.h (heal/diagnose/
+ * stale-cleanup). It is included here because every helper above this
+ * line that it depends on (boot_id scoping, liveness probes, marker
+ * paths) is already defined, and every caller below needs it.
+ */
+#include "workdir_hygiene.h"
+
+/*
  * Exclusive cross-process lock serializing late-load and module
  * activation across daemon, watcher and keeper actors. The fd returned
  * by the acquire is inherited by forked children so a lock held across a
@@ -799,8 +807,13 @@ static inline void activation_lock_release(int fd) {
  * must never disturb a running framework unless module activation actually
  * succeeded. Exit 42 defers while the system is still booting; stage
  * failures leave the zygote untouched so retries cannot soft-reboot-loop.
+ *
+ * The work-dir heal prefix comes first (RMG_WORK_DIR_HEAL_SH from
+ * workdir_hygiene.h): re-applied on every apply pass so a wipe by
+ * anti-log addons like KillLogger between passes cannot strand staging.
  */
 #define KSU_APPLY_SCRIPT \
+  RMG_WORK_DIR_HEAL_SH \
   "softdog disable 2>/dev/null; " \
   "setprop persist.vendor.softdog off 2>/dev/null; " \
   "if [ \"$(getprop sys.boot_completed 2>/dev/null)\" != \"1\" ]; then " \

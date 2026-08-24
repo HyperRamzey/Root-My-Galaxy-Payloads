@@ -165,6 +165,19 @@ __attribute__((constructor)) static void load(void) {
     return;
   }
 
+  /* Work-dir hygiene. Order matters:
+   *  - diagnose first so the log captures the pre-heal state;
+   *  - heal is best-effort (no-op from unprivileged domains under
+   *    enforcing policy; the daemon and keeper repeat it from contexts
+   *    where relabeling succeeds);
+   *  - stale cleanup runs before exploitation so previous-boot state can
+   *    never leak into this attempt. Its contract guarantees current-
+   *    boot anti-double-root state is never touched (see
+   *    workdir_hygiene.h). */
+  rmg_diagnose_work_dir();
+  rmg_heal_work_dir();
+  rmg_cleanup_stale_runtime_artifacts();
+
   wait_for_boot_quiet_window();
 
   int max_attempts = env_int(

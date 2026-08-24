@@ -577,6 +577,16 @@ static void slide_wait_before_consume(int sequence) {
 
 static uint64_t slide_select_route_fine_delay_ticks(void) {
 #if defined(APP_FOPS_ROUTE_FINE_DELAY_TICKS)
+  const char *override_text = getenv("FINE_TICKS_OVERRIDE");
+  if (override_text && *override_text) {
+    char *override_end = NULL;
+    errno = 0;
+    unsigned long long override_value =
+        strtoull(override_text, &override_end, 0);
+    if (!errno && override_end != override_text && !*override_end) {
+      return (uint64_t)override_value;
+    }
+  }
   static const uint64_t delays[] = {
     APP_FOPS_ROUTE_FINE_DELAY_TICKS
   };
