@@ -89,6 +89,11 @@ jobs:
                   node = p.get(key)
                   assert isinstance(node, dict) and 'url' in node and 'size' in \
                       node, f'{pid}: {key} missing url/size'
+                  assert node['url'].startswith(
+                      'https://raw.githubusercontent.com/HyperRamzey/'
+                      'Root-My-Galaxy-Payloads/main/'), \
+                      f'{pid}: {key} URL outside the pinned artifact repo ' \
+                      '(app rejects it with repo_url_invalid)'
           print(f'feed ok: {len(feed["payloads"])} payloads')
           PY
 

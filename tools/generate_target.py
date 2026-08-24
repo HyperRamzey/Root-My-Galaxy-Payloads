@@ -979,8 +979,12 @@ def update_feed(feed_path, profile, model, build, kernel_release,
                          f"{feed.get('schemaVersion')!r} (want 3)")
     payloads = feed.setdefault('payloads', [])
 
-    base = ('https://raw.githubusercontent.com/BuSung-dev/'
-            'Root-My-Galaxy-Payloads/main/')
+    # The app pins artifact URLs to THIS repository (it resolves one
+    # commit here and rewrites every URL to that commit for immutability;
+    # any other host is rejected with repo_url_invalid). Mirrors/upstream
+    # must not appear in feed URLs.
+    base = ('https://raw.githubusercontent.com/'
+            'HyperRamzey/Root-My-Galaxy-Payloads/main/')
     entry_id = profile
 
     def artifact(name, rel):
