@@ -104,9 +104,9 @@ jobs:
           cd ksu-src
           # Order matters: the base KDP/RKP/DEFEX patch creates
           # kernel/compat/samsung_kdp.c which later patches modify.
-          for p in kernelsu/patches/KernelSU-v3.2.5-samsung-kdp-rkp-defex.patch \
-                   kernelsu/patches/KernelSU-v3.2.5-dm2q-fzg1.patch \
-                   kernelsu/patches/KernelSU-v3.2.5-samsung-selinux_hide.patch; do
+          for p in ../kernelsu/patches/KernelSU-v3.2.5-samsung-kdp-rkp-defex.patch \
+                   ../kernelsu/patches/KernelSU-v3.2.5-dm2q-fzg1.patch \
+                   ../kernelsu/patches/KernelSU-v3.2.5-samsung-selinux_hide.patch; do
             echo "applying $p"
             git apply "$p"
           done
