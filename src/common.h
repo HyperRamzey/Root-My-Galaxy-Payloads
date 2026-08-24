@@ -811,6 +811,10 @@ static inline void activation_lock_release(int fd) {
  * The work-dir heal prefix comes first (RMG_WORK_DIR_HEAL_SH from
  * workdir_hygiene.h): re-applied on every apply pass so a wipe by
  * anti-log addons like KillLogger between passes cannot strand staging.
+ * The SAME heal is also appended after the zygote restart + modules-done
+ * marker: anti-log addons fire their wipe at boot_completed, potentially
+ * between this script's leading heal and completion, so the trailing
+ * pass guarantees a staged-ready directory for the next boot.
  */
 #define KSU_APPLY_SCRIPT \
   RMG_WORK_DIR_HEAL_SH \
@@ -863,6 +867,8 @@ static inline void activation_lock_release(int fd) {
   "UP=$(cut -d' ' -f1 /proc/uptime 2>/dev/null | cut -d. -f1); " \
   "if [ -n \"$BID\" ] && [ -n \"$UP\" ]; then " \
   "echo \"$BID $UP\" > /data/local/tmp/.cve43499-modules-done 2>/dev/null; fi; " \
-  "echo 'apply-modules: zygote restarted for module pickup'; exit 0"
+  "echo 'apply-modules: zygote restarted for module pickup'; " \
+  RMG_WORK_DIR_HEAL_SH \
+  "exit 0"
 
 #endif

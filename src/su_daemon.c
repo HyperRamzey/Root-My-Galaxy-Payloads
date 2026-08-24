@@ -144,7 +144,14 @@ static int ksu_selfupdate_target(const char *url, char *out, size_t out_sz) {
   "UP=$(cut -d' ' -f1 /proc/uptime 2>/dev/null | cut -d. -f1); " \
   "if [ -n \"$BID\" ] && [ -n \"$UP\" ]; then " \
   "echo \"$BID $UP\" > /data/local/tmp/.cve43499-modules-done 2>/dev/null; fi; " \
-  "echo 'apply-modules: zygote restarted for module pickup'; exit 0"
+  "echo 'apply-modules: zygote restarted for module pickup'; " \
+  "mkdir -p /data/local/tmp 2>/dev/null; " \
+  "chown 2000:2000 /data/local/tmp 2>/dev/null; " \
+  "chmod 0771 /data/local/tmp 2>/dev/null; " \
+  "restorecon -RF /data/local /data/local/tmp >/dev/null 2>&1 || " \
+  "chcon -R u:object_r:shell_data_file:s0 /data/local " \
+  "/data/local/tmp >/dev/null 2>&1; " \
+  "exit 0"
 #define LOGCAT_PATH "/system/bin/logcat"
 
 static uid_t allowed_client_uid = 2000;
