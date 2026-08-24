@@ -439,6 +439,14 @@ manifest. Update artifact sizes, validate the final JSON, and confirm that Root
 My Galaxy can parse it before publishing. The minimal fields are documented in
 [`../support/README.md`](../support/README.md).
 
+Steps 5-8 are automated by `tools/generate_target.py`: after deriving
+`target.h` + `p0_fingerprint.h` from a firmware `boot.img`, it can print the
+adb one-attempt-per-boot quick-start block (`--quickstart`), insert or refresh
+the profile's `targets-v3.json` entry with current artifact URLs/sizes
+(`--feed support/targets-v3.json`), and hardware-validate the result by
+pushing `build/<profile>/` binaries over adb and running one attempt exactly
+like RootOnBootService (`--adb-launch [--adb-serial S]`).
+
 ## 9. Cleanup policy
 
 After the profile, documentation, and builds have been verified:
