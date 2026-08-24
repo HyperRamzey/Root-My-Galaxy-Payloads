@@ -40,6 +40,24 @@ jobs:
             ANDROID_NDK_HOME="$ANDROID_NDK_HOME" \
             NDK_HOST=linux-x86_64 API=35 all
 
+      - name: Optimization parity with build_f946b.bat
+        run: |
+          set -e
+          for flag in '\-O2' '\-flto=thin' '\-march=armv8-a+crc+crypto' \
+                      '\-mtune=cortex-a510' '\-ffunction-sections' \
+                      '\-fdata-sections' '\-fomit-frame-pointer'; do
+            grep -q -- "$flag" Makefile || {
+              echo "::error::Makefile lost optimization flag $flag (must stay in sync with build_f946b.bat)"; exit 1; }
+          done
+          grep -q -- '\-Wl,--gc-sections' Makefile
+          echo "optimization flags OK (-O2 thin-LTO armv8a tuned, gc-sections)"
+
+      - name: Built artifacts are stripped-size arm64 ELF
+        run: |
+          set -e
+          file build/${{ matrix.target }}/cve-2026-43499-app.so | grep -q aarch64
+          test "$(stat -c%s build/${{ matrix.target }}/cve-2026-43499-app.so)" -lt 400000
+
       - name: Work-dir hygiene probe compiles for arm64
         run: |
           set -e
