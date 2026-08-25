@@ -28,6 +28,7 @@ int rmg_resolve_pinned_core(void) {
       if (sched_setaffinity(0, sizeof(want), &want) == 0) {
         sched_setaffinity(0, sizeof(prev), &prev);
         rmg_pinned_core = c;
+        pr_info("pinning-test: choreography core resolved cpu=%d\n", c);
         return c;
       }
     }
