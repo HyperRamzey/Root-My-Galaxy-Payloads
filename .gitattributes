@@ -1,3 +1,1 @@
-support/targets-v2.json text eol=lf
-Makefile text eol=lf
-*.bat text eol=crlf
+kernelsu/patches/*.patch text eol=lf
