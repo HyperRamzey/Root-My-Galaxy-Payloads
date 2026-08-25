@@ -101,6 +101,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Tag refs check out detached; the sync must commit to main.
+      - name: Check out main
+        run: |
+          set -euo pipefail
+          git fetch origin main
+          git checkout -B main origin/main
+
       - uses: actions/download-artifact@v4
         with:
           path: dist
