@@ -102,17 +102,91 @@ static int attempt_delay_usec(int base_delay, int attempt) {
   return delay < 0 ? 0 : delay;
 }
 
+/* Order-3+ free pages across all zones — the boot-time allocation storm
+ * (zygote preload, system_server warmup, vendor init) keeps this number
+ * moving; once it settles the buddy allocator is predictable again. */
+static long long buddy_high_order_free(void) {
+  FILE *f = fopen("/proc/buddyinfo", "r");
+  if (!f) {
+    return -1;
+  }
+  char line[512];
+  long long total = -1;
+  while (fgets(line, sizeof(line), f)) {
+    /* Line: "Node N, zone Z, o0 o1 ... o10" — take the LAST 11 integers
+     * so node/zone labels and punctuation never pollute the counts. */
+    unsigned long long tokens[24];
+    int filled = 0;
+    const char *p = line;
+    while (*p && filled < 24) {
+      char *end = NULL;
+      unsigned long long v = strtoull(p, &end, 10);
+      if (end == p) {
+        p++;
+        continue;
+      }
+      tokens[filled++] = v;
+      p = end;
+    }
+    if (filled >= 11) {
+      if (total < 0) {
+        total = 0;
+      }
+      for (int i = filled - 11 + 3; i < filled; ++i) {
+        total += (long long)tokens[i];
+      }
+    }
+  }
+  fclose(f);
+  return total;
+}
+
 static void wait_for_boot_quiet_window(void) {
 #if defined(APP_PAYLOAD) && APP_PAYLOAD
   struct timespec uptime;
   SYSCHK(clock_gettime(CLOCK_BOOTTIME, &uptime));
-  if (uptime.tv_sec < APP_MIN_BOOT_UPTIME_SEC) {
-    time_t wait_sec = APP_MIN_BOOT_UPTIME_SEC - uptime.tv_sec;
-    pr_info("waiting for boot allocator quiet window seconds=%lld uptime=%lld\n",
-            (long long)wait_sec, (long long)uptime.tv_sec);
-    while (wait_sec > 0) {
-      wait_sec = sleep((unsigned int)wait_sec);
+  if (uptime.tv_sec >= APP_MIN_BOOT_UPTIME_SEC) {
+    return;
+  }
+  time_t wait_sec = APP_MIN_BOOT_UPTIME_SEC - uptime.tv_sec;
+  pr_info("waiting for boot allocator quiet window seconds=%lld uptime=%lld\n",
+          (long long)wait_sec, (long long)uptime.tv_sec);
+
+  /* Measured quietness: instead of blind-sleeping to the 120s constant,
+   * watch the high-order buddy free counts settle. Three consecutive
+   * identical samples 2s apart mean the boot allocation storm is over.
+   * Hard floor keeps us out of the worst churn regardless; the old
+   * constant remains the cap, so this can only ever wait LESS. */
+  static const time_t QUIET_FLOOR_SEC = 60;
+  static const int QUIET_STABLE_SAMPLES = 3;
+  if (uptime.tv_sec < QUIET_FLOOR_SEC) {
+    wait_sec = sleep((unsigned int)(QUIET_FLOOR_SEC - uptime.tv_sec));
+  }
+  long long prev = -1;
+  int stable = 0;
+  for (int poll = 0; poll < 30; ++poll) {
+    long long now = buddy_high_order_free();
+    if (now >= 0) {
+      if (prev >= 0 && now == prev) {
+        stable++;
+        if (stable >= QUIET_STABLE_SAMPLES) {
+          struct timespec up2;
+          clock_gettime(CLOCK_BOOTTIME, &up2);
+          pr_info("boot allocator quiet (buddy stable) uptime=%lld\n",
+                  (long long)up2.tv_sec);
+          return;
+        }
+      } else {
+        stable = 0;
+      }
+      prev = now;
+    } else {
+      break; /* buddyinfo unreadable — fall back to the blind window */
     }
+    sleep(2);
+  }
+  while (wait_sec > 0) {
+    wait_sec = sleep((unsigned int)wait_sec);
   }
 #endif
 }
