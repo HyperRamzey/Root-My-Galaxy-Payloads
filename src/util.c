@@ -91,16 +91,6 @@ static struct mm_ctx post_ctx;
 static pid_t child_leak;
 #endif
 
-#if defined(APP_REQUIRE_FRESH_P0_SESSION) && APP_REQUIRE_FRESH_P0_SESSION
-static int rmg_fast_profile_enabled(void) {
-#if defined(APP_DEFAULT_FAST_KSNITCH) && APP_DEFAULT_FAST_KSNITCH
-  return 1;
-#else
-  const char *value = getenv("RMG_FAST");
-  return value && *value && strcmp(value, "0") != 0;
-#endif
-}
-
 static size_t rmg_profile_env_size(const char *name, size_t fallback,
                                    size_t min, size_t max) {
   const char *value = getenv(name);
@@ -116,6 +106,16 @@ static size_t rmg_profile_env_size(const char *name, size_t fallback,
     return fallback;
   }
   return (size_t)parsed;
+}
+
+#if defined(APP_REQUIRE_FRESH_P0_SESSION) && APP_REQUIRE_FRESH_P0_SESSION
+static int rmg_fast_profile_enabled(void) {
+#if defined(APP_DEFAULT_FAST_KSNITCH) && APP_DEFAULT_FAST_KSNITCH
+  return 1;
+#else
+  const char *value = getenv("RMG_FAST");
+  return value && *value && strcmp(value, "0") != 0;
+#endif
 }
 
 static void configure_kernelsnitch_profile(
