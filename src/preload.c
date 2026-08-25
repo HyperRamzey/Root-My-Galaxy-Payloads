@@ -155,34 +155,35 @@ static void wait_for_boot_quiet_window(void) {
   /* Measured quietness: instead of blind-sleeping to the 120s constant,
    * watch the high-order buddy free counts settle. Three consecutive
    * identical samples 2s apart mean the boot allocation storm is over.
-   * Hard floor keeps us out of the worst churn regardless; the old
-   * constant remains the cap, so this can only ever wait LESS. */
+   * Sampling runs DURING the floor sleep (exit requires now >= floor),
+   * so stability evidence accumulates while we wait — the floor is pure
+   * belt-and-suspenders and the old constant remains the cap, so this
+   * can only ever wait LESS. */
   static const time_t QUIET_FLOOR_SEC = 60;
   static const int QUIET_STABLE_SAMPLES = 3;
-  if (uptime.tv_sec < QUIET_FLOOR_SEC) {
-    wait_sec = sleep((unsigned int)(QUIET_FLOOR_SEC - uptime.tv_sec));
-  }
   long long prev = -1;
   int stable = 0;
-  for (int poll = 0; poll < 30; ++poll) {
+  struct timespec now_ts;
+  for (int poll = 0; poll < 45; ++poll) {
+    clock_gettime(CLOCK_BOOTTIME, &now_ts);
+    if (now_ts.tv_sec >= APP_MIN_BOOT_UPTIME_SEC) {
+      return; /* cap reached — old behavior would have exited here */
+    }
+    if (now_ts.tv_sec >= QUIET_FLOOR_SEC && stable >= QUIET_STABLE_SAMPLES) {
+      pr_info("boot allocator quiet (buddy stable) uptime=%lld\n",
+              (long long)now_ts.tv_sec);
+      return;
+    }
     long long now = buddy_high_order_free();
-    if (now >= 0) {
-      if (prev >= 0 && now == prev) {
-        stable++;
-        if (stable >= QUIET_STABLE_SAMPLES) {
-          struct timespec up2;
-          clock_gettime(CLOCK_BOOTTIME, &up2);
-          pr_info("boot allocator quiet (buddy stable) uptime=%lld\n",
-                  (long long)up2.tv_sec);
-          return;
-        }
-      } else {
-        stable = 0;
-      }
-      prev = now;
-    } else {
+    if (now < 0) {
       break; /* buddyinfo unreadable — fall back to the blind window */
     }
+    if (prev >= 0 && now == prev) {
+      stable++;
+    } else {
+      stable = 0;
+    }
+    prev = now;
     sleep(2);
   }
   while (wait_sec > 0) {
