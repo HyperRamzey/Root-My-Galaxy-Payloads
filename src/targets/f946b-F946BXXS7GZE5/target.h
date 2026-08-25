@@ -46,9 +46,24 @@
  * perf core next, literal 0 as last resort (see src/util.c
  * rmg_resolve_pinned_core). Compiled against -mcpu=cortex-x3
  * -mtune=cortex-x3. E2E on device decides whether the futex-collision
- * channel survives off-LITTLE placement; revert to main if not.
+/*
+ * Choreography core policy — pinning-test BRANCH RESULT (e2e 2026-08-25):
+ * prime/perf placement is NOT viable on F946B firmware.
+ *  1. cpu7 (X3): affinity probe passes at constructor time, but the
+ *     attempt-time pin fails with EINVAL — Samsung PM moves the task
+ *     into a cpuset excluding the prime (revalidated fallback -> cpu6).
+ *  2. cpu6 (best permitted perf core): kernelsnitch finds ZERO futex
+ *     collisions ("only found 0 collisions -> cannot continue", repeat-
+ *     ed) — the collision channel is calibrated to the LITTLE pair and
+ *     produces nothing on perf clusters.
+ * RMG_PIN_TEST_PRIME stays 0: CORE remains the LITTLE-calibrated
+ * literal. The x3 codegen (-mcpu=cortex-x3+nomops+nosve) is KEPT — it
+ * is placement-independent and e2e-verified (slide/kaslr/staging all
+ * ran on the x3-tuned binary). See build_f946b.bat + src/util.c
+ * (rmg_resolve_pinned_core / rmg_revalidate_pinned_core) for the
+ * experiment machinery, ready to re-enable via this define.
  */
-#define RMG_PIN_TEST_PRIME 1
+#define RMG_PIN_TEST_PRIME 0
 
 #define KMALLOC_CGROUP_TYPE 1
 #define KMALLOC_CACHE_TYPES 3
