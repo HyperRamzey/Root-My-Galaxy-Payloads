@@ -1,2 +1,5 @@
 /build/
 /diagnostics/
+.e2e-*
+stuff.txt
+androguard.db
