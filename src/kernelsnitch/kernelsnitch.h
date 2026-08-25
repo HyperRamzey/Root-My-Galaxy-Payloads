@@ -114,7 +114,13 @@ static void *__do_increase(void *arg)
     struct inc_arg *inc_arg = (struct inc_arg *)arg;
     struct kernelsnitch_shared_state *ks = inc_arg->ks;
     size_t id = inc_arg->id;
-    SYSCHK(__futex((unsigned int *)&ks->inc_futex[id], FUTEX_WAIT_PRIVATE, 0, NULL, NULL, 0));
+    int rc = __futex((unsigned int *)&ks->inc_futex[id], FUTEX_WAIT_PRIVATE, 0, NULL, NULL, 0);
+    if (rc != 0 && rc != -EINTR) {
+        static atomic_int reported;
+        if (atomic_fetch_add(&reported, 1) < 4) {
+            pr_warning("waiter futex rc=%d errno=%d\n", rc, errno);
+        }
+    }
     free(inc_arg);
     return 0;
 }
@@ -464,6 +470,8 @@ void kernelsnitch_find_collisions(struct kernelsnitch_shared_state *ks)
     // piled-up hash bucket ID 128
     // here, I append 4096 futexes to this hash bucket creating a distinction between most other empty or lightly populated ones
     __increase(ks, ID, ks->appended_futexes);
+    pr_info("ksnitch pile-up waiters=%zu (wanted %zu)\n",
+            ks->increase_count, ks->appended_futexes);
     if (ks->verbose) pr_info("start finding collisions\n");
 
     // find futex user space address which collide with the piled-up hash bucket ID 128

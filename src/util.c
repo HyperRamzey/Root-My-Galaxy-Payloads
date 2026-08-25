@@ -419,7 +419,8 @@ void setup_kernelsnitch(void) {
   configure_kernelsnitch_profile(ks, PAGE_PAYLOAD_SLIDE);
 #else
   ks = kernelsnitch_setup(
-      MM_STRUCT_SZ, MM_ORDER, cpu_count, KSNITCH_COLLISIONS, 0, 0);
+      MM_STRUCT_SZ, MM_ORDER, cpu_count, KSNITCH_COLLISIONS,
+      KERNELSNITCH_VERBOSE, KERNELSNITCH_MTE_ENABLED);
 #if defined(APP_PHYS_P0_ORACLE) && APP_PHYS_P0_ORACLE
   kernelsnitch_set_profile(
       ks, SLIDE_KSNITCH_APPENDED_FUTEXES,
@@ -2060,7 +2061,8 @@ uintptr_t prepare_kernel_page(int payload_mode) {
   configure_kernelsnitch_profile(ks, payload_mode);
 #else
   ks = kernelsnitch_setup(
-      MM_STRUCT_SZ, MM_ORDER, cpu_count, KSNITCH_COLLISIONS, 0, 0);
+      MM_STRUCT_SZ, MM_ORDER, cpu_count, KSNITCH_COLLISIONS,
+      KERNELSNITCH_VERBOSE, KERNELSNITCH_MTE_ENABLED);
 #if defined(APP_PAYLOAD) && APP_PAYLOAD && \
     defined(SLIDE_KSNITCH_APPENDED_FUTEXES)
   if (payload_mode == PAGE_PAYLOAD_SLIDE) {
