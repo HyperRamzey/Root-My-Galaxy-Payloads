@@ -63,7 +63,7 @@
  * (rmg_resolve_pinned_core / rmg_revalidate_pinned_core) for the
  * experiment machinery, ready to re-enable via this define.
  */
-#define RMG_PIN_TEST_PRIME 0
+#define RMG_PIN_TEST_PRIME 1
 
 #define KMALLOC_CGROUP_TYPE 1
 #define KMALLOC_CACHE_TYPES 3
