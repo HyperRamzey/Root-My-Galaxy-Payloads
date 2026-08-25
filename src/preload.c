@@ -178,7 +178,9 @@ static void wait_for_boot_quiet_window(void) {
     if (now < 0) {
       break; /* buddyinfo unreadable — fall back to the blind window */
     }
-    if (prev >= 0 && now == prev) {
+    /* Tolerance, not equality: order-3+ sums drift a few pages with
+     * harmless PCP refills; exact 3x-equality never fired on F946B. */
+    if (prev >= 0 && (now - prev <= 2 && prev - now <= 2)) {
       stable++;
     } else {
       stable = 0;
