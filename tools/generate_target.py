@@ -984,7 +984,7 @@ def update_feed(feed_path, profile, model, build, kernel_release,
     # any other host is rejected with repo_url_invalid). Mirrors/upstream
     # must not appear in feed URLs.
     base = ('https://raw.githubusercontent.com/'
-            'HyperRamzey/Root-My-Galaxy-Payloads/pinning-test/')
+            'HyperRamzey/Root-My-Galaxy-Payloads/main/')
     entry_id = profile
 
     def artifact(name, rel):
