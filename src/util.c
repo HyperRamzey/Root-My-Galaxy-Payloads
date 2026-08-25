@@ -1063,8 +1063,19 @@ static int controlled_mm_leak(size_t cpu_count, uintptr_t hint,
     }
     /* pinning-test: 256-entry pile-up walks train down to ~5x baseline
      * on A715 — below the x5 threshold. 2048 entries restore the margin
-     * (signal ~30x baseline) that the LITTLE calibration assumed. */
-    kernelsnitch_set_profile(state, 2048, REPEAT_MEASUREMENT, AVERAGE);
+     * (signal ~30x baseline) that the LITTLE calibration assumed.
+     * Repeat/average honor the RMG_KSNITCH_* env knobs (clamped to the
+     * compile-time maxima) so the sample count is A/B-testable without
+     * a rebuild; the app pipeline passes 64/4 — the x5 threshold plus
+     * majority-vote confirmation holds at 64 repeats e2e. */
+    size_t repeat = rmg_profile_env_size(
+        "RMG_KSNITCH_REPEAT", REPEAT_MEASUREMENT, 8, REPEAT_MEASUREMENT);
+    size_t average = rmg_profile_env_size(
+        "RMG_KSNITCH_AVERAGE", AVERAGE, 1, repeat);
+    if (average > repeat) {
+      average = repeat;
+    }
+    kernelsnitch_set_profile(state, 2048, repeat, average);
 #ifdef QEMU_MM_TRACE_VALIDATE
     uintptr_t oracle_mm = 0;
     if (!qemu_mm_trace_drain()) {

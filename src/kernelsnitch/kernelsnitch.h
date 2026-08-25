@@ -570,6 +570,35 @@ void kernelsnitch_bruteforce(struct kernelsnitch_shared_state *ks)
     if (ks->verbose) pr_info("start bruteforcing\n");
     reset_cpu_pin();
 
+    /* pinning-test: bias the bruteforce (timing-INsensitive, runs after
+     * the calibrated scan) onto the perf cluster via uclamp instead of
+     * affinity — sched_setattr carries no restricted-core EINVAL risk.
+     * Spawned workers inherit the clamp at clone. Kill-switch:
+     * RMG_UCLAMP=0. */
+    if (!(getenv("RMG_UCLAMP") && getenv("RMG_UCLAMP")[0] == '0')) {
+        struct {
+            unsigned int size;
+            unsigned int sched_policy;
+            unsigned long long sched_flags;
+            int sched_nice;
+            unsigned int sched_priority;
+            unsigned long long sched_runtime;
+            unsigned long long sched_deadline;
+            unsigned long long sched_period;
+            unsigned int sched_util_min;
+            unsigned int sched_util_max;
+        } attr;
+        memset(&attr, 0, sizeof(attr));
+        attr.size = (unsigned int)sizeof(attr);
+        attr.sched_policy = 0; /* SCHED_NORMAL */
+        attr.sched_flags = 0x20; /* SCHED_FLAG_UTIL_CLAMP_MIN */
+        attr.sched_util_min = 512;
+        attr.sched_util_max = 1024;
+        if (syscall(274 /* __NR_sched_setattr */, 0, &attr, 0) == 0) {
+            pr_info("ksnitch bruteforce uclamp_min=512\n");
+        }
+    }
+
     for (size_t i = 0; i < ks->thread_cnt; ++i) {
         struct mm_leak_arg *mm_leak_arg = (struct mm_leak_arg *)SYSCHK(calloc(1, sizeof(struct mm_leak_arg)));
         mm_leak_arg->ks = ks;
