@@ -35,6 +35,42 @@ int rmg_resolve_pinned_core(void) {
   }
   return rmg_pinned_core;
 }
+
+/*
+ * Re-validate at pin time. Samsung PM may migrate the task into a cpuset
+ * that excludes the prime between constructor-time resolution and the
+ * attempt start (observed: resolver probe cpu7 OK, later pin EINVAL).
+ * Walks the same preference order against the CURRENT mask and updates
+ * the global so every later pin_to_core(CORE) lands on a legal core.
+ */
+int rmg_revalidate_pinned_core(void) {
+  cpu_set_t cur;
+  if (sched_getaffinity(0, sizeof(cur), &cur) != 0) {
+    return rmg_pinned_core;
+  }
+  if (rmg_pinned_core >= 0 && rmg_pinned_core < AFFINITY_MAX_CPUS &&
+      CPU_ISSET(rmg_pinned_core, &cur)) {
+    return rmg_pinned_core;
+  }
+  static const int order[] = {7, 6, 5, 4, 3, 0};
+  for (size_t i = 0; i < sizeof(order) / sizeof(order[0]); i++) {
+    int c = order[i];
+    if (!CPU_ISSET(c, &cur)) {
+      continue;
+    }
+    cpu_set_t want;
+    CPU_ZERO(&want);
+    CPU_SET(c, &want);
+    if (sched_setaffinity(0, sizeof(want), &want) == 0) {
+      sched_setaffinity(0, sizeof(cur), &cur);
+      rmg_pinned_core = c;
+      pr_info("pinning-test: revalidated core cpu=%d\n", c);
+      return c;
+    }
+  }
+  pr_info("pinning-test: no candidate core usable; leaving unpinned\n");
+  return rmg_pinned_core;
+}
 #endif
 
 static struct kernelsnitch_shared_state *ks;

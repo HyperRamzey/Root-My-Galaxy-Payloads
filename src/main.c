@@ -648,6 +648,9 @@ int run_exploit(int argc, char **argv) {
   log_startup_context();
   init_ashmem_path();
 
+#if defined(RMG_PIN_TEST_PRIME)
+  rmg_revalidate_pinned_core();
+#endif
   pin_to_core(CORE);
 #if defined(SLIDE_STACK_WRITER) && \
     defined(SLIDE_STACK_WRITER_SIGRETURN) && \

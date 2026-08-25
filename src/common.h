@@ -86,6 +86,7 @@
  * semantics preserved via the macro). */
 extern int rmg_pinned_core;
 int rmg_resolve_pinned_core(void);
+int rmg_revalidate_pinned_core(void);
 #define CORE rmg_pinned_core
 #else
 /* Choreography cores are COMPILE-TIME LITERALS on purpose. Device-verified
