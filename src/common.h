@@ -866,6 +866,19 @@ static inline void activation_lock_release(int fd) {
   "echo \"apply-modules: vectord pid=$VD\"; else " \
   "echo 'apply-modules: no vectord (vector not installed or not running); " \
   "non-blocking'; fi; " \
+  "sleep 8; " \
+  "VDIR=/data/adb/modules/zygisk_vector; " \
+  "if [ -d \"$VDIR\" ] && [ -z \"$(pidof vectord)\" ]; then " \
+  "(cd \"$VDIR\" && CLASSPATH=\"$VDIR/daemon.apk\" nohup " \
+  "/system/bin/app_process64 /system/bin --nice-name=vectord " \
+  "-Djava.class.path=\"$VDIR/daemon.apk\" " \
+  "org.matrix.vector.daemon.VectorDaemon --system-server-max-retry=3 " \
+  "</dev/null >/dev/null 2>&1 &) ; sleep 3; fi; " \
+  "VD=$(pidof vectord); " \
+  "if [ -n \"$VD\" ]; then " \
+  "echo \"apply-modules: vectord revived pid=$VD\"; else " \
+  "echo \"apply-modules: vectord not running post-restart; " \
+  "non-blocking\"; fi; " \
   "killed=0; " \
   "for p in $(pidof zygote64) $(pidof zygote); do " \
   "kill -9 $p 2>/dev/null && killed=1; " \
