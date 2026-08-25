@@ -1838,6 +1838,7 @@ static int slide_child_trigger_write(void) {
   pthread_t waiter;
   pthread_t owner;
   pthread_t consumer;
+  int ready_polls = 0;
   SYSCHK(pthread_create(&waiter, NULL, slide_waiter_thread, NULL));
   SYSCHK(pthread_create(&owner, NULL, slide_owner_thread, NULL));
   SYSCHK(pthread_create(&consumer, NULL, slide_consumer_thread, NULL));
@@ -1846,6 +1847,13 @@ static int slide_child_trigger_write(void) {
          !atomic_load(&slide_owner_started) ||
          !atomic_load(&slide_consumer_ready)) {
     usleep(1000);
+    /* Bound the ready-sync: a thread that never arms (scheduler
+     * starvation, cpuset surprise) must fail the attempt, not wedge
+     * the whole boot. */
+    if (++ready_polls > 10000) { /* 10s */
+      pr_error("slide pi ready-sync timed out\n");
+      return 0;
+    }
   }
   if (SLIDE_REQUEUE_ARM_USEC) {
     usleep(SLIDE_REQUEUE_ARM_USEC);
@@ -1876,8 +1884,19 @@ static int slide_child_trigger_write(void) {
   }
   pr_info("slide pi stage=deadlock-accepted\n");
   atomic_store(&slide_deadlock_seen, 1);
-  while (!atomic_load(&slide_route_done)) {
-    usleep(1000);
+  {
+    /* Bound the route wait: the whole choreography completes in ~2-3s
+     * when the window hits; a miss must fail the attempt cleanly so the
+     * supervisor releases the session lock and the ladder can retry —
+     * an unbounded wait here wedged whole boots (observed). */
+    long route_wait_ms = 0;
+    while (!atomic_load(&slide_route_done)) {
+      usleep(1000);
+      if (++route_wait_ms > 20000) {
+        pr_error("slide pi route wait timed out after 20s\n");
+        return 0;
+      }
+    }
   }
 #if defined(APP_ACCEPT_SCHED_TRIGGER) && APP_ACCEPT_SCHED_TRIGGER
   int sched_ok = atomic_load(&slide_consume_sched_ok) != 0;
