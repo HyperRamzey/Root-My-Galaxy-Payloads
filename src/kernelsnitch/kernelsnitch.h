@@ -472,6 +472,22 @@ void kernelsnitch_find_collisions(struct kernelsnitch_shared_state *ks)
     __increase(ks, ID, ks->appended_futexes);
     pr_info("ksnitch pile-up waiters=%zu (wanted %zu)\n",
             ks->increase_count, ks->appended_futexes);
+    {
+        /* Direct read of the pile-up bucket itself. nr_wake=0 still
+         * wakes one matching waiter per call on this kernel, so keep
+         * the sample count tiny — this is a diagnostic, not the scan. */
+        size_t pile_min = (size_t)-1, pile_max = 0;
+        for (int __p = 0; __p < 8; ++__p) {
+            sched_yield();
+            size_t t0 = rdtsc_begin();
+            __futex((unsigned int *)&ks->inc_futex[ID], FUTEX_WAKE_PRIVATE, 0, NULL, NULL, 0);
+            size_t t1 = rdtsc_end();
+            if (t1 - t0 < pile_min) pile_min = t1 - t0;
+            if (t1 - t0 > pile_max) pile_max = t1 - t0;
+        }
+        pr_info("ksnitch pile-up self-measure min=%zu max=%zu (baseline %zu)\n",
+                pile_min, pile_max, approx_time);
+    }
     if (ks->verbose) pr_info("start finding collisions\n");
 
     // find futex user space address which collide with the piled-up hash bucket ID 128
