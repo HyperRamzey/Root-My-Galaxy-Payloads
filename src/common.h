@@ -99,6 +99,7 @@ int rmg_revalidate_pinned_core(void);
  * Background actors use src/affinity.h pin_perf_mask() AFTER root. */
 #define CORE RMG_CORE_LITERAL
 #endif
+void durable_log_checkpoint(const char *stage);
 #ifndef KSNITCH_COLLISIONS
 #define KSNITCH_COLLISIONS 4
 #endif

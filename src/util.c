@@ -1061,7 +1061,10 @@ static int controlled_mm_leak(size_t cpu_count, uintptr_t hint,
     if (!state) {
       return -1;
     }
-    kernelsnitch_set_profile(state, 256, REPEAT_MEASUREMENT, AVERAGE);
+    /* pinning-test: 256-entry pile-up walks train down to ~5x baseline
+     * on A715 — below the x5 threshold. 2048 entries restore the margin
+     * (signal ~30x baseline) that the LITTLE calibration assumed. */
+    kernelsnitch_set_profile(state, 2048, REPEAT_MEASUREMENT, AVERAGE);
 #ifdef QEMU_MM_TRACE_VALIDATE
     uintptr_t oracle_mm = 0;
     if (!qemu_mm_trace_drain()) {
