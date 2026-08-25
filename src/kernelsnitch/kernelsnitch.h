@@ -353,7 +353,7 @@ struct kernelsnitch_shared_state *kernelsnitch_setup(size_t __mm_struct_sz, size
         ks->thread_cnt,
         ks->collisions,
         ks->mte_enabled ? "enabled" : "disabled");
-    pin_to_core(0);
+    pin_to_core(CORE);
     futex_init();
 
     ks->state = KERNELSNITCH_INIT;

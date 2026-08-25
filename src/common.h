@@ -75,6 +75,19 @@
 #define KERNELSNITCH_MTE_ENABLED 0
 #endif
 #define MM_PARTIALS 5
+#ifndef RMG_CORE_LITERAL
+#define RMG_CORE_LITERAL 0
+#endif
+#if defined(RMG_PIN_TEST_PRIME)
+/* pinning-test experiment: resolve the choreography core ONCE at startup
+ * — X3 prime first, then fastest permitted perf core, LITERAL last. The
+ * probe runs strictly before any timing window opens; placement is fixed
+ * for the whole process lifetime afterwards (compile-time-literal
+ * semantics preserved via the macro). */
+extern int rmg_pinned_core;
+int rmg_resolve_pinned_core(void);
+#define CORE rmg_pinned_core
+#else
 /* Choreography cores are COMPILE-TIME LITERALS on purpose. Device-verified
  * on F946B: any topology probing / runtime core resolution in the payload
  * path (sysfs reads, trial sched_setaffinity migrations before the timing
@@ -83,7 +96,8 @@
  * (0,1); the Cortex-X3 prime rejects affinity outright on this firmware
  * (restricted-core EINVAL), so there is nothing faster to legally target.
  * Background actors use src/affinity.h pin_perf_mask() AFTER root. */
-#define CORE 0
+#define CORE RMG_CORE_LITERAL
+#endif
 #ifndef KSNITCH_COLLISIONS
 #define KSNITCH_COLLISIONS 4
 #endif

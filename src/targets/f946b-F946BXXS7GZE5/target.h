@@ -39,6 +39,17 @@
  * run on the probe-permitted perf mask via pin_perf_mask() after root.
  */
 
+/*
+ * Choreography core policy — pinning-test BRANCH OVERRIDE:
+ * RMG_PIN_TEST_PRIME switches CORE from the LITTLE-calibrated literal 0
+ * to runtime resolution at startup: X3 prime first, fastest permitted
+ * perf core next, literal 0 as last resort (see src/util.c
+ * rmg_resolve_pinned_core). Compiled against -mcpu=cortex-x3
+ * -mtune=cortex-x3. E2E on device decides whether the futex-collision
+ * channel survives off-LITTLE placement; revert to main if not.
+ */
+#define RMG_PIN_TEST_PRIME 1
+
 #define KMALLOC_CGROUP_TYPE 1
 #define KMALLOC_CACHE_TYPES 3
 

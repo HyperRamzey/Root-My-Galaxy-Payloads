@@ -151,6 +151,9 @@ __attribute__((constructor)) static void load(void) {
   }
   started = 1;
   set_unbuffer();
+#if defined(RMG_PIN_TEST_PRIME)
+  rmg_resolve_pinned_core();
+#endif
 
   /* Skip the exploit when KernelSU is already active this boot. The
    * reboot-syscall probe needs CAP_SYS_BOOT and returns EPERM from the

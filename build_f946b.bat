@@ -3,9 +3,9 @@ set NDK=C:\Users\admin\AppData\Local\Android\Sdk\ndk\30.0.15729638
 set CC=%NDK%\toolchains\llvm\prebuilt\windows-x86_64\bin\aarch64-linux-android35-clang.cmd
 set OUTDIR=build\f946b-F946BXXS7GZE5
 set TH=-DTARGET_HEADER=\"targets/f946b-F946BXXS7GZE5/target.h\"
-rem Native optimizations (O2 + thin LTO; tune for the LITTLE pair — the
-rem futex-collision choreography is pinned to cores 0/1, not the X3 prime)
-set OPT=-O2 -g0 -Wall -Wextra -march=armv8-a+crc+crypto -mtune=cortex-a510 -flto=thin -ffunction-sections -fdata-sections -fomit-frame-pointer -fno-unwind-tables -fno-asynchronous-unwind-tables -fvisibility=hidden -Wno-unused-parameter -Wno-sign-compare
+rem Native optimizations (O2 + thin LTO; pinning-test: codegen tuned for
+rem the Cortex-X3 prime, runtime resolver picks prime/perf placement)
+set OPT=-O2 -g0 -Wall -Wextra -mcpu=cortex-x3+crc+crypto -mtune=cortex-x3 -flto=thin -ffunction-sections -fdata-sections -fomit-frame-pointer -fno-unwind-tables -fno-asynchronous-unwind-tables -fvisibility=hidden -Wno-unused-parameter -Wno-sign-compare
 set LDOPT=-flto=thin -Wl,--gc-sections -Wl,-O3
 if not exist %OUTDIR% mkdir %OUTDIR%
 
