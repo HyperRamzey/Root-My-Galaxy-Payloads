@@ -153,6 +153,25 @@ static inline void pin_to_core(ssize_t core)
     }
 }
 
+/* Strict variant for the timing-critical choreography threads: reports
+ * failure instead of silently continuing unpinned. Callers in the write
+ * stage must treat a failure as a clean attempt abort — an unpinned
+ * consumer turns the race into a kernel-panic coin flip. */
+static inline int pin_to_core_strict(ssize_t core)
+{
+    if (core < 0) {
+        return 0;
+    }
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(core, &cpuset);
+    if (sched_setaffinity(0, sizeof(cpu_set_t), &cpuset) == 0) {
+        return 1;
+    }
+    pr_warning("pin to core %zd failed errno=%d (strict)\n", core, errno);
+    return 0;
+}
+
 static inline void reset_cpu_pin(void)
 {
     cpu_set_t cpuset;

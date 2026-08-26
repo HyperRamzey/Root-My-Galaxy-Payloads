@@ -40,28 +40,22 @@
  */
 
 /*
- * Choreography core policy — pinning-test BRANCH OVERRIDE:
- * RMG_PIN_TEST_PRIME switches CORE from the LITTLE-calibrated literal 0
- * to runtime resolution at startup: X3 prime first, fastest permitted
- * perf core next, literal 0 as last resort (see src/util.c
- * rmg_resolve_pinned_core). Compiled against -mcpu=cortex-x3
- * -mtune=cortex-x3. E2E on device decides whether the futex-collision
-/*
- * Choreography core policy — pinning-test BRANCH RESULT (e2e 2026-08-25):
- * prime/perf placement is NOT viable on F946B firmware.
- *  1. cpu7 (X3): affinity probe passes at constructor time, but the
- *     attempt-time pin fails with EINVAL — Samsung PM moves the task
- *     into a cpuset excluding the prime (revalidated fallback -> cpu6).
- *  2. cpu6 (best permitted perf core): kernelsnitch finds ZERO futex
- *     collisions ("only found 0 collisions -> cannot continue", repeat-
- *     ed) — the collision channel is calibrated to the LITTLE pair and
- *     produces nothing on perf clusters.
- * RMG_PIN_TEST_PRIME stays 0: CORE remains the LITTLE-calibrated
- * literal. The x3 codegen (-mcpu=cortex-x3+nomops+nosve) is KEPT — it
- * is placement-independent and e2e-verified (slide/kaslr/staging all
- * ran on the x3-tuned binary). See build_f946b.bat + src/util.c
- * (rmg_resolve_pinned_core / rmg_revalidate_pinned_core) for the
- * experiment machinery, ready to re-enable via this define.
+ * Choreography core policy (2026-08-27 stability rework).
+ * RMG_PIN_TEST_PRIME=1 enables runtime pair resolution (src/util.c
+ * rmg_select_pair): the choreography core AND the consumer core are
+ * chosen together from the A715 cluster (cpu3-6) so both are legally
+ * pinnable at attempt time — codegen is -mtune=cortex-a715 and the
+ * collision channel is perf-calibrated (2048 pile-up, x5 threshold).
+ * The X3 prime (cpu7) is no longer preferred: firmware revokes it
+ * mid-run and it mismatches the tune. Samsung PM migrates tasks between
+ * cpusets (top-app 0-7 -> foreground 0-6 -> background 0-2), so the
+ * pair is re-validated at every attempt and again right before the
+ * pi-futex write stage (rmg_pin_gate_ready); when no perf-core pair is
+ * legal the attempt fails CLEANLY instead of running unpinned into the
+ * ~50% kernel-panic coin flip (observed 2026-08-26: resolve cpu=7 ->
+ * revalidate cpu=5 -> consumer pin cpu=6 EINVAL -> unpinned -> panic).
+ * The write-stage main thread stays on the LITTLE-calibrated literal
+ * (main.c fops block). Background actors use src/affinity.h after root.
  */
 #define RMG_PIN_TEST_PRIME 1
 

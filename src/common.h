@@ -79,14 +79,17 @@
 #define RMG_CORE_LITERAL 0
 #endif
 #if defined(RMG_PIN_TEST_PRIME)
-/* pinning-test experiment: resolve the choreography core ONCE at startup
- * — X3 prime first, then fastest permitted perf core, LITERAL last. The
- * probe runs strictly before any timing window opens; placement is fixed
- * for the whole process lifetime afterwards (compile-time-literal
- * semantics preserved via the macro). */
+/* pinning-test experiment: resolve the choreography core pair ONCE at
+ * startup and re-validate at every attempt — X3 is no longer preferred
+ * (a715 tune), and the consumer core is selected together with the
+ * choreography core so both are legally pinnable. The probe runs strictly
+ * before any timing window opens; placement is fixed for the whole
+ * attempt afterwards. */
 extern int rmg_pinned_core;
+extern int rmg_consumer_core;
 int rmg_resolve_pinned_core(void);
 int rmg_revalidate_pinned_core(void);
+int rmg_pin_gate_ready(void);
 #define CORE rmg_pinned_core
 #else
 /* Choreography cores are COMPILE-TIME LITERALS on purpose. Device-verified
@@ -168,7 +171,11 @@ void durable_log_checkpoint(const char *stage);
 #define P0_DATA_ALIAS_CONST(image_addr) \
   (P0_PAGE_OFFSET | ((image_addr) - KIMAGE_TEXT_BASE + P0_KERNEL_PHYS_DELTA))
 
+#if defined(RMG_PIN_TEST_PRIME)
+#define CONSUMER_CORE rmg_consumer_core
+#else
 #define CONSUMER_CORE (CORE + 1)
+#endif
 #define CONSUMER_MAX_CALLS 1
 #define PSELECT_ROUTE_NFDS 320
 #define PSELECT_CONSUMER_NICE 19

