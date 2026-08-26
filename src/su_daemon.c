@@ -1620,13 +1620,11 @@ static int daemon_main(void) {
     return 1;
   }
   chmod(BOOTSTRAP_SOCK_PATH, 0666);
-  /* The UMH daemon runs in the kernel context, so the socket is created
-   * unlabeled and SELinux denies shell-domain getattr/connect once
-   * enforcing kicks in — the exact failure that stranded late-load.
-   * Relabel at creation time; every later daemon restart redoes it. */
-  setxattr(BOOTSTRAP_SOCK_PATH, "security.selinux",
-           "u:object_r:shell_data_file:s0",
-           sizeof("u:object_r:shell_data_file:s0") - 1, 0);
+  /* NOTE: do not setxattr the socket here. The daemon runs on a payload-
+   * patched cred inside the UMH window; a policy-touching syscall at this
+   * point kills it before the watcher forks (observed live: socket bound,
+   * process gone, activation stranded). Socket labeling is owned by the
+   * app-side per-file mark heal after activation. */
 
   /* Spawn the activation watcher: it polls for the runner's activation
    * marker and performs KernelSU late-load + module activation from this
