@@ -651,13 +651,27 @@ int run_exploit(int argc, char **argv) {
 #if defined(RMG_PIN_TEST_PRIME)
   /* Stability gate (2026-08-27): the whole attempt requires a legally
    * pinnable perf-core pair (choreography core + consumer core). Samsung
-   * PM/thermal restricts perf cores DYNAMICALLY (observed: open at
-   * attempt start, closed ~30s later once the scan load heats the
-   * device), so wait up to 120s for a perf-core window (the device cools
-   * while we idle) before failing the attempt cleanly. Running without a
-   * pinned pair is the ~50% kernel-panic gamble we no longer take. */
-  if (!rmg_pin_gate_wait(120, "attempt-start")) {
-    return 1;
+   * PM restricts perf cores for the shell domain in boot phases:
+   * observed OPEN for ~2 min after boot, then FULLY CLOSED for several
+   * minutes (the mid-boot window the pipeline lands in), settling into a
+   * light rotating restriction later. The wait polls while the device
+   * idles (no load, cooling) until a pair becomes legally pinnable —
+   * env-tunable so the budget can be tuned without a rebuild. Running
+   * without a pinned pair is the ~50% kernel-panic gamble we no longer
+   * take. */
+  {
+    const char *gw = getenv("RMG_PIN_GATE_WAIT_SEC");
+    int gate_wait_sec = 180;
+    if (gw && *gw) {
+      char *end = NULL;
+      long v = strtol(gw, &end, 10);
+      if (end != gw && v >= 0 && v <= 900) {
+        gate_wait_sec = (int)v;
+      }
+    }
+    if (!rmg_pin_gate_wait(gate_wait_sec, "attempt-start")) {
+      return 1;
+    }
   }
   if (!pin_to_core_strict(CORE)) {
     pr_error("choreography core cpu=%d not pinnable; failing attempt "
@@ -729,12 +743,11 @@ int run_exploit(int argc, char **argv) {
 #endif
 
 #if defined(RMG_PIN_TEST_PRIME)
-  /* Re-validate before the page/write stages: the scan/reclaim phase
-   * heats the device and Samsung PM can revoke perf cores mid-attempt
-   * (observed: gate cpu=4/5 at start -> "no perf core usable" here).
-   * Wait for the window to reopen (device cools while idling) instead of
-   * gambling or immediately burning the attempt. */
-  if (!rmg_pin_gate_wait(120, "pre-page") || !pin_to_core_strict(CORE)) {
+  /* Re-validate before the page/write stages: the scan/reclaim phase can
+   * outlast the perf-core window (observed: gate cpu=4/5 at start ->
+   * "no perf core usable" here). Wait for the window to reopen instead
+   * of gambling or immediately burning the attempt. */
+  if (!rmg_pin_gate_wait(180, "pre-page") || !pin_to_core_strict(CORE)) {
     pr_error("pre-page placement lost (cpuset wall); failing attempt "
              "cleanly\n");
     return 1;

