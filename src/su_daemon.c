@@ -1062,6 +1062,30 @@ static void mark_modules_done(void) {
     (void)ignored;
     close(fd);
   }
+  /* The boot pipeline polls this marker from the shell domain over adb;
+   * keep it world-readable even when written from a root context with a
+   * restrictive umask. */
+  chown(KSU_MODULES_DONE_PATH, 2000, 2000);
+  chmod(KSU_MODULES_DONE_PATH, 0644);
+}
+
+/*
+ * The activation log is O_APPEND and persists across boots; the runner
+ * must not mistake a previous boot's trailing "[activate] done" for this
+ * boot's completion. Treat the log as current only when it has been
+ * modified since boot (mtime-versus-uptime, the same scheme as the
+ * modules_done_this_boot fallback).
+ */
+static int activate_log_modified_this_boot(void) {
+  struct stat st;
+  if (stat(ACTIVATE_LOG_PATH, &st) != 0) {
+    return 0;
+  }
+  struct sysinfo si;
+  if (sysinfo(&si) != 0) {
+    return 1;
+  }
+  return st.st_mtime >= time(NULL) - (long)si.uptime - 5;
 }
 
 /*
@@ -1095,8 +1119,18 @@ static void heal_work_dir(void) {
 static void run_activation_sequence(void) {
   heal_work_dir();
   int log_fd = open(ACTIVATE_LOG_PATH,
-                    O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0600);
+                    O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
   if (log_fd >= 0) {
+    /* The shell-domain runner polls this log for "[activate] done".
+     * Opened as root the file ends up root:root 0600 (and O_CREAT does
+     * not change the mode of a pre-existing file), so the runner's
+     * open(O_RDONLY) gets EACCES and its wait times out even though
+     * activation succeeded — the app then reports a failed run on top
+     * of a rooted device. Normalize owner+mode while the fd is held
+     * open as root; this also heals root:root 0600 logs left behind by
+     * earlier builds. */
+    fchown(log_fd, 2000, 2000);
+    fchmod(log_fd, 0644);
     dup2(log_fd, STDOUT_FILENO);
     dup2(log_fd, STDERR_FILENO);
     if (log_fd > STDERR_FILENO) {
@@ -2210,11 +2244,25 @@ static int payload_runner_main(int argc, char **argv) {
           close(marker_fd);
           if (got > 0) {
             tail[got] = '\0';
-            if (strstr(tail, "[activate] done")) {
+            /* The log is O_APPEND and persists across boots, so a stale
+             * "[activate] done" tail from an earlier boot would fake
+             * completion; accept it only when the file was written
+             * during this boot. */
+            if (activate_log_modified_this_boot() &&
+                strstr(tail, "[activate] done")) {
               activated = 1;
               break;
             }
           }
+        } else if (modules_done_this_boot()) {
+          /* The log can still be unreadable from the shell domain when
+           * an older build left it root:root 0600 or SELinux denied
+           * creation (the watcher then logs to /dev/null). The
+           * boot-scoped modules-done marker is the stronger signal
+           * anyway: it is written only after the ksud stages succeed
+           * with KernelSU live. */
+          activated = 1;
+          break;
         }
         sleep(1);
       }
