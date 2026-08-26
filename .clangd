@@ -14,5 +14,14 @@ CompileFlags:
   Remove:
     - -march=*
     - -mtune=*
+---
+# Standalone header parses: these are C headers (the whole project is
+# C); without this clangd picks C++/ObjC++ heuristics and chokes on the
+# struct field named `private` in common.h.
+If:
+  PathMatch: .*\.h
+CompileFlags:
+  Add:
+    - -xc-header
 Diagnostics:
   UnusedIncludes: None

@@ -114,6 +114,91 @@ int rmg_pin_gate_ready(void) {
   (void)rmg_select_pair("gate");
   return rmg_consumer_core >= 3 && rmg_trial_pin(rmg_consumer_core);
 }
+
+/* Read the hottest cpu thermal zone temperature (millidegrees C), or -1
+ * when unreadable. Diagnostic aid for gate-wait logging: the observed
+ * mid-attempt perf-core restriction correlates with the device cooking
+ * itself (~87-90C) during the scan/reclaim phases. */
+static int rmg_max_cpu_temp(void) {
+  int max_temp = -1;
+  for (int z = 0; z < 40; z++) {
+    char path[96];
+    snprintf(path, sizeof(path), "/sys/class/thermal/thermal_zone%d/type", z);
+    FILE *f = fopen(path, "r");
+    if (!f) {
+      continue;
+    }
+    char type[64] = {0};
+    if (!fgets(type, sizeof(type), f)) {
+      fclose(f);
+      continue;
+    }
+    fclose(f);
+    if (strncmp(type, "cpu", 3) != 0) {
+      continue;
+    }
+    snprintf(path, sizeof(path), "/sys/class/thermal/thermal_zone%d/temp", z);
+    f = fopen(path, "r");
+    if (!f) {
+      continue;
+    }
+    int t = -1;
+    if (fscanf(f, "%d", &t) == 1 && t > max_temp) {
+      max_temp = t;
+    }
+    fclose(f);
+  }
+  return max_temp;
+}
+
+/* Format a millidegree temperature as "NN.NC" in a static buffer. */
+static const char *rmg_temp_str(int millideg) {
+  static char buf[24];
+  snprintf(buf, sizeof(buf), "%d.%dC", millideg / 1000,
+           (millideg / 100) % 10);
+  return buf;
+}
+
+/*
+ * Thermal/PM-aware gate wait (2026-08-27, round 2). The perf-core
+ * restriction is DYNAMIC within a single attempt: observed open at
+ * attempt start ("gate core cpu=4 consumer cpu=5") and fully closed
+ * ~30s later after the scan/reclaim load heats the device ("gate no
+ * perf core usable"). Failing immediately just re-runs the hot scan on
+ * the next attempt and cooks the device further. Instead: poll the pair
+ * availability while the device cools (the pipeline holds a wakelock but
+ * the CPU load drops to near zero while waiting), up to max_wait_sec.
+ * Returns 1 when a legal pair is pinned, 0 when the budget burns out
+ * (caller fails the attempt cleanly).
+ */
+int rmg_pin_gate_wait(int max_wait_sec, const char *stage) {
+  for (int waited = 0;; waited += 2) {
+    if (rmg_pin_gate_ready()) {
+      if (waited > 0) {
+        pr_success("pin gate %s: perf pair available after %ds cooling "
+                   "(core=%d consumer=%d)\n",
+                   stage, waited, rmg_pinned_core, rmg_consumer_core);
+      }
+      return 1;
+    }
+    if (waited >= max_wait_sec) {
+      int t = rmg_max_cpu_temp();
+      pr_error("pin gate %s: no perf-core pair after %ds wait; hottest cpu "
+               "zone %s; failing attempt cleanly\n",
+               stage, waited,
+               t < 0 ? "n/a" : rmg_temp_str(t));
+      return 0;
+    }
+    if (waited % 20 == 0) {
+      int t = rmg_max_cpu_temp();
+      pr_info("pin gate %s: waiting for perf-core window (%ds/%ds) "
+              "hottest cpu zone %s\n",
+              stage, waited, max_wait_sec,
+              t < 0 ? "n/a" : rmg_temp_str(t));
+    }
+    sleep(2);
+  }
+}
 #endif
 
 static struct kernelsnitch_shared_state *ks;

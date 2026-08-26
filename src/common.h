@@ -90,6 +90,7 @@ extern int rmg_consumer_core;
 int rmg_resolve_pinned_core(void);
 int rmg_revalidate_pinned_core(void);
 int rmg_pin_gate_ready(void);
+int rmg_pin_gate_wait(int max_wait_sec, const char *stage);
 #define CORE rmg_pinned_core
 #else
 /* Choreography cores are COMPILE-TIME LITERALS on purpose. Device-verified
