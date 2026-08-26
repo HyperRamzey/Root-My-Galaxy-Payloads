@@ -3,3 +3,4 @@
 .e2e-*
 stuff.txt
 androguard.db
+.tmp_*
