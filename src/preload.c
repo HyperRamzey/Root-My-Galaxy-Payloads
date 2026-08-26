@@ -29,6 +29,8 @@ struct app_p0_shared_state {
 
 static struct app_p0_shared_state *app_p0_state;
 
+static void rmg_mark_writer_ran(void);
+
 void app_publish_p0_offset(uintptr_t offset) {
   if (!app_p0_state) {
     return;
@@ -59,9 +61,71 @@ void app_publish_writer_started(void) {
   if (app_p0_state) {
     atomic_store(&app_p0_state->writer_started, 1);
   }
+  rmg_mark_writer_ran();
 }
 
 #endif
+
+/*
+ * Boot-scoped writer guard (2026-08-27 round 5, panic postmortem).
+ *
+ * Once the stack writer has run, the kernel's futex/pipe state for this
+ * attempt is dirty. The anonymous app_p0_state guard only stops retries
+ * inside ONE supervisor process — but the app relaunches the payload
+ * every ~20s, and each fresh process happily fast-forwards back to the
+ * writer stage (retained slide/P0 state) and fires it again at the
+ * already-corrupted kernel. Observed 2026-08-27 ~02:43: repeated writer
+ * runs within one boot ended in a kernel panic. Persist a boot_id-
+ * stamped marker so every later launch of the same boot refuses BEFORE
+ * running anything dangerous; a reboot resets boot_id and re-arms.
+ */
+#define RMG_WRITER_MARKER_PATH "/data/local/tmp/.cve43499-writer-ran"
+
+static int rmg_read_boot_id(char *out, size_t n) {
+  FILE *f = fopen("/proc/sys/kernel/random/boot_id", "r");
+  if (!f) {
+    return 0;
+  }
+  if (!fgets(out, (int)n, f)) {
+    fclose(f);
+    return 0;
+  }
+  fclose(f);
+  out[strcspn(out, "\r\n")] = '\0';
+  return out[0] != '\0';
+}
+
+static void rmg_mark_writer_ran(void) {
+  char boot_id[64];
+  if (!rmg_read_boot_id(boot_id, sizeof(boot_id))) {
+    return;
+  }
+  FILE *f = fopen(RMG_WRITER_MARKER_PATH, "w");
+  if (!f) {
+    return;
+  }
+  fprintf(f, "%s\n", boot_id);
+  fclose(f);
+}
+
+static int rmg_writer_ran_this_boot(void) {
+  char boot_id[64];
+  char marked[128] = {0};
+  if (!rmg_read_boot_id(boot_id, sizeof(boot_id))) {
+    return 0;
+  }
+  FILE *f = fopen(RMG_WRITER_MARKER_PATH, "r");
+  if (!f) {
+    return 0;
+  }
+  if (!fgets(marked, sizeof(marked), f)) {
+    fclose(f);
+    return 0;
+  }
+  fclose(f);
+  marked[strcspn(marked, "\r\n")] = '\0';
+  return strcmp(marked, boot_id) == 0;
+}
 
 static int env_int(const char *name, int fallback, int min, int max) {
   const char *value = getenv(name);
@@ -285,6 +349,14 @@ __attribute__((constructor)) static void load(void) {
   if (app_p0_state == MAP_FAILED) {
     pr_error("app p0 shared state mmap failed errno=%d\n", errno);
     _exit(1);
+  }
+  /* Boot-scoped writer guard: a previous launch THIS BOOT already ran
+   * the stack writer, so the kernel state is dirty. Refuse before any
+   * dangerous stage; the app's reboot ladder gets a fresh boot_id. */
+  if (rmg_writer_ran_this_boot()) {
+    pr_error("stack writer already ran this boot (durable marker); "
+             "refusing re-run; reboot required\n");
+    _exit(3);
   }
 #endif
 

