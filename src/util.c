@@ -5,8 +5,30 @@
 int rmg_pinned_core = RMG_CORE_LITERAL;
 int rmg_consumer_core = RMG_CORE_LITERAL + 1;
 
+/* Widen the calling task's affinity mask back to all cores.
+ *
+ * REQUIRED before any probe round (2026-08-27 round 5, proven with the
+ * pinprobe helper on RFCWC0G1Z1J): this kernel silently DROPS halted
+ * (WALT core_ctl / thermal-paused) and restricted (prime) cores from
+ * ANY mask passed to sched_setaffinity — the syscall returns 0 but
+ * stores mask ∩ currently-usable. Restoring a previously-read mask
+ * therefore accumulates shrinkage: every probe/restore cycle done
+ * while a perf core is halted permanently loses that core from the
+ * task's mask, and CPU_ISSET-first probes then report it walled even
+ * after it resumes. Re-widening before each round resets the mask to
+ * "everything usable RIGHT NOW". */
+static void rmg_widen_mask(void) {
+  cpu_set_t wide;
+  CPU_ZERO(&wide);
+  for (int c = 0; c < 8; c++) {
+    CPU_SET(c, &wide);
+  }
+  sched_setaffinity(0, sizeof(wide), &wide);
+}
+
 /* Trial-pin helper: may the calling task be pinned to cpu c right now?
- * Restores the previous mask before returning. */
+ * Restores the WIDE mask (not the old prev) before returning — see
+ * rmg_widen_mask for why prev-restore corrupts the mask. */
 static int rmg_trial_pin(int c) {
   cpu_set_t prev;
   if (sched_getaffinity(0, sizeof(prev), &prev) != 0 ||
@@ -19,7 +41,7 @@ static int rmg_trial_pin(int c) {
   if (sched_setaffinity(0, sizeof(want), &want) != 0) {
     return 0;
   }
-  sched_setaffinity(0, sizeof(prev), &prev);
+  rmg_widen_mask();
   return 1;
 }
 
@@ -42,6 +64,11 @@ static int rmg_trial_pin(int c) {
  * cpu=5, consumer pin cpu=6 EINVAL -> unpinned write stage -> panic).
  */
 static int rmg_select_pair(const char *why) {
+  /* Reset the mask to "all cores usable now" first: prior probe/restore
+   * cycles done while cores were halted silently shrank it (the kernel
+   * drops halted cores from every stored mask), which made probes report
+   * resumed cores as walled forever. */
+  rmg_widen_mask();
   cpu_set_t cur;
   if (sched_getaffinity(0, sizeof(cur), &cur) != 0) {
     return rmg_pinned_core;
@@ -318,6 +345,7 @@ static void rmg_log_pin_diag(const char *why) {
   }
   cpu_set_t prev;
   int have_prev = sched_getaffinity(0, sizeof(prev), &prev) == 0;
+  (void)have_prev;
   int err[4] = {0, 0, 0, 0};
   for (int i = 0; i < 4; i++) {
     int c = 3 + i;
@@ -325,9 +353,8 @@ static void rmg_log_pin_diag(const char *why) {
     CPU_ZERO(&want);
     CPU_SET(c, &want);
     err[i] = sched_setaffinity(0, sizeof(want), &want) == 0 ? 0 : errno;
-    if (have_prev) {
-      sched_setaffinity(0, sizeof(prev), &prev);
-    }
+    /* Widen between probes (prev-restore would re-shrink the mask). */
+    rmg_widen_mask();
   }
   pr_info("pin diag %s: allowed=%s setaffinity errno cpu3=%d cpu4=%d "
           "cpu5=%d cpu6=%d (22=EINVAL: halted or walled)\n",
