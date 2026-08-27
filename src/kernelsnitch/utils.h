@@ -19,9 +19,19 @@
 #include <sys/types.h>
 #include <sys/prctl.h>
 
-#ifdef ANDROID_APP_NO_LKM
 #include <android/log.h>
-#endif
+
+/* RMG debug mode (2026-08-27): when RMG_DEBUG_LOGCAT=1 is set in the
+ * environment, every pr_* line is ALSO mirrored to logcat under the
+ * RMG_EXPLOIT tag. A streaming `logcat -s RMG_EXPLOIT` watcher then sees
+ * the exploit's stage markers in realtime — when the kernel panics, the
+ * last mirrored line before the drop is the failure point (the on-disk
+ * f946b.log may lose its tail because the panic kills the writer before
+ * fsync). Default off: one env-checked branch per log line, no logcat
+ * traffic. rmg_pr_out formats once and writes stdout + logcat from the
+ * same buffer, so call-site codegen stays a single variadic call.
+ * Implemented in src/util.c. */
+void rmg_pr_out(int prio, const char *fmt, ...);
 
 #ifndef HIDEMINMAX
 #define MAX(X,Y) (((X) > (Y)) ? (X) : (Y))
@@ -111,18 +121,15 @@
     } while (0)
 #else
 #define pr_error(fmt, ...) do { \
-        printf(COLOR_RED "[!] " COLOR_DEFAULT fmt, ##__VA_ARGS__); \
+        rmg_pr_out(ANDROID_LOG_ERROR, COLOR_RED "[!] " COLOR_DEFAULT fmt, ##__VA_ARGS__); \
         exit(-1); \
     } while (0)
-#define pr_warning(fmt, ...) do { \
-        printf(COLOR_RED "[-] " COLOR_DEFAULT fmt, ##__VA_ARGS__); \
-    } while (0)
-#define pr_info(fmt, ...) do { \
-        printf(COLOR_YELLOW "[*] " COLOR_DEFAULT fmt, ##__VA_ARGS__); \
-    } while (0)
-#define pr_success(fmt, ...) do { \
-        printf(COLOR_GREEN "[+] " COLOR_DEFAULT fmt, ##__VA_ARGS__); \
-    } while (0)
+#define pr_warning(fmt, ...) \
+        rmg_pr_out(ANDROID_LOG_WARN, COLOR_RED "[-] " COLOR_DEFAULT fmt, ##__VA_ARGS__)
+#define pr_info(fmt, ...) \
+        rmg_pr_out(ANDROID_LOG_INFO, COLOR_YELLOW "[*] " COLOR_DEFAULT fmt, ##__VA_ARGS__)
+#define pr_success(fmt, ...) \
+        rmg_pr_out(ANDROID_LOG_INFO, COLOR_GREEN "[+] " COLOR_DEFAULT fmt, ##__VA_ARGS__)
 #endif
 #endif
 

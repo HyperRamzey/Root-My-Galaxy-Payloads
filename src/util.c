@@ -1,6 +1,33 @@
 #include "common.h"
 #include "kernelsnitch/kernelsnitch.h"
 
+#include <stdarg.h>
+
+/* RMG debug mode: mirror pr_* output to logcat (tag RMG_EXPLOIT) when
+ * RMG_DEBUG_LOGCAT=1. Lazy env check, inherited by every forked child, so
+ * one set at launch covers supervisor/child/threads. A live
+ * `logcat -s RMG_EXPLOIT` stream then survives the on-disk log's lost
+ * tail on kernel panic: the last mirrored line is the failure point.
+ * Single-buffer design: format once, fputs to stdout (one stdio lock
+ * hold, same atomicity as the old single printf), then optionally the
+ * same text to logcat — call sites stay one variadic call. */
+void rmg_pr_out(int prio, const char *fmt, ...) {
+  static int logcat_enabled = -1;
+  char buf[1024];
+  va_list ap;
+  va_start(ap, fmt);
+  vsnprintf(buf, sizeof(buf), fmt, ap);
+  va_end(ap);
+  fputs(buf, stdout);
+  if (logcat_enabled < 0) {
+    const char *env = getenv("RMG_DEBUG_LOGCAT");
+    logcat_enabled = (env != NULL && env[0] == '1') ? 1 : 0;
+  }
+  if (logcat_enabled) {
+    __android_log_print(prio, "RMG_EXPLOIT", "%s", buf);
+  }
+}
+
 #if defined(RMG_PIN_TEST_PRIME)
 int rmg_pinned_core = RMG_CORE_LITERAL;
 int rmg_consumer_core = RMG_CORE_LITERAL + 1;

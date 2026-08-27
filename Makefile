@@ -67,14 +67,14 @@ $(OUTDIR):
 
 $(PRELOAD): $(PRELOAD_SRCS) $(TARGET_HEADER) src/offset.h src/common.h src/kernelsnitch/*.h | $(OUTDIR)
 	$(TARGET_CC) -fPIC $(COMMON_CFLAGS) $(PRELOAD_SRCS) \
-	  -shared -pthread $(COMMON_LDFLAGS) -o $@
+	  -shared -pthread -Wl,--no-as-needed -llog -Wl,--as-needed $(COMMON_LDFLAGS) -o $@
 
 $(ROOT_HELPER): src/su_daemon.c | $(OUTDIR)
 	$(TARGET_CC) -fPIE -pie $(COMMON_CFLAGS) $< -ldl $(COMMON_LDFLAGS) -o $@
 
 $(APP_PRELOAD): $(APP_PRELOAD_SRCS) $(TARGET_HEADER) src/offset.h src/common.h src/kernelsnitch/*.h | $(OUTDIR)
 	$(TARGET_CC) -DAPP_PAYLOAD=1 $(APP_TARGET_CFLAGS) -fPIC $(COMMON_CFLAGS) $(APP_PRELOAD_SRCS) \
-	  -shared -pthread $(COMMON_LDFLAGS) -o $@
+	  -shared -pthread -Wl,--no-as-needed -llog -Wl,--as-needed $(COMMON_LDFLAGS) -o $@
 
 $(APP_RELEASE): $(APP_PRELOAD_SRCS) $(TARGET_HEADER) src/offset.h src/common.h src/kernelsnitch/*.h | $(OUTDIR)
 	$(TARGET_CC) -DAPP_PAYLOAD=1 $(APP_TARGET_CFLAGS) -fPIC -O2 -g0 \
@@ -83,7 +83,7 @@ $(APP_RELEASE): $(APP_PRELOAD_SRCS) $(TARGET_HEADER) src/offset.h src/common.h s
 	  -ffunction-sections -fdata-sections \
 	  -Wall -Wextra -Wno-unused-parameter -Wno-sign-compare \
 	  -Isrc -DTARGET_HEADER='"$(TARGET_INCLUDE)"' \
-	  $(APP_PRELOAD_SRCS) -shared -pthread \
+	  $(APP_PRELOAD_SRCS) -shared -pthread -Wl,--no-as-needed -llog -Wl,--as-needed \
 	  -flto=thin -Wl,--gc-sections -s -o $@
 	@test $$(stat -c %s $@) -le $(APP_RELEASE_SIZE)
 	truncate -s $(APP_RELEASE_SIZE) $@

@@ -10,11 +10,11 @@ set LDOPT=-flto=thin -Wl,--gc-sections -Wl,-O3
 if not exist %OUTDIR% mkdir %OUTDIR%
 
 echo === Building preload (root-umh) ===
-call %CC% -fPIC %OPT% -Isrc %TH% src/main.c src/util.c src/slide.c src/fops.c src/pipe.c src/root.c src/preload.c -shared -pthread %LDOPT% -o %OUTDIR%/cve-2026-43499
+call %CC% -fPIC %OPT% -Isrc %TH% src/main.c src/util.c src/slide.c src/fops.c src/pipe.c src/root.c src/preload.c -shared -pthread -Wl,--no-as-needed -llog -Wl,--as-needed %LDOPT% -o %OUTDIR%/cve-2026-43499
 if errorlevel 1 (echo PRELOAD BUILD FAILED & exit /b 1)
 
 echo === Building app preload (MCAST stack writer) ===
-call %CC% -DAPP_PAYLOAD=1 -DSLIDE_STACK_WRITER=1 -fPIC %OPT% -Isrc %TH% src/main.c src/util.c src/slide_app.c src/fops.c src/pipe.c src/root.c src/preload.c -shared -pthread %LDOPT% -o %OUTDIR%/cve-2026-43499-app.so
+call %CC% -DAPP_PAYLOAD=1 -DSLIDE_STACK_WRITER=1 -fPIC %OPT% -Isrc %TH% src/main.c src/util.c src/slide_app.c src/fops.c src/pipe.c src/root.c src/preload.c -shared -pthread -Wl,--no-as-needed -llog -Wl,--as-needed %LDOPT% -o %OUTDIR%/cve-2026-43499-app.so
 if errorlevel 1 (echo APP BUILD FAILED & exit /b 1)
 
 echo === Building root helper ===
