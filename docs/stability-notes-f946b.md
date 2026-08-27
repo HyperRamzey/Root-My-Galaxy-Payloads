@@ -58,6 +58,19 @@ Magic mount uses legacy bind mounts (no `fsmount`, no overlayfs). Verified:
 panics the same way, add another `[rules.<module-id>] default_mode = "magic"`
 entry, or set the global `default_mode = "magic"`.
 
+Second confirmed case (2026-08-27): **GhostGMS 3.1.3** (`id=ghostgms`)
+ships ~47 system files (`system/bin/log*` zero-byte placeholders,
+`system/etc/init/*.rc`) and panicked identically at uptime 183s
+(`hybrid-mount` PID, `__arm64_sys_fsmount+0x268`). Fixed with
+`[rules.ghostgms] default_mode = "magic"` — 53/53 mounts, 0 failures.
+Note: the module lifecycle also runs inside the ksud late-load's private
+mount namespace, so mounts from that pass vanish with it; the keeper's
+global apply (or a manual `ksud post-fs-data/services/boot-completed`)
+is what makes mounts persist.
+Note: GhostGMS disables logging by design (zero-byte `logcat`/`logd`/
+`tombstoned`/`dumpstate`) — `adb logcat` and the RMG_EXPLOIT debug
+stream are blind while it is mounted.
+
 Known cosmetic artifact: `state.json` may report `failed_mounts: 1` with
 logcat error `Failed to add try-umount list /product, File exists` when
 Hybrid Mount runs twice in one boot (second run re-adds an existing
