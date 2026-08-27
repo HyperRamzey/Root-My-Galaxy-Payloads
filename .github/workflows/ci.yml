@@ -32,7 +32,8 @@ jobs:
           set -e
           yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
             "ndk;30.0.15729638" > /dev/null || true
-          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/30.0.15729638" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/30.0.15729638" \
+            >> "$GITHUB_ENV"
 
       - name: Build (warnings as visible)
         run: |
@@ -47,25 +48,31 @@ jobs:
                       '\-mtune=cortex-a715' '\-ffunction-sections' \
                       '\-fdata-sections' '\-fomit-frame-pointer'; do
             grep -q -- "$flag" Makefile || {
-              echo "::error::Makefile lost optimization flag $flag (must stay in sync with build_f946b.bat)"; exit 1; }
+              echo "::error::Makefile lost optimization flag $flag" \
+                "(must stay in sync with build_f946b.bat)"
+              exit 1; }
           done
           grep -q -- '\-Wl,--gc-sections' Makefile
-          echo "optimization flags OK (-O2 thin-LTO armv8a tuned, gc-sections)"
+          echo "optimization flags OK (-O2 thin-LTO armv8a tuned)"
 
       - name: Built artifacts are stripped-size arm64 ELF
         run: |
           set -e
-          file build/${{ matrix.target }}/cve-2026-43499-app.so | grep -q aarch64
-          test "$(stat -c%s build/${{ matrix.target }}/cve-2026-43499-app.so)" -lt 400000
+          file build/${{ matrix.target }}/cve-2026-43499-app.so \
+            | grep -q aarch64
+          test "$(stat -c%s build/${{ matrix.target }}/cve-2026-43499-app.so)" \
+            -lt 400000
 
       - name: Work-dir hygiene probe compiles for arm64
         run: |
           set -e
-          CC="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android35-clang"
+          CC="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt"
+          CC="$CC/linux-x86_64/bin/aarch64-linux-android35-clang"
           $CC -O1 -g0 -Wall -Wextra -Isrc \
             -DTARGET_HEADER='"targets/f946b-F946BXXS7GZE5/target.h"' \
             tests/workdir_probe_main.c src/main.c src/util.c src/slide.c \
-            src/fops.c src/pipe.c src/root.c -pthread -o /tmp/workdir_probe
+            src/fops.c src/pipe.c src/root.c -pthread \
+            -Wl,--no-as-needed -llog -Wl,--as-needed -o /tmp/workdir_probe
           test -x /tmp/workdir_probe
 
   tools:
@@ -87,8 +94,9 @@ jobs:
               assert pid, 'payload entry without payloadId'
               for key in ('exploit', 'kernelsu'):
                   node = p.get(key)
-                  assert isinstance(node, dict) and 'url' in node and 'size' in \
-                      node, f'{pid}: {key} missing url/size'
+                  ok = isinstance(node, dict) and 'url' in node \
+                      and 'size' in node
+                  assert ok, f'{pid}: {key} missing url/size'
                   assert node['url'].startswith(
                       'https://raw.githubusercontent.com/HyperRamzey/'
                       'Root-My-Galaxy-Payloads/main/'), \
@@ -103,15 +111,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Fetch v3.2.5
-        run: git clone --depth 1 --branch v3.2.5 https://github.com/tiann/KernelSU.git ksu-src
+        run: |
+          git clone --depth 1 --branch v3.2.5 \
+            https://github.com/tiann/KernelSU.git ksu-src
       - name: Apply Samsung patches
         run: |
           cd ksu-src
           # Order matters: the base KDP/RKP/DEFEX patch creates
           # kernel/compat/samsung_kdp.c which later patches modify.
-          for p in ../kernelsu/patches/KernelSU-v3.2.5-samsung-kdp-rkp-defex.patch \
-                   ../kernelsu/patches/KernelSU-v3.2.5-dm2q-fzg1.patch \
-                   ../kernelsu/patches/KernelSU-v3.2.5-samsung-selinux_hide.patch; do
+          for p in \
+            ../kernelsu/patches/KernelSU-v3.2.5-samsung-kdp-rkp-defex.patch \
+            ../kernelsu/patches/KernelSU-v3.2.5-dm2q-fzg1.patch \
+            ../kernelsu/patches/KernelSU-v3.2.5-samsung-selinux_hide.patch; do
             echo "applying $p"
             git apply "$p"
           done
