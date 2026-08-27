@@ -3,11 +3,6 @@ name: Release payloads
 on:
   push:
     tags: ["v*"]
-  workflow_dispatch:
-  schedule:
-    # Weekly, Monday 03:20 UTC - refresh payloads against latest NDK builds,
-    # and keep the KernelSU upstream source snapshot current.
-    - cron: "20 3 * * 1"
 
 permissions:
   contents: write
@@ -18,7 +13,7 @@ concurrency:
 
 jobs:
   build-native:
-    name: Build ${{ matrix.target }}
+    name: Build ${{ matrix.target }} (sanity gate)
     runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
@@ -36,162 +31,42 @@ jobs:
           set -e
           yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
             "ndk;30.0.15729638" > /dev/null || true
-          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/30.0.15729638" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/30.0.15729638" \
+            >> "$GITHUB_ENV"
 
-      - name: Build
+      - name: Build (source must still compile; output NOT shipped)
         run: |
           make TARGET=${{ matrix.target }} \
             ANDROID_NDK_HOME="$ANDROID_NDK_HOME" \
             NDK_HOST=linux-x86_64 API=35 all
 
-      - name: Stage artifacts
-        run: |
-          mkdir -p stage/${{ matrix.target }}
-          cd build/${{ matrix.target }}
-          for f in cve-2026-43499-app.so cve-2026-43499-root cve-2026-43499; do
-            [ -f "$f" ] && cp "$f" "../../stage/${{ matrix.target }}/${{ matrix.target }}-$f"
-          done
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: native-${{ matrix.target }}
-          path: stage/
-
-  ksu-upstream-sync:
-    name: Pull latest KernelSU source
-    runs-on: ubuntu-24.04
-    outputs:
-      ksu_ref: ${{ steps.ksu.outputs.ref }}
-    steps:
-      - id: ksu
-        run: |
-          ref=$(git ls-remote --tags --refs --sort=-v:refname \
-            https://github.com/tiann/KernelSU.git |
-            grep -E 'refs/tags/v[0-9]+\.[0-9]+\.[0-9]+$' | head -1 |
-            sed 's#.*refs/tags/##')
-          [ -n "$ref" ] || ref=main
-          echo "ref=$ref" >> "$GITHUB_OUTPUT"
-          echo "Latest KernelSU release tag: $ref"
-
-      - name: Fetch and archive KernelSU source at ${{ steps.ksu.outputs.ref }}
-        run: |
-          git clone --depth 1 --branch "${{ steps.ksu.outputs.ref }}" \
-            https://github.com/tiann/KernelSU.git ksu-src
-          tar -czf kernelsu-${{ steps.ksu.outputs.ref }}-src.tar.gz ksu-src
-
-      - name: Verify Samsung KDP patch applies cleanly
-        run: |
-          cd ksu-src
-          for p in ../kernelsu/patches/*.patch; do
-            echo "checking $p"
-            git apply --check "$p" ||
-              echo "::warning::$p needs rebasing onto ${{ steps.ksu.outputs.ref }}"
-          done
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: kernelsu-source-${{ steps.ksu.outputs.ref }}
-          path: kernelsu-*.tar.gz
-
-  weekly-refresh:
-    name: Sync fresh payloads into repo + feed
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    needs: [build-native]
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-
-      # Tag refs check out detached; the sync must commit to main.
-      - name: Check out main
-        run: |
-          set -euo pipefail
-          git fetch origin main
-          git checkout -B main origin/main
-
-      - uses: actions/download-artifact@v4
-        with:
-          path: dist
-          merge-multiple: true
-
-      - name: Copy fresh builds over committed artifacts
-        run: |
-          set -euo pipefail
-          shopt -s nullglob
-          for d in dist/*/; do
-            t=$(basename "$d")
-            mkdir -p "artifacts/$t"
-            for f in "$d""$t"-cve-2026-43499-app.so \
-                     "$d""$t"-cve-2026-43499-root \
-                     "$d""$t"-cve-2026-43499; do
-              base=$(basename "$f")
-              dest="artifacts/$t/${base#"$t"-}"
-              if ! cmp -s "$f" "$dest" 2>/dev/null; then
-                cp "$f" "$dest"
-                echo "refreshed: $dest"
-              fi
-            done
-          done
-
-      - name: Update feed sizes to match fresh builds
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          import json, os, glob
-          feed_path = 'support/targets-v3.json'
-          with open(feed_path) as fh:
-              feed = json.load(fh)
-          sizes = {}
-          for p in glob.glob('artifacts/*/*'):
-              t = p.split('/')[1]
-              sizes[(t, os.path.basename(p))] = os.path.getsize(p)
-          touched = 0
-          def fix(node):
-              global touched
-              url = node.get('url', '')
-              if '/artifacts/' not in url or '/kernelsu/' in url:
-                  return
-              rest = url.split('/artifacts/')[1]
-              parts = rest.split('/')
-              key = (parts[0], parts[-1])
-              if key in sizes and node.get('size') != sizes[key]:
-                  node['size'] = sizes[key]
-                  globals()['touched'] += 1
-          for payload in feed['payloads']:
-              for k in ('exploit', 'rootHelper'):
-                  node = payload.get(k)
-                  if isinstance(node, dict):
-                      fix(node)
-          with open(feed_path, 'w') as fh:
-              json.dump(feed, fh, indent=2)
-              fh.write('\n')
-          print(f'feed entries updated: {touched}')
-          PY
-
-      - name: Commit refreshed artifacts (if changed)
-        run: |
-          set -euo pipefail
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          if git diff --quiet && git diff --cached --quiet; then
-            echo "No changes since last sync."
-            exit 0
-          fi
-          git add -A
-          git commit -m "ci(weekly): refresh payloads + feed from latest NDK builds"
-          git push origin main
-
   release:
     name: Publish release
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
     needs: [build-native]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/download-artifact@v4
-        with:
-          path: dist
-          merge-multiple: true
+      # Ship the COMMITTED artifacts, byte-for-byte. These are the exact
+      # binaries the live feed (support/targets-v3.json) points at and the
+      # ones verified on-device. CI rebuilds are NOT byte-identical
+      # (ThinLTO), so they must never be released: release == feed ==
+      # verified bits. The build-native job above only gates that the
+      # sources still compile. (The old weekly-refresh job silently
+      # overwrote committed artifacts with CI rebuilds and is removed.)
+      - name: Stage committed artifacts
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          for d in artifacts/*/; do
+            t=$(basename "$d")
+            mkdir -p "dist/$t"
+            for f in cve-2026-43499-app.so cve-2026-43499-root \
+                     cve-2026-43499; do
+              [ -f "$d$f" ] && cp "$d$f" "dist/$t/$t-$f"
+            done
+          done
+          find dist -type f | sort
 
       - name: Attach vendored KernelSU binaries + feed
         run: |
@@ -202,13 +77,15 @@ jobs:
       - name: Generate checksums
         run: |
           cd dist
-          find . -type f ! -name SHA256SUMS -exec sha256sum {} \; > SHA256SUMS
+          find . -type f ! -name SHA256SUMS -exec sha256sum {} \; \
+            > SHA256SUMS
 
       - uses: softprops/action-gh-release@v2
         with:
           files: |
             dist/**/*.so
-            dist/**/cve-2026-43499-root
+            dist/**/*cve-2026-43499-root
+            dist/**/*cve-2026-43499
             dist/kernelsu/*
             dist/support/*
             dist/SHA256SUMS
