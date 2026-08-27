@@ -105,6 +105,13 @@ void rmg_waker_stop(void);
  * (restricted-core EINVAL), so there is nothing faster to legally target.
  * Background actors use src/affinity.h pin_perf_mask() AFTER root. */
 #define CORE RMG_CORE_LITERAL
+/* Targets without the pin-gate experiment: slide_app.c calls
+ * rmg_pin_gate_ready() unconditionally; historically there was no gate,
+ * so it is a no-op that always passes. (Fixes CI builds for targets
+ * that do not define RMG_PIN_TEST_PRIME.) */
+static inline int rmg_pin_gate_ready(void) {
+  return 1;
+}
 #endif
 void durable_log_checkpoint(const char *stage);
 #ifndef KSNITCH_COLLISIONS
