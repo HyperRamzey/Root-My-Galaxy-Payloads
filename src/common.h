@@ -900,6 +900,17 @@ static inline void activation_lock_release(int fd) {
   "echo \"apply-modules: vectord revived pid=$VD\"; else " \
   "echo \"apply-modules: vectord not running post-restart; " \
   "non-blocking\"; fi; " \
+  "i=0; b=''; l=''; li=''; " \
+  "while [ \"$i\" -lt 45 ]; do " \
+  "b=$(cat /sys/class/kgsl/kgsl-3d0/gpu_busy_percentage 2>/dev/null | cut -d' ' -f1); " \
+  "l=$(cut -d' ' -f1 /proc/loadavg 2>/dev/null); " \
+  "ok=1; li=${l%%.*}; " \
+  "if [ -n \"$li\" ] && [ \"$li\" -ge 2 ] 2>/dev/null; then ok=0; fi; " \
+  "if [ -n \"$b\" ] && [ \"$b\" != 0 ]; then ok=0; fi; " \
+  "[ \"$ok\" = 1 ] && break; " \
+  "i=$((i+1)); sleep 1; " \
+  "done; " \
+  "echo \"apply-modules: pre-kill settle ${i}s gpu_busy=$b load=$l\"; " \
   "killed=0; " \
   "for p in $(pidof zygote64) $(pidof zygote); do " \
   "kill -9 $p 2>/dev/null && killed=1; " \

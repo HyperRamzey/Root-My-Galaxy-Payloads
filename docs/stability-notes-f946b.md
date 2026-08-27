@@ -97,3 +97,49 @@ logcat — call-site codegen stays one variadic call (+~2 KB total).
 Note: the payload links `liblog.so` with `-Wl,--no-as-needed` — the NDK's
 default `--as-needed` plus ThinLTO otherwise drops the DT_NEEDED entry and
 `dlopen` fails with `cannot locate symbol "__android_log_print"`.
+
+## kgsl `hwsched_idle_check` list-corruption panic at the zygote bounce
+
+Observed 2026-08-27 ~23:17 (boot `0b88eb74`): the device panicked ~4 s after
+the apply script's `kill -9` zygote bounce, at uptime 177.8 s:
+
+```
+[177.816169] list_del corruption. next->prev should be ffffff88442e1680,
+             but was ffffff8836716008
+[177.816231] kernel BUG at lib/list_debug.c:64!
+[177.817268] Workqueue: kgsl-workqueue hwsched_idle_check.2227.cfi_jt [msm_kgsl]
+[177.817911] Call trace:
+[177.817915]  __list_del_entry_valid+0xc8/0xcc
+[177.817920]  process_one_work+0x174/0x510
+[177.817929]  worker_thread+0x3ac/0x738
+[177.817961] Kernel panic - not syncing: Oops - BUG: Fatal exception
+```
+
+Evidence: `/proc/last_kmsg` of the following boot (pstore is empty on this
+device). The faulting work item is the Adreno GPU hardware scheduler's idle
+check; its `work_struct` list node was corrupted while queued.
+
+Chain: the zygote bounce kills every app process at once; the mass GPU
+context teardown races the kgsl hwsched housekeeping on this
+`5.15.189-android13-8` kernel. The race is flaky — the same bounce window
+survived on 3 of 4 observed boots. It is NOT caused by GPU userspace
+replacement: `GPU_UPDATE` carried a `disable` marker since 22:03 and its
+libs were verified not mounted (`/vendor/lib64/egl/libGLESv2_adreno.so` md5
+mismatch with the module copy, 0 `GPU_UPDATE` entries in `/proc/mounts`).
+`ghostgms` was likewise disabled at the time.
+
+**Fix (payload-side):** `KSU_APPLY_SCRIPT` (both copies — `src/common.h` and
+`src/su_daemon.c`) now waits up to 45 s before the zygote kill until the GPU
+is idle (`/sys/class/kgsl/kgsl-3d0/gpu_busy_percentage` == 0; note the file
+prints `0 %`, so the value is cut on space) and 1-min loadavg < 2, so the
+teardown storm starts from a quiescent scheduler. The wait logs
+`apply-modules: pre-kill settle <N>s gpu_busy=<b> load=<l>`; the keeper's
+120 s apply budget still covers worst case. Verified: builds pass
+(`build_f946b.bat`), the loop exits in 0 s on an idle system, and the
+patched binaries + on-disk `.cve43499-apply.sh` are staged on the device
+(`/data/local/tmp` and the manager's `files/payloads/f946b-F946BXXS7GZE5/`).
+
+If this panic is ever seen again despite the settle wait, the next
+mitigation is to stop bouncing zygote altogether (accept that zygisk modules
+only pick up on the following natural boot) — the bounce exists solely for
+same-boot zygisk pickup.
