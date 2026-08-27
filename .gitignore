@@ -4,3 +4,5 @@
 stuff.txt
 androguard.db
 .tmp_*
+
+.evidence/
