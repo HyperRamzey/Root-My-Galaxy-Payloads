@@ -10,7 +10,7 @@ LOG=/data/local/tmp/wcg_f946b.log
 RP=/data/adb/ksu/bin/resetprop
 [ -x "$RP" ] || RP=resetprop
 
-log() { echo "[service] $(date '+%Y-%m-%d %H:%M:%S') $*" >> "$LOG"; }
+log() { echo "[service] $(date '+%Y-%m-%d %H:%M:%S') $*" >>"$LOG"; }
 
 set_prop() { "$RP" "$PROP" 0 2>/dev/null || setprop "$PROP" 0; }
 

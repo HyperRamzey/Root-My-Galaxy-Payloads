@@ -6,6 +6,38 @@ Galaxy Z Fold5 (`SM-F946B`, Snapdragon 8 Gen 2, Android 16 / OneUI 8).
 The hardware already supports WCG — Samsung only disables it in software.
 This module removes the software block.
 
+## Why Samsung disables it
+
+It is a deliberate software choice, not a hardware limit. Samsung routes color
+through its own engine instead of Android's framework color management, and the
+WCG Configuration bit is tied to the latter.
+
+`persist.sys.sf.native_mode` is SurfaceFlinger's display-color setting:
+`0 = MANAGED` (framework color management), `1 = UNMANAGED` (native). The WCG
+bit only turns on in managed mode, and Samsung ships `1`. The reasons:
+
+- **Own color pipeline, not AOSP's.** Display color on One UI comes from MDNIE
+  (`SemMdnieManagerService` / `MdnieScenarioControlService` — the consumers of
+  the `SEC_FLOATING_FEATURE_LCD_SUPPORT_WIDE_COLOR_GAMUT` flag) and Samsung's
+  screen-mode system, not from SurfaceFlinger's color management. Enabling
+  framework WCG would hand color control to AOSP and conflict with their tuning.
+- **The default look is not a managed wide-gamut mode.** The stock screen mode
+  maps to UNMANAGED (`native_mode=1`); the AOSP managed path (`0`) corresponds
+  to Natural/Boosted. One UI also overrides the AOSP `display_color_mode` lever
+  and keeps forcing UNMANAGED.
+- **Consistent, controlled output.** Letting apps opt into wide-gamut rendering
+  produces app-to-app color inconsistency, so Samsung keeps the flag off and
+  controls the look itself.
+- **Exposed their own way.** Users still get wide/punchy color via
+  Settings → Screen mode (Vivid/Natural/Photo) and HDR for video — just not via
+  the standard `android.hardware.wide_color_gamut` feature flag.
+
+The consequence: apps that query WCG get `false` and render sRGB even though the
+panel can show P3. This module flips `native_mode` to managed and declares the
+feature, so the framework finally grants the wide gamut the hardware has had all
+along — at the cost of moving from Samsung's "Vivid" processing to framework
+color management.
+
 ## Why WCG is off out of the box
 
 The panel and SurfaceFlinger are Display-P3 capable:
@@ -125,6 +157,26 @@ adb shell cmd activity get-config | grep -i widecg              # widecg
 adb shell dumpsys display | grep -i 'wide\|colorMode'
 adb shell cat /data/local/tmp/wcg_f946b.log
 ```
+
+## Runtime health (verified)
+
+Checked via `logcat`, `dmesg`, and `dumpsys dropbox` after a real boot with the
+module active (SM-F946B, OneUI 80500):
+
+- **0 SELinux denials** from the module — the watchdog, `resetprop`, and the
+  `surfaceflinger_color_prop` write are all permitted.
+- **No errors/warnings** referencing `wcg_f946b`, `wcg_watchdog`,
+  `ColorDisplayService`, `DisplayTransformManager`, or SurfaceFlinger color.
+- **No log spam** — the watchdog only appends to
+  `/data/local/tmp/wcg_f946b.log` and stays silent in logcat.
+- **system_server stable** — no crash/ANR attributable to the module.
+
+Unrelated noise you may see that is **not** caused by this module:
+`com.qti.snapdragon.qdcm_ff` failing to load a missing
+`vendor.display.color.V1_0.IDisplayColor` shared library (a pre-existing
+Qualcomm QDCM provisioning gap), and periodic
+`E Watchdog: !@Sync … softdog disabled` lines, which are Samsung's routine
+30 s system_server diagnostics.
 
 ## Notes / caveats
 

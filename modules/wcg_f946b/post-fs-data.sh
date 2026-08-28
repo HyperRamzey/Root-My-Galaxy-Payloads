@@ -9,7 +9,7 @@ LOG=/data/local/tmp/wcg_f946b.log
 RP=/data/adb/ksu/bin/resetprop
 [ -x "$RP" ] || RP=resetprop
 
-log() { echo "[post-fs-data] $(date '+%Y-%m-%d %H:%M:%S') $*" >> "$LOG"; }
+log() { echo "[post-fs-data] $(date '+%Y-%m-%d %H:%M:%S') $*" >>"$LOG"; }
 
 # Set the gate property to MANAGED (0) so WCG is allowed.
 "$RP" "$PROP" 0 2>/dev/null || setprop "$PROP" 0

@@ -18,7 +18,7 @@ RP=/data/adb/ksu/bin/resetprop
 DURATION="${1:-300}"
 POLL="${2:-0.2}"
 
-end=$(( $(date +%s) + DURATION ))
+end=$(($(date +%s) + DURATION))
 while [ "$(date +%s)" -lt "$end" ]; do
     if [ "$(getprop "$PROP")" != "0" ]; then
         "$RP" "$PROP" 0 2>/dev/null || setprop "$PROP" 0
