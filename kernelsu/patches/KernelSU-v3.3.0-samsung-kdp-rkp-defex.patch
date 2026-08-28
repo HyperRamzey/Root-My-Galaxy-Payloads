@@ -51,7 +51,7 @@ index 85932d3..3a5d658 100644
  # If there is no .git directory, use default version
  $(warning "KSU_GIT_VERSION not defined! It is better to make KernelSU a git repository!")
 -ccflags-y += -DKSU_VERSION=16
-+KSU_VERSION ?= 33000
++KSU_VERSION ?= 32601
 +$(info -- KernelSU fallback version: $(KSU_VERSION))
 +ccflags-y += -DKSU_VERSION=$(KSU_VERSION)
  endif
