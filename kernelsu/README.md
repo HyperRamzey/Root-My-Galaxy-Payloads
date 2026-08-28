@@ -1,7 +1,7 @@
 # Samsung KernelSU late-load builds
 
-The files in this directory are built from KernelSU `v3.2.5`, commit
-`b0bc817b4e966aa6aa830834eaf6ef765d821d40`. They are not interchangeable
+The files in this directory are built from KernelSU `v3.3.0`, commit
+`932014ab5b2c9b74a3d11e2ec4d17dd10fc9442e`. They are not interchangeable
 between KMIs.
 
 ## Versioned artifacts
@@ -35,7 +35,7 @@ The standalone `.ko` files are retained for auditing. Root My Galaxy downloads
 the corresponding `ksud-*` file because `ksud late-load` loads its embedded
 `<kmi>_kernelsu.ko` asset.
 
-The S916B FZG1 pair is built from Samsung's released `SM-S916B_16_Opensource` tree with the live FZG1 config and Android clang `r450784e`. Its zero-length `__versions` section and retained symbol tables are intended for KernelSU's kallsyms-aware manual loader. Audit against the exact recovered FZG1 `vmlinux.elf` found all 200 undefined names. Plain `insmod` is not supported. The target patch [`KernelSU-v3.2.5-dm2q-fzg1.patch`](patches/KernelSU-v3.2.5-dm2q-fzg1.patch) selects the exact FZG1 `enum ucount_type` ABI and hard-stops RKP syscall-table writes; the build also sets `CONFIG_KSU_SAMSUNG_NO_PATCH_TEXT=y`. Use the root helper's guarded `--late-load` operation so the loader's security-domain and stdio transition can complete safely. Module initialization is not yet confirmed on S916B hardware.
+The S916B FZG1 pair is built from Samsung's released `SM-S916B_16_Opensource` tree with the live FZG1 config and Android clang `r450784e`. Its zero-length `__versions` section and retained symbol tables are intended for KernelSU's kallsyms-aware manual loader. Audit against the exact recovered FZG1 `vmlinux.elf` found all 200 undefined names. Plain `insmod` is not supported. The target patch [`KernelSU-v3.3.0-dm2q-fzg1.patch`](patches/KernelSU-v3.3.0-dm2q-fzg1.patch) selects the exact FZG1 `enum ucount_type` ABI and hard-stops RKP syscall-table writes; the build also sets `CONFIG_KSU_SAMSUNG_NO_PATCH_TEXT=y`. Use the root helper's guarded `--late-load` operation so the loader's security-domain and stdio transition can complete safely. Module initialization is not yet confirmed on S916B hardware.
 
 The generic 6.1 files and E3Q pair are build-verified but device-untested. The
 E3Q pair is tied to the full S928U DZF2 release string and must not be replaced
@@ -79,8 +79,8 @@ Three other Samsung-specific conflicts were confirmed during the 6.6 port:
 
 ## Patch contents
 
-[`patches/KernelSU-v3.2.5-samsung-kdp-rkp-defex.patch`](patches/KernelSU-v3.2.5-samsung-kdp-rkp-defex.patch)
-contains the complete source delta from the tagged v3.2.5 tree:
+[`patches/KernelSU-v3.3.0-samsung-kdp-rkp-defex.patch`](patches/KernelSU-v3.3.0-samsung-kdp-rkp-defex.patch)
+contains the complete source delta from the tagged v3.3.0 tree:
 
 - resolve Samsung KDP credential helpers and release protected credentials with
   `kdp_usecount_dec_and_test()` plus `__put_cred()`;
@@ -134,11 +134,11 @@ separately.
 
 ## Rebuild
 
-Apply the patch to a clean v3.2.5 checkout:
+Apply the patch to a clean v3.3.0 checkout:
 
 ```sh
-git checkout v3.2.5
-git apply KernelSU-v3.2.5-samsung-kdp-rkp-defex.patch
+git checkout v3.3.0
+git apply KernelSU-v3.3.0-samsung-kdp-rkp-defex.patch
 ```
 
 For the Samsung 6.1 module, use DDK image
