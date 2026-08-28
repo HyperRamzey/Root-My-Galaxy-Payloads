@@ -235,36 +235,6 @@ the "Vector loaded" notification appears.
 
 ![Vector loaded notification](SM-F946B-vector-notification.png)
 
-## Wide Color Gamut module (`modules/wcg_f946b`)
-
-A standard (non-Zygisk) KernelSU module that enables framework **Wide Color
-Gamut** on this device. The panel and SurfaceFlinger already support
-Display-P3 (`ro.surface_flinger.has_wide_color_display=true`,
-`ColorMode::DISPLAY_P3`), but Samsung suppresses WCG in software via two
-independent blocks, both handled by the module:
-
-1. **`persist.sys.sf.native_mode=1` kill-switch.** Samsung's
-   `DisplayContent.computeScreenConfiguration()` gates the `widecg`
-   Configuration bit on `SystemProperties.getInt("persist.sys.sf.native_mode",0) != 1`.
-   `ColorDisplayService.setUp()` → `DisplayTransformManager.setDisplayColor()`
-   rewrites the property to `1` during every boot, and a one-shot set loses that
-   race (One UI also overrides the AOSP `display_color_mode` lever). The module
-   therefore runs `wcg_watchdog.sh`, which re-asserts `0` every 0.2 s for the
-   first 300 s of boot so `WindowManagerService` always reads the managed value,
-   plus a post-boot safety net that forces a display recompute if the config is
-   still `nowidecg`.
-2. **Missing feature declaration.** The module ships a systemless
-   `system/etc/permissions/android.hardware.wide_color_gamut.xml` so
-   `pm has-feature android.hardware.wide_color_gamut` returns true.
-
-Verified on-device 2026-08-28 after a real boot + activation: `native_mode=0`,
-`cmd activity get-config` reports `widecg`, and `pm has-feature
-android.hardware.wide_color_gamut` returns true; the watchdog actively re-asserts
-`0` against Samsung's reset. The module is applied by the same activation flow
-above (`post-fs-data`/`services` stages); the feature XML takes effect once
-KernelSU mounts the overlay (`mount=true`). See `modules/wcg_f946b/README.md`
-for full evidence and revert.
-
 ## Remaining Work
 
 1. **SKB_DATA_DELTA** runtime confirmation (-0x1000, matches Kalama 5.15 family)
