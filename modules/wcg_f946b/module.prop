@@ -1,0 +1,6 @@
+id=wcg_f946b
+name=Wide Color Gamut (Fold5)
+version=v1.1.0
+versionCode=110
+author=Root-My-Galaxy
+description=Enables framework Wide Color Gamut on Galaxy Z Fold5 (SM-F946B). Clears the persist.sys.sf.native_mode=1 kill-switch that Samsung's WindowManagerService/ColorDisplayService use to suppress WCG, defends it with a boot watchdog, and declares the android.hardware.wide_color_gamut feature. Panel + SurfaceFlinger already support Display-P3.

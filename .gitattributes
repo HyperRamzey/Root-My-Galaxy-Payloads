@@ -1,1 +1,6 @@
 kernelsu/patches/*.patch text eol=lf
+
+# Android module + tooling text files must stay LF (CRLF breaks /system/bin/sh)
+*.sh text eol=lf
+*.prop text eol=lf
+modules/**/module.prop text eol=lf

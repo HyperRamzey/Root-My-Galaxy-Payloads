@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Wide Color Gamut feature declaration for Galaxy Z Fold5 (SM-F946B).
+
+  The Fold5 panel and SurfaceFlinger already support Display-P3
+  (ro.surface_flinger.has_wide_color_display=true, and the displays expose
+  ColorMode::DISPLAY_P3), but Samsung omits this PackageManager feature.
+  Declaring it makes PackageManager.hasSystemFeature(FEATURE_WIDE_COLOR_GAMUT)
+  return true for apps that query it.
+-->
+<permissions>
+    <feature name="android.hardware.wide_color_gamut" />
+</permissions>

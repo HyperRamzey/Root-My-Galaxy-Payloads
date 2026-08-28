@@ -1,0 +1,13 @@
+# Wide Color Gamut enabler — SM-F946B (Galaxy Z Fold5)
+#
+# Samsung's WindowManagerService gates the Configuration wide-color bit on:
+#   displayInfo.isWideColorGamut()
+#     && mHasWideColorGamutSupport            (= ro.surface_flinger.has_wide_color_display, true)
+#     && SystemProperties.getInt("persist.sys.sf.native_mode", 0) != 1
+#
+# Samsung ships persist.sys.sf.native_mode=1, which forces SurfaceFlinger into
+# unmanaged native color mode and makes hasWideColorGamutSupport() return false,
+# so the framework reports nowidecg even though the panel is Display-P3 capable.
+#
+# Clearing it to 0 re-enables framework color management and the WCG path.
+persist.sys.sf.native_mode=0
