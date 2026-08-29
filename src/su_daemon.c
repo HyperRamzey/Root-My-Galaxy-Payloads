@@ -32,14 +32,15 @@
 #define BOOTSTRAP_SOCK_PATH "/data/local/tmp/temp_su.sock"
 #define HOLD_READY_SOCKET "cve43499_roothold"
 #define SH_PATH "/system/bin/sh"
-#define KSU_LOADER_PATH "/data/local/tmp/ksud-s25u-kdp"
 #define KSU_LATE_LOAD_LOCK_PATH "/data/local/tmp/.cve43499-lateload.lock"
 
 /*
  * The app stages ksud under its feed artifact name
- * (/data/local/tmp/ksud-<profile>-kdp); older builds only ever had the fixed
- * legacy alias above. Resolve the live loader binary on every call: prefer a
- * profile-named candidate so a stale legacy copy can never shadow it.
+ * (/data/local/tmp/ksud-<profile>-kdp). Resolve the live loader binary on
+ * every call. There is deliberately no fixed fallback: the legacy
+ * ksud-s25u-kdp alias was removed with the S25U binary (SIGILL-carrying
+ * A715 codegen series), and a stale legacy copy must never be loaded for
+ * a target it was not built for.
  */
 static const char *ksu_loader_path(void) {
   static char resolved[160];
@@ -51,8 +52,7 @@ static const char *ksu_loader_path(void) {
       size_t len = strlen(ent->d_name);
       if (len > 8 && len < sizeof(resolved) - 16 &&
           strncmp(ent->d_name, "ksud-", 5) == 0 &&
-          strcmp(ent->d_name + len - 4, "-kdp") == 0 &&
-          strcmp(ent->d_name, "ksud-s25u-kdp") != 0) {
+          strcmp(ent->d_name + len - 4, "-kdp") == 0) {
         snprintf(resolved, sizeof(resolved), "/data/local/tmp/%s",
                  ent->d_name);
         break;
@@ -61,7 +61,8 @@ static const char *ksu_loader_path(void) {
     closedir(dir);
   }
   if (resolved[0] == '\0') {
-    snprintf(resolved, sizeof(resolved), "%s", KSU_LOADER_PATH);
+    /* No staged loader: callers report and abort rather than guess. */
+    return "";
   }
   return resolved;
 }
@@ -100,7 +101,7 @@ static int ksu_selfupdate_target(const char *url, char *out, size_t out_sz) {
   "if [ \"$(getprop sys.boot_completed 2>/dev/null)\" != \"1\" ]; then " \
   "echo 'apply-modules: boot not completed; deferring' >&2; exit 42; fi; " \
   "ksud=''; " \
-  "for p in /data/local/tmp/ksud-*-kdp /data/local/tmp/ksud-s25u-kdp " \
+  "for p in /data/local/tmp/ksud-*-kdp " \
   "/data/adb/ksud /data/adb/ksu/bin/ksud; do " \
   "[ -x \"$p\" ] && ksud=\"$p\" && break; " \
   "done; " \
@@ -785,13 +786,19 @@ static int verify_kernelsu_control(void) {
  * run_activation_sequence).
  */
 static int kernelsu_late_load_locked(void) {
+  const char *loader_path = ksu_loader_path();
+  if (loader_path[0] == '\0') {
+    dprintf(STDERR_FILENO,
+            "late-load: no staged ksud-*-kdp in /data/local/tmp\n");
+    return 15;
+  }
   /* Pre-stage the ksud binary so the loader's self-staging rename step
    * (/data/local/tmp/.ksud-stage -> /data/adb/ksud) always has a valid
    * source. On a clean boot the loader's own copy can fail, leaving the
    * rename source missing and the whole late-load aborted. */
   mkdir("/data/adb", 0755);
   {
-    int src = open(ksu_loader_path(), O_RDONLY | O_CLOEXEC);
+    int src = open(loader_path, O_RDONLY | O_CLOEXEC);
     if (src >= 0) {
       const char *staging_paths[] = {
           "/data/local/tmp/.ksud-stage",
@@ -832,7 +839,7 @@ static int kernelsu_late_load_locked(void) {
             strerror(errno));
     return 10;
   }
-  if (mount(ksu_loader_path(), LOGCAT_PATH, NULL, MS_BIND, NULL) != 0) {
+  if (mount(loader_path, LOGCAT_PATH, NULL, MS_BIND, NULL) != 0) {
     dprintf(STDERR_FILENO, "late-load: bind mount: %s\n", strerror(errno));
     return 11;
   }
@@ -2084,9 +2091,13 @@ static void self_update_artifacts(int report_fd, const char *payload_path,
   targets[1] = helper_arg;     /* rootHelper (this binary) */
   char ksu_target[160];
   if (ksu_selfupdate_target(info[2].url, ksu_target, sizeof(ksu_target)) != 0) {
-    snprintf(ksu_target, sizeof(ksu_target), "%s", KSU_LOADER_PATH);
+    /* No usable feed file name for the ksud artifact: skip the kernelsu
+     * leg rather than guess a path. The primary staging comes from the
+     * app's feed download anyway. */
+    targets[2] = NULL;
+  } else {
+    targets[2] = ksu_target;    /* kernelsu */
   }
-  targets[2] = ksu_target      /* kernelsu */;
   static const char *names[RMG_ARTIFACT_COUNT] = {"exploit", "root-helper",
                                                   "ksud"};
 

@@ -859,9 +859,9 @@ static inline void activation_lock_release(int fd) {
   "softdog disable 2>/dev/null; " \
   "setprop persist.vendor.softdog off 2>/dev/null; " \
   "if [ \"$(getprop sys.boot_completed 2>/dev/null)\" != \"1\" ]; then " \
-  "echo 'apply-modules: boot not completed; deferring' >&2; exit 42; fi; " \
+   "echo 'apply-modules: boot not completed; deferring' >&2; exit 42; fi; " \
    "ksud=''; " \
-   "for p in /data/local/tmp/ksud-*-kdp /data/local/tmp/ksud-s25u-kdp " \
+   "for p in /data/local/tmp/ksud-*-kdp " \
    "/data/adb/ksud /data/adb/ksu/bin/ksud; do " \
   "[ -x \"$p\" ] && ksud=\"$p\" && break; " \
   "done; " \

@@ -143,3 +143,39 @@ If this panic is ever seen again despite the settle wait, the next
 mitigation is to stop bouncing zygote altogether (accept that zygisk modules
 only pick up on the following natural boot) â€” the bounce exists solely for
 same-boot zygisk pickup.
+
+## ksud SVE codegen SIGILL after the v3.3.0 rebase (2026-08-29)
+
+After rebasing to KernelSU v3.3.0 (commit `1da084d`), every late-load died
+with `late-load exit=132` and root "died" minutes later. 132 = 128+4 =
+SIGILL. Tombstones showed `strsim::generic_jaro+52` (pc 0x3c2c94) and
+clap's `gather_direct_conflicts+744` (pc 0x234648) executing SVE
+instructions (`CNTH`, `LD1SB {Z}, P0/Z`, `PTRUE`).
+
+Chain: the rebase rebuilt ksud with `-C target-cpu=cortex-a715`
+(ARMv9.1-with-SVE2); LLVM auto-vectorized the string-similarity paths with
+SVE. Samsung's 5.15.189 kernel does not expose SVE to userspace — HWCAP on
+all kalama cores (A510 0xd46 / A710 0xd4d / X3 0xd4e) lacks `sve` — so the
+first SVE instruction killed the process. This is the same bug class the
+C payloads already fought: `9be3f6d` (SVE addvl on non-SVE cores) and
+`b2044a5` (FEAT_MOPS). Rust user-space binaries must therefore use
+`-C target-feature=+crc` with NO `target-cpu` tuning.
+
+Rebase regression #2 made the fresh ksud doubly broken: the embedded LKM
+was renamed `android13-5.15.189_kernelsu.ko` while late-load resolves the
+asset as `{kmi}_kernelsu.ko` = `android13-5.15_kernelsu.ko` from uname
+(`5.15.189-android13-8-...`), so even without the SIGILL the module was
+"asset not found". The stale v1.2.12 ksud worked because it embedded the
+KMI-named module.
+
+Fix (commit `9ec4f09`): rebuilt ksud SVE-free (O2+thinLTO+gc-sections,
+`-C target-feature=+crc`, 5465448 bytes), embedded the verified DDK LKM
+under its KMI name, synced feed sizes. Verified on-device: `--version`,
+late-load, post-fs-data/services/boot-completed all clean;
+`uid=0(root) context=u:r:ksu:s0`; driver 32601 == ksud 3.3.0 ==
+manager versionCode 32601. The build rules are now codified in
+`docs/REBASE-REBUILD-GUIDE.md` §2.2.
+
+Diagnostic signature for next time: `[activate] late-load exit=132` in
+`ksu-activate.log` + `Fatal signal 4 (SIGILL)` in `logcat -b crash` with
+`strsim`/`clap_builder` frames = SVE codegen regression in ksud.
