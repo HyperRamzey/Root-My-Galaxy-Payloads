@@ -48,6 +48,26 @@
         "url": "https://raw.githubusercontent.com/HyperRamzey/Root-My-Galaxy-Payloads/main/artifacts/f946b-F946BXXS7GZE5/cve-2026-43499-root",
         "size": 44520
       }
+    },
+    {
+      "payloadId": "f731n-F731NTCS6GZF2",
+      "displayName": "Galaxy Z Flip 5 (SM-F731N) | Kernel 5.15.189",
+      "models": [
+        "SM-F731N"
+      ],
+      "kernelVersions": [
+        "5.15.189"
+      ],
+      "exploit": {
+        "url": "https://raw.githubusercontent.com/HyperRamzey/Root-My-Galaxy-Payloads/main/artifacts/f731n-F731NTCS6GZF2/cve-2026-43499-app.so",
+        "size": 142928
+      },
+      "rootHelper": {
+        "url": "https://raw.githubusercontent.com/HyperRamzey/Root-My-Galaxy-Payloads/main/artifacts/f731n-F731NTCS6GZF2/cve-2026-43499-root",
+        "size": 44240
+      },
+      "slideSource": "tracefs",
+      "notes": "Verified on hardware (SM-F731N GZF2). SM8550 text_offset=0 with P0_KERNEL_PHYS_LOAD=0x80000000, systematic +0x300 runtime section delta (f946b + 0x80)."
     }
   ]
 }
