@@ -794,9 +794,12 @@ int install_pipe_physrw(int fd) {
   }
 
   int found = find_pipe_buffer(fd, pipebuf_page_base);
-  pr_info("phys step pipe probe found=%d pipebuf=%016zx idx=%d scan=%d/%d/%d\n",
+  pr_info("phys step pipe probe found=%d pipebuf=%016zx idx=%d scan=%d/%d/%d first_ops=%016llx want_ops=%016llx diff=%lld\n",
           found, pipebuf_addr, pipebuf_pipe_idx, pipe_scan_vmemmap,
-          pipe_scan_ops, pipe_scan_len);
+          pipe_scan_ops, pipe_scan_len,
+          (unsigned long long)pipe_scan_first_ops,
+          (unsigned long long)pipe_buf_ops_addr(),
+          (long long)(pipe_scan_first_ops - pipe_buf_ops_addr()));
   if (!found) {
     return 0;
   }

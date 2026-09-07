@@ -485,6 +485,19 @@ int try_cfi_stage(void) {
 
   pr_info("cfi starting pipe physrw\n");
 
+  /* F731N: runtime ksymtab verification for kmalloc_caches */
+  {
+    uintptr_t dbg_kmc = data_addr(KMALLOC_CACHES);
+    int32_t ksym_val = 0;
+    uintptr_t ksymtab_img = 0x0219bc94ULL;
+    ssize_t ks_rd = kernel_read_data(fd, text_addr(KIMAGE_TEXT_BASE + ksymtab_img),
+                                     &ksym_val, sizeof(ksym_val));
+    uintptr_t rt_kmc = text_addr(KIMAGE_TEXT_BASE + ksymtab_img) + ksym_val;
+    pr_info("kmc check: ksymtab rd=%zd rt_kmc=%016zx target_kmc=%016zx delta=%zd\n",
+            ks_rd, rt_kmc, dbg_kmc, (ssize_t)(rt_kmc - dbg_kmc));
+  }
+
+
 #if defined(APP_PHYS_P0_ORACLE) && APP_PHYS_P0_ORACLE
   if (getenv("P0_ORACLE_DIAG")) {
     int diagnostic_ok = run_p0_pipe_oracle_diagnostic(fd);
