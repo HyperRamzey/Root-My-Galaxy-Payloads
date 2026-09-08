@@ -2882,7 +2882,7 @@ ssize_t configfs_write_once(int fd, uintptr_t target, const void *data, size_t l
   uint32_t buffer_size = 0;
 
   if (end > max_write_window ||
-      !((base >> 24) & 0xff) || !((base >> 32) & 0xff) ||
+      !((base >> 32) & 0xff) ||
       !((base >> 40) & 0xff) || !((base >> 48) & 0xff) ||
       !((base >> 56) & 0xff)) {
     errno = ERANGE;
