@@ -2882,14 +2882,15 @@ ssize_t configfs_write_once(int fd, uintptr_t target, const void *data, size_t l
   uint32_t buffer_size = 0;
 
   if (end > max_write_window ||
-      !((base >> 24) & 0xff) || !((base >> 32) & 0xff) ||
+      !((base >> 32) & 0xff) ||
       !((base >> 40) & 0xff) || !((base >> 48) & 0xff) ||
       !((base >> 56) & 0xff)) {
     errno = ERANGE;
     return -1;
   }
-  for (uintptr_t candidate_size = end;
-       candidate_size <= max_write_window && candidate_size - end < 0x200;
+  uintptr_t start_candidate = end < 0x010101 ? 0x010101 : end;
+  for (uintptr_t candidate_size = start_candidate;
+       candidate_size <= max_write_window && candidate_size - start_candidate < 0x20000;
        candidate_size++) {
     int usable = 1;
     for (size_t i = 0; i < 3; i++) {
