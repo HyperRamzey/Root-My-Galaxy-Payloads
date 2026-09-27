@@ -1,17 +1,17 @@
 # Firmware-to-profile porting procedure
 
-This document records the exact procedure used for the Galaxy S24 FE Korean
-firmware `S721NKSSCDZF3`. Do not reuse its values for another build. The
-separate Galaxy S24 `S921BXXSFDZF2` record, including every changed offset and
-firmware hash, is in
-[`SM-S921B-S921BXXSFDZF2.md`](SM-S921B-S921BXXSFDZF2.md).
-That model uses Exynos 2400 and is not a reference for the Snapdragon E3Q
-kernel. The independent SM-S928U/SM-S928U1 Qualcomm DZF2 procedure and
-completed offline-gate status are recorded in
-[`SM-S928U1-S928U1UES6DZF2.md`](SM-S928U1-S928U1UES6DZF2.md).
-The no-BTF Android 5.10 procedure and legacy `rt_mutex_waiter` layout are
-recorded separately in
-[`SM-A155N-A155NKSS6BYH1.md`](SM-A155N-A155NKSS6BYH1.md).
+This is a general procedure, parameterised below on the Galaxy S24 FE Korean
+firmware `S721NKSSCDZF3` for concreteness. Do not reuse its values for another
+build — every constant must come from the target firmware's own boot image and
+BTF, per the steps below.
+
+**Reference profile in this fork:** `SM-F946B` `F946BXXS7GZE5`, recorded in
+[`SM-F946B.md`](SM-F946B.md) with its full 66-offset BTF audit in
+[`f946b-offset-memory.md`](f946b-offset-memory.md) and its KernelSU pair recipe
+in [`../kernelsu/README.md`](../kernelsu/README.md). The per-device records for
+every other SoC (S24 FE, S24, S24 Ultra, S23/S23 Ultra, S22, S25, A-series,
+A155N) were removed with their profiles on 2026-09-27 and remain readable in
+history: `git log --diff-filter=D --name-only -- docs/SM-*.md`.
 
 ## 1. Identify the exact firmware
 
@@ -366,7 +366,7 @@ Generate every P0 row from the target raw kernel. For each candidate slide
 `0x000000` through `0x1f0000` in steps of `0x10000`, record the eight little-
 endian qwords at page offsets `0x000, 0x200, ..., 0xe00`. Verify the generated
 table by reading all 256 source qwords back from the raw Image. The checked-in
-table is `src/targets/essi-S721NKSSCDZF3/p0_fingerprint.h`.
+table is `src/targets/f946b-F946BXXS7GZE5/p0_fingerprint.h`.
 
 ## 6. Add and build a target
 
@@ -384,14 +384,14 @@ the default header.
 Build and enforce the fixed release payload size:
 
 ```sh
-make TARGET=essi-S721NKSSCDZF3 \
-  ANDROID_NDK_HOME=/path/to/android-ndk-r29 release
+make TARGET=f946b-F946BXXS7GZE5 \
+  ANDROID_NDK_HOME=/path/to/android-ndk-r30 release
 ```
 
 The output must be copied to:
 
 ```text
-artifacts/essi-S721NKSSCDZF3/cve-2026-43499-app.so
+artifacts/f946b-F946BXXS7GZE5/cve-2026-43499-app.so
 ```
 
 ## 7. Build the matching KernelSU module
@@ -399,7 +399,7 @@ artifacts/essi-S721NKSSCDZF3/cve-2026-43499-app.so
 Follow [`../kernelsu/README.md`](../kernelsu/README.md). In addition to a clean
 module build, perform all of these checks:
 
-1. apply the Samsung patch cleanly to KernelSU v3.2.5;
+1. apply the Samsung patch cleanly to KernelSU v3.3.0;
 2. run `check_symbol` against the recovered target `vmlinux.elf`, not only the
    DDK vmlinux;
 3. inspect the target kernel configuration for `CONFIG_MODULE_FORCE_LOAD` and
@@ -417,7 +417,7 @@ For this target, the embedded and standalone KO reports:
 ```
 
 For a no-BTF Samsung 5.10 target with `CONFIG_TRIM_UNUSED_KSYMS=y`, follow the
-A155N procedure in [`SM-A155N-A155NKSS6BYH1.md`](SM-A155N-A155NKSS6BYH1.md).
+A155N procedure; that record is in history (see header).
 Build with `KBUILD_MODPOST_WARN=1`, keep `.symtab` and `.strtab`, and require a
 zero-length `__versions` section so KernelSU's late loader can relocate every
 undefined symbol from `/proc/kallsyms`. Do not copy a `Module.symvers` from a

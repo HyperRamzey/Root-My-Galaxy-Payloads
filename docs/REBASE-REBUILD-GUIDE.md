@@ -2,6 +2,14 @@
 
 This is the exact procedure used for `v3.2.5/b0bc817 → v3.3.0/932014a` (`O2+thinLTO+armv8-a+crc+crypto` for all builds).
 
+> The `v3.2.5` patch series this guide rebases *from*
+> (`KernelSU-v3.2.5-samsung-kdp-rkp-defex.patch`, `-dm2q-fzg1.patch`,
+> `-samsung-selinux_hide.patch`) was removed from the tree on 2026-09-27 with
+> the non-Fold5 profiles. `v3.3.0` is now the only supported base; the v3.2.5
+> files are readable in history at commit `17c7040`. Section 1 below is kept
+> as the record of how the rebase was done — for a fresh port, start from
+> `KernelSU-v3.3.0-samsung-kdp-rkp-defex.patch` and go straight to §2.
+
 ## 1. Rebase Samsung patches to new KernelSU tag
 
 ### 1.1 Fetch both tags
@@ -75,9 +83,9 @@ git apply --check ../../kernelsu/patches/KernelSU-v3.3.0-samsung-kdp-rkp-defex.p
 # Windows (PowerShell, NDK 30.0.15729638):
 $env:ANDROID_NDK_HOME="C:\...\ndk\30.0.15729638"
 # fix mkdir -p on Windows:
-New-Item -ItemType Directory -Path build\essi-A566EXXSCCZG6 -Force | Out-Null
+New-Item -ItemType Directory -Path build\f946b-F946BXXS7GZE5 -Force | Out-Null
 make TARGET=f946b-F946BXXS7GZE5 ANDROID_NDK_HOME="$env:ANDROID_NDK_HOME" NDK_HOST=windows-x86_64 API=35
-make TARGET=e2s-S926BXXUEDZDR ...
+make TARGET=f946b-F946BXXS7GZE5 ...
 # or for all 17:
 Get-ChildItem src/targets | % { make TARGET=$_.Name ... }
 # artifacts/<target>/cve-2026-43499* now 136352/107368 etc. (was Oz)

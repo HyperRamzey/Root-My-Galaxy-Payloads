@@ -20,9 +20,9 @@ Use only on devices you own or are explicitly authorized to test.
   full auto-root pipeline verified end-to-end across 9+ consecutive boots
   (5 consecutive app-flow cycles, each: first-attempt exploit, KernelSU
   live, modules applied, zero kernel panics in `/proc/last_kmsg`).
-- KernelSU: **v3.2.5 LKM** with Samsung KDP/RKP/DEFEX + SELinux-hide
-  patches; the mainline manager (`me.weishu.kernelsu`) is crowned by a
-  cert-hash patch inside the shipped `ksud` (see below).
+- KernelSU: **v3.3.0 LKM** (32601) with the Samsung KDP/RKP/DEFEX patch; the
+  mainline manager (`me.weishu.kernelsu`) is crowned by a cert-hash patch
+  inside the shipped `ksud` (see below).
 
 ## Galaxy Z Fold 5 — `f946b-F946BXXS7GZE5` (device-tested)
 
@@ -30,7 +30,7 @@ Use only on devices you own or are explicitly authorized to test.
 | --- | --- |
 | Kernel | `5.15.189-android13-8-33404244-abF946BXXS7GZE5` |
 | Engine | MCAST / tracefs / shaped-reclaim (PR #223 lineage) |
-| Result | `uid=0(root) context=u:r:ksu:s0`, KernelSU v3.2.5 LKM, Zygisk + Vector live |
+| Result | `uid=0(root) context=u:r:ksu:s0`, KernelSU v3.3.0 LKM, Zygisk + Vector live |
 | Offsets | 66/66 BTF-verified (`docs/f946b-offset-memory.md`) |
 
 ### Manual quick start
@@ -106,12 +106,14 @@ activation to `/data/local/tmp/ksu-activate.log` (shell-readable 0644).
 
 `kernelsu/` vendors the Samsung-hardened KernelSU build chain:
 
-- Patches (applied to upstream v3.2.5; CI verifies they still apply):
-  - `KernelSU-v3.2.5-samsung-kdp-rkp-defex.patch` — Samsung KDP/RKP/DEFEX
-    compatibility (creates `kernel/compat/samsung_kdp.c`),
-  - `KernelSU-v3.2.5-dm2q-fzg1.patch` — S23+ (dm2q) specifics,
-  - `KernelSU-v3.2.5-samsung-selinux_hide.patch` — hide SELinux state.
-- `ksud-<target>-kdp` per target: the late-load loader with the target's
+- Patches (applied to upstream v3.3.0 `932014a`; CI verifies they still
+  apply):
+  - `KernelSU-v3.3.0-samsung-kdp-rkp-defex.patch` — the complete Samsung
+    KDP/RKP/DEFEX delta from the tagged v3.3.0 tree (creates
+    `kernel/compat/samsung_kdp.c`); `kernelsu/README.md` lists the hunks.
+    The earlier v3.2.5 patch series went away with the non-Fold5 profiles and
+    is readable in history at commit `17c7040`.
+- `ksud-f946b-F946BXXS7GZE5-kdp`: the late-load loader with the target's
   module stream embedded. The f946b binary is **crown-patched**: the
   compiled-in manager certificate hash is replaced with the official
   `me.weishu.kernelsu` release-cert hash, so the *mainline* manager app
@@ -139,16 +141,15 @@ the late-load mount-namespace caveat: `docs/stability-notes-f946b.md`.
 | Payload | Models | Kernel | Status |
 | --- | --- | --- | --- |
 | `f946b-F946BXXS7GZE5` | Z Fold5 | 5.15.189 | **Device-tested: full auto-root e2e** |
-| `e2s-S926BXXUEDZDR` | S24+ | 6.1.157 | Device-tested |
-| `essi-A566EXXSCCZG6` | A56 5G | 6.6.102 | Device-tested |
-| `a36xq-A366WVLS3AYG1` | A36 5G | 6.6.46 | Device-tested |
-| `e3q-S928USQS6DZF2` | S24 Ultra | 6.1.145 | HW debugging |
-| `dm3q-S9180ZHS8FZF5` | S23 Ultra | 5.15.189 | Testing |
-| `dm2q-S916BXXSAFZG1` / `-S916NKSS8FZG1` | S23+ | 5.15.189 | Shell-only |
-| `galaxy-s25-series-2026-06-07` | S25 family | 6.6.98 | Device-tested |
-| others (`a15`, `e1s`, `e3q`, `pa3q`, `psq`, `q7q`, …) | various | various | app.so-only placeholders |
 
-Per-device notes live in `docs/SM-*.md`.
+This fork is Fold5-only: the live feed and the app build serve
+`f946b-F946BXXS7GZE5` and nothing else. Profiles for other SoCs were removed
+on 2026-09-27 — they can never run in this fork's app, and keeping them
+shipped meant the feed, the `dist/` mirror and the KernelSU pairs drifted out
+of sync with each other. Their derivation records remain in the git history
+(`git log --diff-filter=D -- docs/`).
+
+Per-device notes live in `docs/SM-F946B.md`.
 
 ## Feed delivery
 
@@ -180,10 +181,10 @@ generator: `tools/generate_target.py`; P0 fingerprint helper:
 
 ## CI / Release
 
-- `ci.yml` (every push): native matrix build for the four maintained
-  targets, feed schema-v3 validation (URLs pinned to this repo, sizes
+- `ci.yml` (every push): native build of the one maintained target,
+  target, feed schema-v3 validation (URLs pinned to this repo, sizes
   present), KernelSU patch applicability check.
-- `release.yml` (tag push): builds the matrix as a **compile sanity gate
+- `release.yml` (tag push): builds the target as a **compile sanity gate
   only**, then publishes the **committed `artifacts/` binaries** plus the
   vendored KernelSU binaries, feed, and `SHA256SUMS`. Release assets are
   therefore byte-identical to what the live feed serves — CI rebuilds are
@@ -197,5 +198,6 @@ generator: `tools/generate_target.py`; P0 fingerprint helper:
   panic analysis, hybrid-mount magic-mode rules, debug logcat mode
 - `docs/f946b-offset-memory.md` — 66 BTF-verified offsets and memory map
 - `docs/PORTING.md` — porting to a new firmware
-- `docs/S23-porting-notes.md`, `docs/SM-*.md` — per-device notes
+- `docs/SM-F946B.md` — the Fold5 profile record
+- `docs/REBASE-REBUILD-GUIDE.md` — KernelSU rebase + SVE-free rebuild gates
 - `docs/oem-unlock-f946b-audit.md` — OEM unlock audit for the Fold5

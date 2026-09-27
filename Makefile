@@ -1,10 +1,12 @@
 API ?= 35
-TARGET ?= pa3q-S938NKSUACZF1
+TARGET ?= f946b-F946BXXS7GZE5
 OUTDIR ?= build/$(TARGET)
 
+# Stack-writer targets need -DSLIDE_STACK_WRITER=1. Keep this list in sync
+# with any target whose target.h carries the `#error` guard.
 APP_TARGET_CFLAGS :=
-ifneq ($(filter dm2q-S916BXXSAFZG1 dm2q-S916NKSS8FZG1 f946b-F946BXXS7GZE5,$(TARGET)),)
-APP_TARGET_CFLAGS := -DSLIDE_STACK_WRITER=1
+ifneq ($(filter f946b-F946BXXS7GZE5,$(TARGET)),)
+  APP_TARGET_CFLAGS := -DSLIDE_STACK_WRITER=1
 endif
 
 TARGET_HEADER := src/targets/$(TARGET)/target.h

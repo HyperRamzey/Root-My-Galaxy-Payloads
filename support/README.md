@@ -21,5 +21,12 @@ The app extracts the leading numeric version from `uname -r`. Kernel suffixes,
 Android build displays, fingerprints, and security-patch dates do not
 participate in matching.
 
-`targets-v2.json` remains unchanged for released 0.2.3 clients. New clients
-read only schema version 3.
+## Schema history
+
+`targets-v2.json` is gone. The app has read schema v3 only since `v0.2.10`
+(`PayloadRepository.kt` pins `support/targets-v3.json`, `SupportManifest.kt`
+does `require(schemaVersion == 3)`), and the root helper's self-update fetches
+the same v3 URL (`RMG_FEED_URL` in `src/su_daemon.c`). The v2 file this repo
+carried was never read by any client of this fork — the pre-v3 clients fetched
+`targets-v2.json` from `BuSung-dev`, not from here — so it was removed on
+2026-09-27 rather than trimmed.

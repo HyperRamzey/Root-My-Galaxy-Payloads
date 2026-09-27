@@ -20,9 +20,6 @@ jobs:
       matrix:
         target:
           - f946b-F946BXXS7GZE5
-          - e2s-S926BXXUEDZDR
-          - essi-A566EXXSCCZG6
-          - a36xq-A366WVLS3AYG1
     steps:
       - uses: actions/checkout@v4
 
@@ -72,7 +69,7 @@ jobs:
         run: |
           mkdir -p dist/kernelsu dist/support
           cp kernelsu/*.ko kernelsu/ksud-* dist/kernelsu/ 2>/dev/null || true
-          cp support/targets-v3.json support/targets-v2.json dist/support/
+          cp support/targets-v3.json dist/support/
 
       - name: Generate checksums
         run: |

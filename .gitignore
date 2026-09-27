@@ -6,3 +6,6 @@ androguard.db
 .tmp_*
 
 .evidence/
+
+__pycache__/
+*.pyc

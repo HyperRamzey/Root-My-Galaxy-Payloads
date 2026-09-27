@@ -21,9 +21,6 @@ jobs:
       matrix:
         target:
           - f946b-F946BXXS7GZE5
-          - e2s-S926BXXUEDZDR
-          - essi-A566EXXSCCZG6
-          - a36xq-A366WVLS3AYG1
     steps:
       - uses: actions/checkout@v4
 
