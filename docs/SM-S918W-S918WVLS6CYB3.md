@@ -112,17 +112,34 @@ symbols), 31 structure layouts against the from-scratch BTF walk
 
 ## Build
 
-Android NDK r28c, `aarch64-linux-android35`, Makefile `release` flags +
-`-DSLIDE_STACK_WRITER=1`: `cve-2026-43499-app.so`, 97,960 bytes pre-pad,
-padded (truncate) to the fixed 104,128-byte release size. Committed final:
+Android NDK r28c, `aarch64-linux-android35`, Makefile flags +
+`-DSLIDE_STACK_WRITER=1`: `cve-2026-43499-app.so`. Committed r28c
+release build (padded era):
 
 ```text
 size: 104128
 SHA-256: cb14959bf64182616f323e59a70aa821bf3b19ba6d696a9800fec6b55718197e
 ```
 
-(r30 rebuild outstanding — see Remaining work; CI's `< 400000` gate is
-unaffected.)
+Gate removal (upstream `1f00eaa`): the 104,128 truncate target is gone —
+no in-tree payload met it (15 of 16 were 123–136 KB). Policy now: build
+with `make TARGET=dm3q-S918WVLS6CYB3 ... all` under r30, ship output
+as-produced, feed `size` = real `stat()`. r30 build (NDK
+30.0.15729638, clang 21):
+
+```text
+cve-2026-43499-app.so
+  size: 129040
+  SHA-256: 51c5b9abff9b5a49f850129ea8bf5d01a69f43a7cb8653d32bb2e88baa58786d
+cve-2026-43499 (shell preload, third artifact)
+  size: 100496
+  SHA-256: f63b6c918e1ebf5698481f859652af9427c654eaf9938c74a1f825ee9e19449c
+```
+
+(ELF aarch64, Android 35, NDK r30; warnings pre-existing only. Local r30
+root rebuild came out 44,544 B vs the committed 44,520 B — per review
+keeping the committed target-independent build, no third variant. CI's
+`< 400000` gate is unaffected.)
 
 ELF audit: AArch64 shared object, `NEEDED` only `libdl.so`/`libc.so` (no
 `ld-linux-aarch64.so.1` dependency — the issue-#151 bug class is absent),
@@ -255,10 +272,10 @@ ksud-dm3q-S918WVLS6CYB3-kdp
 
 1. ~~App-facing `su` grant~~ DONE (see Validation evidence: Termux `uid=0
    ... u:r:ksu:s0`, AdAway 80,173 blocked).
-2. r30 toolchain rebuild (`cve-2026-43499-app.so` + shell preload
-   `cve-2026-43499`, third artifact) + KSU v3.3.0 pair rebuild (KO +
-   ksud, KSU_VERSION 32601) + on-device re-verify + mainline-Manager
-   pairing check (validated only against the 32525 manager so far).
+2. ~~r30 toolchain rebuild~~ DONE for userspace (`app.so` + preload
+   above); still outstanding: KSU v3.3.0 pair rebuild (KO + ksud,
+   KSU_VERSION 32601) + on-device re-verify + mainline-Manager pairing
+   check (validated only against the 32525 manager so far).
 3. Commit evidence logs (`test-attempt2.log`, `dm3q-attempt3.log`,
    phone-side copies).
 4. App-path validation: re-run exploit → late-load → su through the

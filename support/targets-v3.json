@@ -60,7 +60,7 @@
       ],
       "exploit": {
         "url": "https://raw.githubusercontent.com/HyperRamzey/Root-My-Galaxy-Payloads/main/artifacts/dm3q-S918WVLS6CYB3/cve-2026-43499-app.so",
-        "size": 104128
+        "size": 129040
       },
       "rootHelper": {
         "url": "https://raw.githubusercontent.com/HyperRamzey/Root-My-Galaxy-Payloads/main/artifacts/dm3q-S918WVLS6CYB3/cve-2026-43499-root",
