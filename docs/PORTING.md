@@ -381,18 +381,28 @@ All firmware-dependent constants belong in that directory. Shared exploit
 code selects it through `TARGET_HEADER`; do not add another device's offsets to
 the default header.
 
-Build and enforce the fixed release payload size:
+Build all three payloads:
 
 ```sh
 make TARGET=f946b-F946BXXS7GZE5 \
-  ANDROID_NDK_HOME=/path/to/android-ndk-r30 release
+  ANDROID_NDK_HOME=/path/to/android-ndk-r30 all
 ```
 
-The output must be copied to:
+Outputs land in `build/f946b-F946BXXS7GZE5/`. The two that ship must be copied
+to:
 
 ```text
+artifacts/f946b-F946BXXS7GZE5/cve-2026-43499
 artifacts/f946b-F946BXXS7GZE5/cve-2026-43499-app.so
+artifacts/f946b-F946BXXS7GZE5/cve-2026-43499-root
 ```
+
+There is no fixed payload size. A `release` target with a 104,128-byte
+truncate gate used to live here; it was removed on 2026-09-27 because no
+target in this repo ever met it (the payloads were 123-136 KB, and only one
+historical target was padded) and no CI job ever ran it. Ship the build as
+produced, and set each feed `size` to the real `stat()` of the committed
+file — that declared size is what the app validates its download against.
 
 ## 7. Build the matching KernelSU module
 

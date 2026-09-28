@@ -27,8 +27,6 @@ endif
 
 PRELOAD := $(OUTDIR)/cve-2026-43499
 APP_PRELOAD := $(OUTDIR)/cve-2026-43499-app.so
-APP_RELEASE := $(OUTDIR)/cve-2026-43499-app.release.so
-APP_RELEASE_SIZE := 104128
 ROOT_HELPER := $(OUTDIR)/cve-2026-43499-root
 
 PRELOAD_SRCS := \
@@ -58,11 +56,9 @@ COMMON_LDFLAGS := -flto=thin -Wl,--gc-sections -Wl,-O3
 
 .DEFAULT_GOAL := all
 
-.PHONY: all clean info release
+.PHONY: all clean info
 
 all: $(PRELOAD) $(APP_PRELOAD) $(ROOT_HELPER)
-
-release: $(APP_RELEASE)
 
 $(OUTDIR):
 	mkdir -p $@
@@ -78,25 +74,12 @@ $(APP_PRELOAD): $(APP_PRELOAD_SRCS) $(TARGET_HEADER) src/offset.h src/common.h s
 	$(TARGET_CC) -DAPP_PAYLOAD=1 $(APP_TARGET_CFLAGS) -fPIC $(COMMON_CFLAGS) $(APP_PRELOAD_SRCS) \
 	  -shared -pthread -Wl,--no-as-needed -llog -Wl,--as-needed $(COMMON_LDFLAGS) -o $@
 
-$(APP_RELEASE): $(APP_PRELOAD_SRCS) $(TARGET_HEADER) src/offset.h src/common.h src/kernelsnitch/*.h | $(OUTDIR)
-	$(TARGET_CC) -DAPP_PAYLOAD=1 $(APP_TARGET_CFLAGS) -fPIC -O2 -g0 \
-	  -flto=thin \
-	  -fno-unwind-tables -fno-asynchronous-unwind-tables \
-	  -ffunction-sections -fdata-sections \
-	  -Wall -Wextra -Wno-unused-parameter -Wno-sign-compare \
-	  -Isrc -DTARGET_HEADER='"$(TARGET_INCLUDE)"' \
-	  $(APP_PRELOAD_SRCS) -shared -pthread -Wl,--no-as-needed -llog -Wl,--as-needed \
-	  -flto=thin -Wl,--gc-sections -s -o $@
-	@test $$(stat -c %s $@) -le $(APP_RELEASE_SIZE)
-	truncate -s $(APP_RELEASE_SIZE) $@
-
 info:
 	@echo "TARGET=$(TARGET)"
 	@echo "APP_TARGET_CFLAGS=$(APP_TARGET_CFLAGS)"
 	@echo "TARGET_CC=$(TARGET_CC)"
 	@echo "PRELOAD=$(PRELOAD)"
 	@echo "APP_PRELOAD=$(APP_PRELOAD)"
-	@echo "APP_RELEASE=$(APP_RELEASE)"
 	@echo "ROOT_HELPER=$(ROOT_HELPER)"
 
 clean:
