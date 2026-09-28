@@ -64,13 +64,13 @@
       },
       "rootHelper": {
         "url": "https://raw.githubusercontent.com/HyperRamzey/Root-My-Galaxy-Payloads/main/artifacts/dm3q-S918WVLS6CYB3/cve-2026-43499-root",
-        "size": 27056
+        "size": 44520
       },
       "kernelsu": {
         "url": "https://raw.githubusercontent.com/HyperRamzey/Root-My-Galaxy-Payloads/main/kernelsu/ksud-dm3q-S918WVLS6CYB3-kdp",
         "size": 4629456
       },
-      "notes": "Device-tested on physical SM-S918W (S918WVLS6CYB3): uid=2000->0, KernelSU live, Manager Working <LKM>, Termux su uid=0, su_compat ENABLED. Temp root only; run via Shizuku close to boot.",
+      "notes": "Device-tested on physical SM-S918W (S918WVLS6CYB3): uid=2000->0, KernelSU live, Manager Working <LKM>, Termux su uid=0, su_compat ENABLED. Temp root only. Manager pairing validated against the 32525 manager only; mainline-manager pairing pending re-verify after the v3.3.0/32601 pair rebuild. KSU base decision: v3.3.0 (zero dm3q delta, see kernelsu/patches/KernelSU-v3.3.0-dm3q-5.15.148.NOTES.md); committed KO+ksud pair is the v3.2.5 build pending rebuild.",
       "slideSource": "tracefs"
     }
   ]

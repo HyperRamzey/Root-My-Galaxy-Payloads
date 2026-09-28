@@ -28,8 +28,10 @@
 #define APP_CLOSED_FOPS_ROUTE 1
 #define APP_CONTROLLED_MM_GROUP_RECLAIM 1
 #define APP_FOPS_ROUTE_COARSE_DELAY_USEC 50000
-/* Same engine shape as the dm2q-S916U1UES6CYB3 5.15.148 profile. The
-   attempt-1 timing pin is carried over; confirm on hardware. */
+/* Same engine shape as the sibling 5.15.148 profile (record now in
+   history: git log --diff-filter=D -- docs/). The attempt-1 timing pin
+   is carried over; single-candidate ladder (0ULL) — the 8-candidate
+   ladder variant is open hardware validation, see Remaining work. */
 #define APP_FOPS_ROUTE_FINE_DELAY_TICKS 0ULL
 #define APP_FOPS_BEFORE_PIPE 1
 #define APP_EXACT_PIPE_BUFFER_ONLY 1
@@ -97,7 +99,7 @@
 #define SLIDE_STACK_WRITER_MCAST 1
 #define SLIDE_STACK_WRITER_SIGRETURN 2
 #ifndef SLIDE_STACK_WRITER
-#error FZG1 stack writer must be set by the build
+#error dm3q stack writer must be set by the build
 #endif
 #define MCAST_WAITER_OFF 0x78
 #define SIGRETURN_FPSIMD_WAITER_OFF 0x18

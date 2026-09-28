@@ -14,7 +14,8 @@ Canadian Galaxy S23 Ultra (`dm3q`, product `dm3qcsx`) on firmware
 `S918WVLS6CYB3` (`UP1A.231005.007.S918WVLS6CYB3`), kernel
 `5.15.148-android13-8-29539737-abS918WVLS6CYB3`.
 
-Status: **offline-built, NOT device-tested** (2026-09-18).
+Status: **offline-built 2026-09-18** (build-phase status; superseded by
+Device validation below — same boot, hardware run succeeded).
 
 ## Firmware identity and acquisition
 
@@ -43,8 +44,9 @@ kernel size: 45017600
 kernel SHA-256: 30fa611c0f878915bfe8556401d901793d0c4543b98d1be321dc0960b1f198a3
 ```
 
-(Same boot/kernel sizes as the sibling `S916U1UES6CYB3` build; different
-hash — different variant, same SoC/base date.)
+(Same boot/kernel sizes as the sibling S916U1 CYB3 build — record now in
+history, `git log --diff-filter=D -- docs/`; different hash —
+different variant, same SoC/base date.)
 
 ## Symbol and BTF recovery
 
@@ -55,8 +57,9 @@ parser (full walk: 134,390 types, no desync) supplied all structure layouts.
 
 Notable findings:
 
-- All `.text` symbol offsets are identical to the sibling S916U1 CYB3 build
-  (same kernel source/compiler/config for core code).
+- All `.text` symbol offsets match the sibling S916U1 CYB3 build's
+  record (same kernel source/compiler/config for core code; record now
+  in history, `git log --diff-filter=D -- docs/`).
 - Variant-specific `.data` offsets differ and were re-derived:
   `anon_pipe_buf_ops` 0x01d496e0, `ashmem_fops` 0x01ec6a80,
   `kmalloc_caches` 0x01f1d300, `ashmem_misc` 0x02a408b8,
@@ -69,7 +72,9 @@ Notable findings:
   `ALIGN(0x3e0, 64) = 0x400`, hence `MM_STRUCT_SZ 0x400` (unchanged).
 - `P0_KERNEL_PHYS_LOAD 0x80080000` adopted from the same-SoC (SM8550) S23
   family, fail-closed via fingerprint match (Qualcomm BL has no
-  load-address literal) — same approach as the sibling port.
+  load-address literal) — same approach as the sibling port (whose
+  sboot-derivation section is now in history, `git log --diff-filter=D
+  -- docs/`).
 
 ## Tracefs slide anchors
 
@@ -87,24 +92,37 @@ Notable findings:
 ## P0 fingerprint table
 
 `p0_fingerprint.h` generated from the exact raw Image at probe `0x1f0000`
-(32 slide rows, 256 source qwords, readback-verified). Row 0 is identical to
-the sibling build (shared `.text`); the table was still generated fresh and
-is bound to this image's SHA-256 above.
+(32 slide rows, 256 source qwords, readback-verified). Row 0 matches the
+sibling S916U1 CYB3 build at the same `.text` RVAs (shared core code);
+note the probe bases differ (`Image[0x1f0000 - slide]` here vs
+`Image[0x400000 - slide]` there), so row 0 is a same-RVA byte comparison,
+not a same-probe one. The table was generated fresh regardless and is
+bound to this image's SHA-256 above. (Sibling record now in history:
+`git log --diff-filter=D -- docs/`.)
 
 ## Audit
 
-`tools/audit_target.py`: all 55 `target.h` offsets (23 symbols vs ELF
-symtab, 31 layouts vs BTF, 1 composite) match — 0 mismatches.
+Procedure (workspace script `tools/audit_target.py`, workspace-local, not
+committed): parse all `#define` offsets from `target.h`; check 23 symbols
+against the recovered ELF symtab (`kernel/vmlinux.nm` from
+`vmlinux-to-elf` 1.3.6 at image base `0xffffffc008000000`, 121,160
+symbols), 31 structure layouts against the from-scratch BTF walk
+(`kernel/layouts.json`, 134,390 types), plus 1 composite check — 55 total,
+0 mismatches.
 
 ## Build
 
 Android NDK r28c, `aarch64-linux-android35`, Makefile `release` flags +
-`-DSLIDE_STACK_WRITER=1`: `cve-2026-43499-app.so`, 97,960 bytes built,
-padded to the fixed 104,128-byte release size:
+`-DSLIDE_STACK_WRITER=1`: `cve-2026-43499-app.so`, 97,960 bytes pre-pad,
+padded (truncate) to the fixed 104,128-byte release size. Committed final:
 
 ```text
-SHA-256: 76378da69381a6c55803f9ed8ddbb640efcc0824701c2f49a2b31858d2eb2508
+size: 104128
+SHA-256: cb14959bf64182616f323e59a70aa821bf3b19ba6d696a9800fec6b55718197e
 ```
+
+(r30 rebuild outstanding — see Remaining work; CI's `< 400000` gate is
+unaffected.)
 
 ELF audit: AArch64 shared object, `NEEDED` only `libdl.so`/`libc.so` (no
 `ld-linux-aarch64.so.1` dependency — the issue-#151 bug class is absent),
@@ -131,14 +149,20 @@ slots keep existing field offsets stable. Gates before any device contact:
    mismatches, empty `__versions`.
 3. Only then: `ksud` packaging and the Shizuku device test.
 
-KernelSU source prep is DONE: v3.2.5 (`b0bc817`) + samsung patch +
-`kernelsu/patches/KernelSU-v3.2.5-dm3q-5.15.148.patch` (ucount_type +
-table-before-RKP-return sucompat fix), applied cleanly in
-`/root/KernelSU-dm3q` (Ubuntu 26.04 WSL2). NDK r28c Linux toolchain ready
-at `/root/ndk/android-ndk-r28c`. Missing input: the Samsung kernel tree
-(`E:\s918w-port\oss\`, needs a manual captcha download).
+KernelSU source prep: v3.3.0 base + samsung patch, applied cleanly.
+Decision per review: rebase onto v3.3.0 / KSU_VERSION 32601 (the cleaner
+path vs a v3.2.5 waiver). Delta analysis
+(`kernelsu/patches/KernelSU-v3.3.0-dm3q-5.15.148.NOTES.md`): **zero
+dm3q-specific hunks** — both v3.2.5-era hunks (ucount_type, RKP
+resolve-before-return) are subsumed by the v3.3.0 base, so no dm3q patch
+file ships. Outstanding: rebuild the KO + ksud pair from v3.3.0 and
+re-verify on hardware (see Remaining work). NDK r28c Linux toolchain was
+at `/root/ndk/android-ndk-r28c`; r30 required for the artifact rebuilds.
+Missing input: the Samsung kernel tree (`E:\s918w-port\oss\`, needs a
+manual captcha download).
 
-## KernelSU pair (built 2026-09-18, offline, NOT device-tested)
+## KernelSU pair (built 2026-09-18, offline; validated live same day — see
+Device validation; v3.3.0 rebuild outstanding, see Remaining work)
 
 - Tree: Samsung unified S918 FZH3-era source (5.15.189) + exact dm3q CYB3
   `config.gz` + exact release override. Layout gate vs target BTF passed
@@ -163,8 +187,8 @@ android13-5.15.148_kernelsu-dm3q-S918WVLS6CYB3-kdp.ko
   audit: 200 undefined imports, 0 missing, 65 via kallsyms, 0 CRC mismatches, __versions empty
 
 ksud-dm3q-S918WVLS6CYB3-kdp
-  size: 4629200
-  SHA-256: 3180a210a84876b16ef34a148889524ac03e301b002ac8d63d62f381fe76aa2b
+  size: 4629456
+  SHA-256: d972cd679209c864433c85f4c13dde80c36e9bdd15b8826d360a45c148f76a78
 ```
 
 ## Device validation (2026-09-18, SM-S918W S918WVLS6CYB3, first hardware run)
@@ -191,11 +215,16 @@ ksud-dm3q-S918WVLS6CYB3-kdp
 
 ## Validation evidence (all 2026-09-18, same boot, no reboot since)
 
-- `test-attempt2.log`: prior run (256-pile-up build) — slide 3/3, mm-search
-  0-3 collisions, fail-clean, no panic.
-- `dm3q-attempt3.log` (phone + workspace copy pending): 4x pile-up build
-  `cb14959b` — slide OK all 8 attempts, 32/32 group on attempt 2,
-  `uid=2000->0 root=1`, no panic, Knox 0.
+- `test-attempt2.log`: prior run — slide 3/3, mm-search 0-3 collisions,
+  fail-clean, no panic.
+- `dm3q-attempt3.log` (phone + workspace copy pending): build `cb14959b`
+  — slide OK all 8 attempts, 32/32 group on attempt 2, `uid=2000->0
+  root=1`, no panic, Knox 0. Runs are distinguished by artifact hash;
+  `S918_MM_PILEUP_FUTEXES` (`target.h:137`, 1024) documents the intended
+  pile-up count for this configuration but is currently unconsumed (the
+  `util.c:453-460` override chain selects
+  `SLIDE_KSNITCH_APPENDED_FUTEXES`, 2048). Wiring it in changes exploit
+  behaviour and is deferred to the r30 rebuild + device re-validation.
 - `SM-S918W-S918WVLS6CYB3-KernelSU-manager.png`: Manager `Working <LKM>
   [Jailbreak mode]`, `32525-2`, exact kernel/fingerprint, Enforcing.
 - `SM-S918W-S918WVLS6CYB3-Termux-su.png`: Termux `su` → `#`, `id` →
@@ -215,11 +244,23 @@ ksud-dm3q-S918WVLS6CYB3-kdp
 - Final ksud: 4,629,456 bytes,
   `d972cd679209c864433c85f4c13dde80c36e9bdd15b8826d360a45c148f76a78`
   (adds `--ephemeral`; manifest dep homes rewired with same pins).
-- Root helper `30a1ef2698b14f4e6e9c0bd3dae1a1f646e349dd884e22dfe57f7f35a69d47ba`
-  (guarded late-load, `--ephemeral` intact).
+- Root helper (current, target-independent, matches in-tree f946b build
+  byte-for-byte):
+  `ee0a9f1481c998028181b09a32f28885fe01c2a5f3806226208feb3788d0299f`
+  (late-load path; `--ephemeral` is a ksud-side flag, present in the
+  rebuilt ksud — the helper invokes late-load and the stages report
+  `ephemeral: true`, verified live).
 
-## Remaining work (not done)
+## Remaining work
 
-1. App-facing `su` grant via Manager Superuser tab, then Termux
-   `su -c id` (expect `uid=0 ... context=u:r:ksu:s0`).
-2. Only then: feed entry, screenshots, upstream PR.
+1. ~~App-facing `su` grant~~ DONE (see Validation evidence: Termux `uid=0
+   ... u:r:ksu:s0`, AdAway 80,173 blocked).
+2. r30 toolchain rebuild (`cve-2026-43499-app.so` + shell preload
+   `cve-2026-43499`, third artifact) + KSU v3.3.0 pair rebuild (KO +
+   ksud, KSU_VERSION 32601) + on-device re-verify + mainline-Manager
+   pairing check (validated only against the 32525 manager so far).
+3. Commit evidence logs (`test-attempt2.log`, `dm3q-attempt3.log`,
+   phone-side copies).
+4. App-path validation: re-run exploit → late-load → su through the
+   fork app's wireless-ADB shell (uid 2000) with its env block, not
+   Shizuku; check pin-gate opens on dm3q.
