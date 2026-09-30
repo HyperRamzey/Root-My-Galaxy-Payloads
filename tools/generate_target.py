@@ -962,7 +962,8 @@ Build id: `{build}`; fingerprint: `{fingerprint}`.
 
 
 def update_feed(feed_path, profile, model, build, kernel_release,
-                slide_source='tracefs'):
+                slide_source='tracefs', firmware_versions=None,
+                allow_firmware=()):
     """Insert or refresh this profile's support/targets-v3.json entry.
 
     Artifact URLs point at this repository's main branch; sizes come from
@@ -1019,6 +1020,18 @@ def update_feed(feed_path, profile, model, build, kernel_release,
     }
     if helper:
         entry['rootHelper'] = helper
+    # Firmware gating. `firmware_versions` is the set this profile is REQUIRED on; it is what
+    # lets the app tell two firmwares apart when they share a model AND a kernel version
+    # (F946BXXS7GZE5 and F946BXXS7GZH2 both report 5.15.189, so model+kernel cannot separate
+    # them). `allow_firmware` is the set this profile is merely ALLOWED on - a superset that
+    # makes a profile usable-but-not-required elsewhere, i.e. optional on foreign firmware.
+    # Omitting firmware_versions entirely leaves the profile ungated, which is the old
+    # behaviour and is why this is additive rather than a schema change.
+    fw = list(firmware_versions or ()) + [
+        f for f in allow_firmware if f not in (firmware_versions or ())
+    ]
+    if fw:
+        entry['firmwareVersions'] = fw
 
     for i, old in enumerate(payloads):
         if old.get('payloadId') == entry_id:

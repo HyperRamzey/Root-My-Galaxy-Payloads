@@ -73,69 +73,145 @@ static int rmg_trial_pin(int c) {
 }
 
 /*
- * Placement policy (2026-08-27 stability rework).
+ * Pin-and-verify (src/core_ctl.h policy, step 7).
  *
- * Codegen is -mtune=cortex-a715 and the collision channel is perf-cluster
- * calibrated (2048 pile-up, x5 threshold), so the choreography core must
- * land on the A715 cluster (cpu3-6). The consumer thread needs its OWN
- * core (CONSUMER_CORE, historically CORE+1) and both cores of the pair
- * must be legally pinnable NOW: Samsung PM migrates tasks between cpusets
- * mid-run (top-app 0-7 -> foreground 0-6 -> background 0-2), so a pair
- * that was legal at constructor time can be revoked before the attempt.
+ * A trial pin only proves the syscall was ACCEPTED. Acceptance is not
+ * verification, and a core that accepted a setaffinity two microseconds ago
+ * may already be core_ctl-paused by the time the kernel consumes our forged
+ * state. So acceptance requires all three of:
+ *   1. sched_setaffinity({cpu}) == 0,
+ *   2. sched_getcpu() == cpu  (the migration actually happened, not deferred),
+ *   3. a FRESH core_ctl read of that cpu still shows not-paused and
+ *      not-not-preferred.
  *
- * Preference: highest a715 core whose +1 neighbor is also legal
- * (5->6, 4->5, 3->4), then any legal a715 core paired with any other
- * legal perf core, then the LITTLE literal as last resort. The X3 prime
- * (cpu7) is deliberately NOT preferred: firmware revokes it mid-run and
- * it does not match the a715 tune (observed: resolved cpu=7, revalidated
- * cpu=5, consumer pin cpu=6 EINVAL -> unpinned write stage -> panic).
+ * The mask is restored to WIDE afterwards, never to the previous mask, for the
+ * reason documented on rmg_widen_mask. rmg_select_pair() therefore only ever
+ * hands out a core it has just verified in this exact sense, which is what
+ * makes it fail closed in the way that matters.
+ */
+static int rmg_pin_verify_cpu(int c) {
+  cpu_set_t want;
+  CPU_ZERO(&want);
+  CPU_SET(c, &want);
+  if (sched_setaffinity(0, sizeof(want), &want) != 0) {
+    return 0;
+  }
+  if (sched_getcpu() != c) {
+    rmg_widen_mask();
+    return 0;
+  }
+  struct core_ctl_cpu_state state;
+  struct core_rank now;
+  core_ctl_probe_cpu(c, &state, &now);
+  if (state.known && (state.paused || state.not_preferred)) {
+    pr_info("pinning-test: cpu=%d failed post-pin core_ctl recheck "
+            "known=1 paused=%d not_preferred=%d\n",
+            c, state.paused, state.not_preferred);
+    rmg_widen_mask();
+    return 0;
+  }
+  rmg_widen_mask();
+  return 1;
+}
+
+/*
+ * Placement policy.
+ *
+ * The choreography needs a PAIR: rmg_pinned_core (main) and a DISTINCT
+ * rmg_consumer_core. Both must be legally pinnable NOW, because Samsung PM
+ * migrates tasks between cpusets mid-run (top-app 0-7 -> foreground 0-6 ->
+ * background 0-2) and core_ctl flips perf cores in and out of "Paused" while
+ * the attempt is in flight. A pair that was legal at constructor time can be
+ * revoked before the attempt.
+ *
+ * Cores are no longer chosen from a hardcoded list. src/core_ctl.h ports the
+ * reference's policy: one sched_getaffinity() read used only as a filter
+ * intersection, ordered by cpu_capacity, then cpuinfo_max_freq, then lowest
+ * cpu index, with Samsung core_ctl "Paused"/"Not preferred" as a hard filter
+ * and a fail-open degradation when core_ctl is unreadable.
+ *
+ * Acceptance requires a full pin-and-verify round, not a trial syscall:
+ * sched_setaffinity must succeed, sched_getcpu() must already report the cpu,
+ * and a FRESH core_ctl read of that cpu must not report it paused or
+ * not-preferred. Anything less and we would be handing out a core the kernel
+ * is about to steal back mid-choreography (CPU theft there is a ~50% panic,
+ * per the gate comment below).
+ *
+ * The old preference for an ADJACENT pair (5->6, 4->5, 3->4) is gone on
+ * purpose: cpus 5/6 are exactly the cores core_ctl pauses most, so adjacency
+ * was mostly picking the two riskiest cores on the part. Ordering comes from
+ * capacity, and the consumer is simply the next distinct survivor.
  */
 static int rmg_select_pair(const char *why) {
   /* Reset the mask to "all cores usable now" first: prior probe/restore
    * cycles done while cores were halted silently shrank it (the kernel
    * drops halted cores from every stored mask), which made probes report
-   * resumed cores as walled forever. */
+   * resumed cores as walled forever. This only ever WIDENS - the selection
+   * itself then re-reads the real mask and intersects. */
   rmg_widen_mask();
-  cpu_set_t cur;
-  if (sched_getaffinity(0, sizeof(cur), &cur) != 0) {
-    return rmg_pinned_core;
-  }
-  static const int pair_order[] = {5, 4, 3};
-  for (size_t i = 0; i < sizeof(pair_order) / sizeof(pair_order[0]); i++) {
-    int c = pair_order[i];
-    if (CPU_ISSET(c, &cur) && CPU_ISSET(c + 1, &cur) &&
-        rmg_trial_pin(c) && rmg_trial_pin(c + 1)) {
-      rmg_pinned_core = c;
-      rmg_consumer_core = c + 1;
-      pr_info("pinning-test: %s core cpu=%d consumer cpu=%d\n",
-              why, c, c + 1);
-      return c;
+
+  static int table_logged;
+  struct core_selection sel;
+  int n = core_ctl_rank_candidates(&sel);
+  if (!table_logged) {
+    table_logged = 1;
+    pr_info("core-ctl: readable=%d have_capacity=%d candidates=%d %s\n",
+            sel.core_ctl_readable, sel.have_capacity, n,
+            sel.core_ctl_readable
+                ? "paused/not-preferred cores filtered out"
+                : "UNREADABLE: failing open, affinity+capacity only");
+    for (int i = 0; i < n && i < CORE_CTL_MAX_CANDIDATES; i++) {
+      pr_info("core-ctl cand rank=%d cpu=%d capacity=%ld max_freq_khz=%ld "
+              "known=%d paused=%d not_preferred=%d\n",
+              i, sel.rank[i].cpu, sel.rank[i].capacity,
+              sel.rank[i].max_frequency_khz, sel.rank[i].state.known,
+              sel.rank[i].state.paused, sel.rank[i].state.not_preferred);
     }
   }
-  /* No adjacent pair available: any legal a715 core + any other legal
-   * perf core for the consumer. */
-  static const int core_order[] = {6, 5, 4, 3};
-  for (size_t i = 0; i < sizeof(core_order) / sizeof(core_order[0]); i++) {
-    int c = core_order[i];
-    if (!CPU_ISSET(c, &cur) || !rmg_trial_pin(c)) {
+  if (n <= 0) {
+    pr_warning("pinning-test: %s sched_getaffinity unusable errno=%d\n", why,
+               errno);
+  }
+
+  for (int i = 0; i < n; i++) {
+    int main_cpu = sel.rank[i].cpu;
+    if (!rmg_pin_verify_cpu(main_cpu)) {
+      pr_info("pinning-test: %s reject main cpu=%d capacity=%ld "
+              "max_freq_khz=%ld known=%d paused=%d not_preferred=%d\n",
+              why, main_cpu, sel.rank[i].capacity,
+              sel.rank[i].max_frequency_khz, sel.rank[i].state.known,
+              sel.rank[i].state.paused, sel.rank[i].state.not_preferred);
       continue;
     }
-    for (int k = 6; k >= 3; k--) {
-      if (k != c && CPU_ISSET(k, &cur) && rmg_trial_pin(k)) {
-        rmg_pinned_core = c;
-        rmg_consumer_core = k;
-        pr_info("pinning-test: %s core cpu=%d consumer cpu=%d (split pair)\n",
-                why, c, k);
-        return c;
+    for (int k = 0; k < n; k++) {
+      int consumer = sel.rank[k].cpu;
+      if (consumer == main_cpu || !rmg_pin_verify_cpu(consumer)) {
+        continue;
       }
+      rmg_pinned_core = main_cpu;
+      rmg_consumer_core = consumer;
+      pr_info("pinning-test: %s main cpu=%d capacity=%ld max_freq_khz=%ld "
+              "core_ctl known=%d paused=%d not_preferred=%d | consumer "
+              "cpu=%d capacity=%ld max_freq_khz=%ld core_ctl known=%d "
+              "paused=%d not_preferred=%d\n",
+              why, main_cpu, sel.rank[i].capacity,
+              sel.rank[i].max_frequency_khz, sel.rank[i].state.known,
+              sel.rank[i].state.paused, sel.rank[i].state.not_preferred,
+              consumer, sel.rank[k].capacity,
+              sel.rank[k].max_frequency_khz, sel.rank[k].state.known,
+              sel.rank[k].state.paused, sel.rank[k].state.not_preferred);
+      return main_cpu;
     }
+    pr_info("pinning-test: %s cpu=%d verified but no distinct consumer "
+            "survived verification\n", why, main_cpu);
   }
-  /* Perf cluster unavailable: fall back to the LITTLE literal pair.
-   * The write-stage pin gate treats this as a clean attempt failure. */
+
+  /* Nothing usable: fall back to the LITTLE literal pair, unchanged. The
+   * write-stage pin gate treats this as a clean attempt failure. */
   rmg_pinned_core = RMG_CORE_LITERAL;
   rmg_consumer_core = RMG_CORE_LITERAL + 1;
-  pr_info("pinning-test: %s no perf core usable; fallback literal cpu=%d\n",
-          why, RMG_CORE_LITERAL);
+  pr_info("pinning-test: %s no usable candidate pair; fallback literal "
+          "cpu=%d\n", why, RMG_CORE_LITERAL);
   return rmg_pinned_core;
 }
 

