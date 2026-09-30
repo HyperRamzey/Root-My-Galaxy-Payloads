@@ -5,7 +5,7 @@ OUTDIR ?= build/$(TARGET)
 # Stack-writer targets need -DSLIDE_STACK_WRITER=1. Keep this list in sync
 # with any target whose target.h carries the `#error` guard.
 APP_TARGET_CFLAGS :=
-ifneq ($(filter f946b-F946BXXS7GZE5,$(TARGET)),)
+ifneq ($(filter f946b-F946BXXS7GZE5 dm3q-S918WVLS6CYB3,$(TARGET)),)
   APP_TARGET_CFLAGS := -DSLIDE_STACK_WRITER=1
 endif
 
