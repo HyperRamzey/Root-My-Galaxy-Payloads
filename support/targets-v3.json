@@ -27,7 +27,7 @@
     },
     {
       "payloadId": "f946b-F946BXXS7GZE5",
-      "displayName": "SM-F946B | Kernel 5.15.189",
+      "displayName": "SM-F946B | F946BXXS7GZE5 | Kernel 5.15.189",
       "models": [
         "SM-F946B"
       ],
@@ -54,7 +54,7 @@
     },
     {
       "payloadId": "f946b-F946BXXS7GZH2",
-      "displayName": "SM-F946B | Kernel 5.15.189",
+      "displayName": "SM-F946B | F946BXXS7GZH2 | Kernel 5.15.189",
       "models": [
         "SM-F946B"
       ],
