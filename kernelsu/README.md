@@ -10,6 +10,8 @@ between KMIs.
 | --- | --- | --- | --- |
 | `android13-5.15.189_kernelsu-f946b-F946BXXS7GZE5.ko` | `SM-F946B` `F946BXXS7GZE5` | `android13-5.15` | Exact Fold5 module with target `vermagic`, audited for manual relocation; cred `0x798` / `real_cred` `0x790` |
 | `ksud-f946b-F946BXXS7GZE5-kdp` | Same exact Fold5 build | `android13-5.15` | Late-load binary embedding the Fold5 5.15 module (SVE-free, 5465448 bytes) |
+| `android13-5.15.189_kernelsu-f946b-F946BXXS7GZH2.ko` | `SM-F946B` `F946BXXS7GZH2` | `android13-5.15` | GZH2-native module (`vermagic ...-abF946BXXS7GZH2`); adds the ashmem llseek-clobber repair (`compat/samsung_ashmem.c`, `patches/KernelSU-v3.3.0-samsung-ashmem-repair.patch`, applied after the kdp-rkp-defex patch); cred `0x798` / `real_cred` `0x790` |
+| `ksud-f946b-F946BXXS7GZH2-kdp` | Same GZH2 build | `android13-5.15` | Late-load binary embedding the GZH2 module (SVE-free, 5339112 bytes) |
 
 **All other target pairs (S25U/A56/A36/E3Q/E2S/S921N/S921B/S916B/S9180/
 android12-5.10/android14-6.1-generic) were removed on 2026-08-29.** Every one

