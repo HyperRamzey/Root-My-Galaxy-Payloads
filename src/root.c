@@ -389,6 +389,74 @@ static int read_root_creds_uid(uint32_t *uid_out) {
   return 1;
 }
 
+static int root_socket_ready(void);
+
+/* 1 iff root is already live on THIS boot: the helper's creds file
+ * verifies uid==0 AND was written after boot (mtime >= /proc/stat
+ * btime). A previous boot's file verifies identically but proves
+ * nothing after a reboot, and a newer file can never predate boot
+ * (wall-clock jumps aside, which fail toward retry, never toward a
+ * false success). Used to make repeat entries idempotent: a second
+ * route/pass must never redo the forge (the mp stage unlinks the
+ * creds file and a fresh cascade orphans the live daemon). */
+static unsigned long long root_boot_btime(void) {
+  static int have = 0;
+  static unsigned long long btime = 0;
+  if (!have) {
+    FILE *f = fopen("/proc/stat", "r");
+    if (f) {
+      char line[256];
+      while (fgets(line, sizeof(line), f)) {
+        unsigned long long v = 0;
+        if (sscanf(line, "btime %llu", &v) == 1) {
+          btime = v;
+          break;
+        }
+      }
+      fclose(f);
+    }
+    have = (btime != 0);
+    if (!have) {
+      rmg_diag("ROOT boot btime unreadable; treating creds as stale\n");
+      return 0;
+    }
+  }
+  return btime;
+}
+
+int root_creds_live(void) {
+  uint32_t uid = 0xffffffff;
+  if (!read_root_creds_uid(&uid) || uid != 0) {
+    return 0;
+  }
+  struct stat st;
+  if (stat(ROOT_CREDS_SENTINEL, &st) != 0) {
+    return 0;
+  }
+  unsigned long long bt = root_boot_btime();
+  if (bt == 0) {
+    return 0;
+  }
+  return (unsigned long long)st.st_mtime >= bt;
+}
+
+/* 1 iff a live root daemon answers on its socket this boot. */
+static int root_daemon_live(void) {
+  return root_creds_live() && root_socket_ready();
+}
+
+/* Idempotence gate for repeat entries (second slide route in one
+ * process, supervisor retry on the same boot): when the daemon is
+ * already up, skip the whole forge. Non-static for try_cfi_stage. */
+int root_already_live(void) {
+  if (root_daemon_live()) {
+    rmg_diag("ROOT already live this boot (creds + daemon socket); "
+             "skipping forge\n");
+    return 1;
+  }
+  return 0;
+}
+
 /* True once the root helper's activation sequence has logged completion.
  *
  * The helper writes /data/local/tmp/ksu-activate.log as root and fchowns it to 2000:2000, so
@@ -2008,11 +2076,16 @@ int modprobe_path_root_attempt(int fd) {
   if (!root_mp_drop_script()) {
     return 0;
   }
-  /* Make "did THIS run win" unambiguous: neither the marker nor the creds file
-   * may survive from a previous run. */
-  if (access(ROOT_CREDS_SENTINEL, F_OK) == 0) {
+  /* Make "did THIS run win" unambiguous: a stale marker or creds file
+   * must not survive from a previous run. But a creds file that verifies
+   * uid==0 AND was written this boot is LIVE evidence (a previous route
+   * or supervisor attempt already rooted) - unlinking it destroys the
+   * proof a later stage is about to read, exactly the run24 failure. */
+  if (access(ROOT_CREDS_SENTINEL, F_OK) == 0 && !root_creds_live()) {
     rmg_diag("ROOT mp clearing stale creds file\n");
     unlink(ROOT_CREDS_SENTINEL);
+  } else if (access(ROOT_CREDS_SENTINEL, F_OK) == 0) {
+    rmg_diag("ROOT mp keeping live creds file (root already proven)\n");
   }
   unlink(ROOT_MP_MARKER);
 
@@ -4123,6 +4196,20 @@ int skip_scan = use_known && ncands;
   uint32_t complete_done = 0;
   int32_t attempt_retval = 0;
   int fired_count = 0;
+  /* Previous-boot sweep: a uid-0 creds file from an earlier boot
+   * verifies but proves nothing now, and the wait loop below would
+   * treat it as instant success without firing a single chain. A
+   * same-boot file can only exist if root is already live - and then
+   * try_cfi_stage's entry guard would have returned before this
+   * stage was ever entered - so anything found here is stale. */
+  {
+    uint32_t stale_uid = 0xffffffff;
+    if (read_root_creds_uid(&stale_uid) && stale_uid == 0 &&
+        !root_creds_live()) {
+      rmg_diag("ROOT staticwork clearing previous-boot creds file\n");
+      unlink(ROOT_CREDS_SENTINEL);
+    }
+  }
   if (chained > 0) {
     int wait_ticks = 900;
     const char *wt = getenv("ROOT_STATIC_WAIT_TICKS");

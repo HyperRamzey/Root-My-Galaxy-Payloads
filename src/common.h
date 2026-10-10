@@ -611,6 +611,12 @@ int install_android_root(int fd);
  * itself untouched. */
 int install_static_work_stage(int fd);
 
+/* Live-root evidence for repeat entries: 1 iff the helper's creds file
+ * verifies uid==0 AND was written this boot (root_creds_live), and the
+ * daemon socket answers (root_already_live). */
+int root_creds_live(void);
+int root_already_live(void);
+
 /*
  * Pre-exploit KernelSU liveness probe.
  *

