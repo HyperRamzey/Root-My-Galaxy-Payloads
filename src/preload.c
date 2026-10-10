@@ -9,7 +9,17 @@
 #endif
 #define DEFAULT_PSELECT_DELAY_USEC 20000
 #ifndef DEFAULT_ATTEMPT_TIMEOUT_SEC
-#define DEFAULT_ATTEMPT_TIMEOUT_SEC 90
+/* 90 s was far too short for the real work on this device and it was silently costing us runs.
+ * Measured on RFCWC0G1Z1J: the KernelSnitch/mm reclaim alone ran past 850 s ('controlled mm
+ * group attempt=39' and still climbing), so a 90 s budget killed the payload mid-groom. The
+ * symptom was a payload that appeared to 'stop' at a fixed diag line count (3, 123, 232) - those
+ * were not real failures, they were SIGKILL from this timeout, which is why the stop point
+ * appeared to track how long we had waited rather than what the code was doing.
+ * The 900 s upper clamp had the same effect even when the env var was honoured. */
+#define DEFAULT_ATTEMPT_TIMEOUT_SEC 1800
+#endif
+#ifndef DEFAULT_ATTEMPT_MAX_TIMEOUT_SEC
+#define DEFAULT_ATTEMPT_MAX_TIMEOUT_SEC 3600
 #endif
 #ifndef DEFAULT_P0_ATTEMPT_TIMEOUT_SEC
 #define DEFAULT_P0_ATTEMPT_TIMEOUT_SEC 20
@@ -332,7 +342,8 @@ __attribute__((constructor)) static void load(void) {
   int base_delay = env_int(
       "PSELECT_DELAY_USEC", DEFAULT_PSELECT_DELAY_USEC, 0, 1000000);
   int attempt_timeout_sec = env_int(
-      "EXPLOIT_ATTEMPT_TIMEOUT_SEC", DEFAULT_ATTEMPT_TIMEOUT_SEC, 5, 900);
+      "EXPLOIT_ATTEMPT_TIMEOUT_SEC", DEFAULT_ATTEMPT_TIMEOUT_SEC, 5,
+      DEFAULT_ATTEMPT_MAX_TIMEOUT_SEC);
   int p0_attempt_timeout_sec = env_int(
       "P0_ATTEMPT_TIMEOUT_SEC", DEFAULT_P0_ATTEMPT_TIMEOUT_SEC, 5,
       attempt_timeout_sec);

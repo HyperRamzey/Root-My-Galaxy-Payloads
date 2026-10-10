@@ -440,8 +440,15 @@ int root_creds_live(void) {
   return (unsigned long long)st.st_mtime >= bt;
 }
 
-/* 1 iff a live root daemon answers on its socket this boot. */
-static int root_daemon_live(void) {
+/* 1 iff fresh this-boot creds AND a live root daemon answers on its socket.
+ * Sockets cannot survive reboot, so an answer means a THIS-boot UMH exec
+ * daemonized. Both are required: creds alone may outlive their daemon (the
+ * evidence-loss case - skipping the forge then reports a hollow success with
+ * no su channel and no late-load), and re-forging while a live daemon holds
+ * the evidence orphans it (run24). Observed 2026-10-11: the gate never fired
+ * TRUE in any successful run, so this restores the reviewed && invariant with
+ * no behavior change on proven paths. */
+int root_daemon_live(void) {
   return root_creds_live() && root_socket_ready();
 }
 
@@ -450,8 +457,8 @@ static int root_daemon_live(void) {
  * already up, skip the whole forge. Non-static for try_cfi_stage. */
 int root_already_live(void) {
   if (root_daemon_live()) {
-    rmg_diag("ROOT already live this boot (creds + daemon socket); "
-             "skipping forge\n");
+    rmg_diag("ROOT already live this boot (fresh creds and live "
+             "daemon socket); skipping forge\n");
     return 1;
   }
   return 0;
@@ -2077,11 +2084,12 @@ int modprobe_path_root_attempt(int fd) {
     return 0;
   }
   /* Make "did THIS run win" unambiguous: a stale marker or creds file
-   * must not survive from a previous run. But a creds file that verifies
-   * uid==0 AND was written this boot is LIVE evidence (a previous route
-   * or supervisor attempt already rooted) - unlinking it destroys the
-   * proof a later stage is about to read, exactly the run24 failure. */
-  if (access(ROOT_CREDS_SENTINEL, F_OK) == 0 && !root_creds_live()) {
+   * must not survive from a previous run. But live evidence must never
+   * be destroyed: a fresh uid-0 file, or an answering daemon socket
+   * (which cannot survive reboot, so it proves a this-boot exec),
+   * means root is already up - unlinking it repeats the run24/run27
+   * failure (success achieved, proof deleted, wedge, timeout). */
+  if (access(ROOT_CREDS_SENTINEL, F_OK) == 0 && !root_daemon_live()) {
     rmg_diag("ROOT mp clearing stale creds file\n");
     unlink(ROOT_CREDS_SENTINEL);
   } else if (access(ROOT_CREDS_SENTINEL, F_OK) == 0) {

