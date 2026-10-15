@@ -107,15 +107,15 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - name: Fetch v3.3.0
+      - name: Fetch v3.3.1
         run: |
-          git clone --depth 1 --branch v3.3.0 \
+          git clone --depth 1 --branch v3.3.1 \
             https://github.com/tiann/KernelSU.git ksu-src
       - name: Apply Samsung patches
         run: |
           cd ksu-src
           for p in \
-            ../kernelsu/patches/KernelSU-v3.3.0-samsung-kdp-rkp-defex.patch; do
+            ../kernelsu/patches/KernelSU-v3.3.1-samsung-kdp-rkp-defex-ashmem.patch; do
             echo "applying $p"
             git apply "$p"
           done

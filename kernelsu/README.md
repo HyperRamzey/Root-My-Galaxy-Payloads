@@ -1,17 +1,17 @@
 # Samsung KernelSU late-load builds
 
-The files in this directory are built from KernelSU `v3.3.0`, commit
-`932014ab5b2c9b74a3d11e2ec4d17dd10fc9442e`. They are not interchangeable
-between KMIs.
+The files in this directory are built from KernelSU `v3.3.1`, commit
+`0c0fdb960178fa12d80d6cbcfdcb6ad8be6a865d` (KSU_VERSION 32680, UAPI 5).
+They are not interchangeable between KMIs.
 
 ## Versioned artifacts
 
 | File | Target | KMI | Purpose |
 | --- | --- | --- | --- |
 | `android13-5.15.189_kernelsu-f946b-F946BXXS7GZE5.ko` | `SM-F946B` `F946BXXS7GZE5` | `android13-5.15` | Exact Fold5 module with target `vermagic`, audited for manual relocation; cred `0x798` / `real_cred` `0x790` |
-| `ksud-f946b-F946BXXS7GZE5-kdp` | Same exact Fold5 build | `android13-5.15` | Late-load binary embedding the Fold5 5.15 module (SVE-free, 5465448 bytes) |
-| `android13-5.15.189_kernelsu-f946b-F946BXXS7GZH2.ko` | `SM-F946B` `F946BXXS7GZH2` | `android13-5.15` | GZH2-native module (`vermagic ...-abF946BXXS7GZH2`); adds the ashmem llseek-clobber repair (`compat/samsung_ashmem.c`, `patches/KernelSU-v3.3.0-samsung-ashmem-repair.patch`, applied after the kdp-rkp-defex patch); cred `0x798` / `real_cred` `0x790` |
-| `ksud-f946b-F946BXXS7GZH2-kdp` | Same GZH2 build | `android13-5.15` | Late-load binary embedding the GZH2 module (SVE-free, 5339112 bytes) |
+| `ksud-f946b-F946BXXS7GZE5-kdp` | Same exact Fold5 build | `android13-5.15` | Late-load binary embedding the Fold5 5.15 module (SVE-free, 5401520 bytes) |
+| `android13-5.15.189_kernelsu-f946b-F946BXXS7GZH2.ko` | `SM-F946B` `F946BXXS7GZH2` | `android13-5.15` | GZH2-native module (`vermagic ...-abF946BXXS7GZH2`); adds the ashmem llseek-clobber repair (`compat/samsung_ashmem.c`, folded into `patches/KernelSU-v3.3.1-samsung-kdp-rkp-defex-ashmem.patch`); cred `0x798` / `real_cred` `0x790` |
+| `ksud-f946b-F946BXXS7GZH2-kdp` | Same GZH2 build | `android13-5.15` | Late-load binary embedding the GZH2 module (SVE-free, 5401520 bytes) |
 
 **All other target pairs (S25U/A56/A36/E3Q/E2S/S921N/S921B/S916B/S9180/
 android12-5.10/android14-6.1-generic) were removed on 2026-08-29.** Every one
@@ -51,8 +51,10 @@ Three other Samsung-specific conflicts were confirmed during the 6.6 port:
 
 ## Patch contents
 
-[`patches/KernelSU-v3.3.0-samsung-kdp-rkp-defex.patch`](patches/KernelSU-v3.3.0-samsung-kdp-rkp-defex.patch)
-contains the complete source delta from the tagged v3.3.0 tree:
+[`patches/KernelSU-v3.3.1-samsung-kdp-rkp-defex-ashmem.patch`](patches/KernelSU-v3.3.1-samsung-kdp-rkp-defex-ashmem.patch)
+contains the complete source delta from the tagged v3.3.1 tree (KDP/RKP/DEFEX
+stack plus the ashmem llseek-repair, consolidated into one file so CI covers
+the whole stack):
 
 - resolve Samsung KDP credential helpers and release protected credentials with
   `kdp_usecount_dec_and_test()` plus `__put_cred()`;
@@ -85,7 +87,7 @@ Kernel module (Windows host, DDK `ghcr.io/ylarod/ddk-min:android13-5.15`):
 make -C /opt/ddk/kdir/android13-5.15 M=/tmp/ksu/kernel ARCH=arm64 LLVM=1 LLVM_IAS=1 \
   CONFIG_KSU=m CONFIG_KSU_SAMSUNG_KDP=y CONFIG_KSU_SAMSUNG_RKP=y \
   CONFIG_KSU_SAMSUNG_DEFEX=y CONFIG_KSU_SAMSUNG_NO_PATCH_TEXT=y \
-  KSU_VERSION=32601 modules
+  KSU_VERSION=32680 modules
 ```
 
 Patch the DDK's generated `UTS_RELEASE` / `kernel.release` to the exact
