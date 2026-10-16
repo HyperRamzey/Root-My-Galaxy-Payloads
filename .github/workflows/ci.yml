@@ -21,6 +21,7 @@ jobs:
       matrix:
         target:
           - f946b-F946BXXS7GZE5
+          - dm3q-S918WVLS6CYB3
     steps:
       - uses: actions/checkout@v4
 
